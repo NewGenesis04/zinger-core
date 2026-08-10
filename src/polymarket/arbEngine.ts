@@ -125,9 +125,9 @@ export async function detectAndExecuteArbPackage({
     pkg.abortReason = `Leg execution mismatch: UP=${upSuccess ? 'OK' : 'FAIL'}, DOWN=${downSuccess ? 'OK' : 'FAIL'}`;
 
     if (upSuccess && !downSuccess) {
-      await unwindLeg({ outcome: 'up', pkg, market, mode, botState, log });
+      await unwindLeg({ outcome: 'up', pkg, market, mode, botState, log, adjustPaperCash });
     } else if (downSuccess && !upSuccess) {
-      await unwindLeg({ outcome: 'down', pkg, market, mode, botState, log });
+      await unwindLeg({ outcome: 'down', pkg, market, mode, botState, log, adjustPaperCash });
     }
 
     savePackage(pkg);
@@ -150,6 +150,7 @@ async function executeArbLeg({ outcome, price, cost, shares, pkg, market, cfg, m
     slug: market.slug,
     outcome,
     price,
+    entryPrice: price,
     shares,
     costEst: cost,
     sizeUsd: cost,
@@ -189,7 +190,7 @@ async function executeArbLeg({ outcome, price, cost, shares, pkg, market, cfg, m
   }
 }
 
-async function unwindLeg({ outcome, pkg, market, mode, botState, log }) {
+async function unwindLeg({ outcome, pkg, market, mode, botState, log, adjustPaperCash }) {
   const pos = botState.positions.find((p) => p.packageId === pkg.packageId && p.outcome === outcome && !p.closed);
   if (!pos) return;
 
@@ -199,9 +200,14 @@ async function unwindLeg({ outcome, pkg, market, mode, botState, log }) {
   pos.pnl = 0;
 
   if (mode === 'paper') {
-    const refund = Math.round(pos.shares * pos.entryPrice * 100) / 100;
-    const { adjustPaperCash } = await import('./bot.js').catch(() => ({ adjustPaperCash: () => {} }));
-    adjustPaperCash(refund, `ROLLBACK ${pos.symbol} ${outcome.toUpperCase()}`);
+    const refund = Math.round((Number(pos.costBasis || (pos.shares * pos.entryPrice)) + Number(pos.entryFee || 0)) * 100) / 100;
+    if (adjustPaperCash) {
+      adjustPaperCash(refund, `ROLLBACK ${pos.symbol} ${outcome.toUpperCase()}`);
+    } else {
+      // Fallback if not injected directly
+      const bot = await import('./bot.js').catch(() => ({ adjustPaperCash: () => {} }));
+      if (bot.adjustPaperCash) bot.adjustPaperCash(refund, `ROLLBACK ${pos.symbol} ${outcome.toUpperCase()}`);
+    }
   }
 
   if (log) {
