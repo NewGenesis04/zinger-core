@@ -116,4 +116,31 @@ describe('Atomic Arb Engine', () => {
     expect(metrics.winRatePct).toBe(100);
     expect(metrics.netProfitUsd).toBe(2.03);
   });
+
+  it('passes valid numeric entryPrice in order plans to trade execution', async () => {
+    const market = { symbol: 'ETH', slug: 'eth-plan-test', tokenIds: { up: 'u', down: 'd' } };
+    const depth = { up: { bestAsk: 0.34 }, down: { bestAsk: 0.62 } };
+    const cfg = { clobArbEnabled: true, minArbGap: 0.015, paperBankroll: 100, mode: 'paper' };
+
+    const capturedPlans: any[] = [];
+    const interceptExecuteTrade = async (pending: any) => {
+      capturedPlans.push(pending.plan);
+      return { ok: true, position: { id: 'p1' } };
+    };
+
+    await detectAndExecuteArbPackage({
+      market, depth, prices: { up: 0.34, down: 0.62 }, cfg, mode: 'paper',
+      log: () => {}, executeTrade: interceptExecuteTrade, adjustPaperCash: () => {}, saveTrade: () => {},
+      botState: { config: {}, positions: [] },
+    });
+
+    expect(capturedPlans.length).toBe(2);
+    for (const plan of capturedPlans) {
+      expect(plan.entryPrice).toBeDefined();
+      expect(typeof plan.entryPrice).toBe('number');
+      expect(plan.entryPrice).toBeGreaterThan(0);
+      expect(plan.packageId).toBeDefined();
+      expect(plan.isArbLeg).toBe(true);
+    }
+  });
 });

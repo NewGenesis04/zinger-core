@@ -707,14 +707,15 @@ async function executePendingTrade(pending) {
     return { ok: false, error: 'insufficient paper cash' };
   }
 
+  const entryPx = Number(plan.entryPrice ?? plan.price ?? 0);
   const pos = {
     id: Date.now().toString(36) + Math.random().toString(36).slice(2, 5),
     symbol: pending.symbol,
     slug: pending.slug,
     outcome: pending.outcome,
-    entryPrice: plan.entryPrice,
-    currentPrice: plan.entryPrice,
-    highestPrice: plan.entryPrice,
+    entryPrice: entryPx,
+    currentPrice: entryPx,
+    highestPrice: entryPx,
     size: plan.sizeUsd,
     shares: plan.shares,
     pnl: 0,
@@ -754,7 +755,7 @@ async function executePendingTrade(pending) {
     try {
       // Min-share inflation guard: 5-share exchange minimum can blow a small budget
       const minSh = Number(pending.minShares || 5);
-      const realCost = Math.max(Number(plan.sizeUsd || 0), minSh * Number(plan.entryPrice || 0));
+      const realCost = Math.max(Number(plan.sizeUsd || 0), minSh * entryPx);
       const spendable = Number(botState.readiness?.spendableBalance ?? botState.readiness?.clobBalance ?? 0);
       if (realCost > spendable * 0.95) {
         pending.status = 'failed';
@@ -766,18 +767,18 @@ async function executePendingTrade(pending) {
       if (realCost > Math.max(capUsd * 1.6, 4.5)) {
         pending.status = 'failed';
         botState._buyLocks.delete(pending.slug);
-        log(`⛔ LIVE SKIP ${pending.symbol} — min order $${realCost.toFixed(2)} (${minSh} sh @ $${plan.entryPrice}) blows cap $${capUsd}`, 'error');
+        log(`⛔ LIVE SKIP ${pending.symbol} — min order $${realCost.toFixed(2)} (${minSh} sh @ $${entryPx}) blows cap $${capUsd}`, 'error');
         return { ok: false, error: 'min order exceeds risk cap' };
       }
-      log(`🛰️ LIVE ORDER SUBMIT ${pending.symbol} ${pending.outcome.toUpperCase()} @ $${plan.entryPrice.toFixed(3)}`, 'signal', {
+      log(`🛰️ LIVE ORDER SUBMIT ${pending.symbol} ${pending.outcome.toUpperCase()} @ $${entryPx.toFixed(3)}`, 'signal', {
         market: pending.symbol, slug: pending.slug, outcome: pending.outcome,
-        amount: plan.sizeUsd, price: plan.entryPrice, announceId: pending.id,
+        amount: plan.sizeUsd, price: entryPx, announceId: pending.id,
       });
       const orderResult = await placeOrder({
         tokenId: pending.tokenId,
         side: 'buy',
         amountUsd: plan.sizeUsd,
-        price: plan.entryPrice,
+        price: entryPx,
         negRisk: pending.negRisk,
         tickSize: pending.tickSize || '0.01',
         minShares: pending.minShares || 5,
@@ -787,7 +788,7 @@ async function executePendingTrade(pending) {
       pos.entryPrice = orderResult.price;
       markPosition(pos, orderResult.price);
       try { await syncClobBalance(); await refreshTelemetry(); } catch {}
-      log(`✅ LIVE BUY ${pending.symbol} ${pending.outcome.toUpperCase()} @ $${orderResult.price.toFixed(3)} · ${orderResult.size} sh · TP $${plan.tpPrice.toFixed(3)} · SL $${plan.slPrice.toFixed(3)}`, 'buy', {
+      log(`✅ LIVE BUY ${pending.symbol} ${pending.outcome.toUpperCase()} @ $${orderResult.price.toFixed(3)} · ${orderResult.size} sh · TP $${Number(plan.tpPrice || 0).toFixed(3)} · SL $${Number(plan.slPrice || 0).toFixed(3)}`, 'buy', {
         market: pending.symbol, slug: pending.slug, outcome: pending.outcome,
         orderId: pos.orderId, amount: plan.sizeUsd, price: orderResult.price,
         shares: orderResult.size, targetTp: plan.targetTp, tpPrice: plan.tpPrice, slPrice: plan.slPrice,
@@ -814,7 +815,7 @@ async function executePendingTrade(pending) {
       return { ok: false, error: err.message };
     }
   } else {
-    markPosition(pos, plan.entryPrice);
+    markPosition(pos, entryPx);
     const premium = Number(pos.costBasis || plan.sizeUsd || 0);
     const feeCategory = cfg.feeCategory || 'crypto';
     const feeOn = cfg.simulateClobFees !== false;
@@ -822,16 +823,16 @@ async function executePendingTrade(pending) {
     const entryFee = !feeOn
       ? 0
       : (useClobFees && pending.tokenId)
-        ? await takerFeeUsdcForToken(pos.shares, plan.entryPrice, pending.tokenId, feeCategory)
-        : takerFeeUsdc(pos.shares, plan.entryPrice, feeCategory);
+        ? await takerFeeUsdcForToken(pos.shares, entryPx, pending.tokenId, feeCategory)
+        : takerFeeUsdc(pos.shares, entryPx, feeCategory);
     pos.entryFee = entryFee;
     pos.feesPaid = entryFee;
     pos.costBasis = premium;
     const debit = Math.round((premium + entryFee) * 100) / 100;
-    adjustPaperCash(-debit, `BUY ${pending.symbol} ${pending.outcome?.toUpperCase()} @ ${plan.entryPrice}`);
-    log(`✅ PAPER BUY ${pending.symbol} ${pending.outcome.toUpperCase()} @ $${plan.entryPrice.toFixed(3)} · $${premium.toFixed(2)} + fee $${entryFee.toFixed(4)} · TP +${plan.targetTp}% · SL -${plan.slPct}%`, 'buy', {
+    adjustPaperCash(-debit, `BUY ${pending.symbol} ${pending.outcome?.toUpperCase()} @ ${entryPx.toFixed(3)}`);
+    log(`✅ PAPER BUY ${pending.symbol} ${pending.outcome.toUpperCase()} @ $${entryPx.toFixed(3)} · $${premium.toFixed(2)} + fee $${entryFee.toFixed(4)} · TP +${plan.targetTp}% · SL -${plan.slPct}%`, 'buy', {
       market: pending.symbol, slug: pending.slug, outcome: pending.outcome,
-      amount: plan.sizeUsd, price: plan.entryPrice, targetTp: plan.targetTp, tpPrice: plan.tpPrice, slPrice: plan.slPrice,
+      amount: plan.sizeUsd, price: entryPx, targetTp: plan.targetTp, tpPrice: plan.tpPrice, slPrice: plan.slPrice,
       entryFee,
     });
   }
