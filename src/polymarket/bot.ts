@@ -38,6 +38,7 @@ import { getMLSignalForBoth, getMLTraceForBoth } from './predict.js';
 import { addMLPrediction, addPriceTrace, getConfidenceBias, getConfidenceBufferStats, getPriceTrace } from './confidence.js';
 import { addSpotTick } from './spotPriceHistory.js';
 import { getModelStates, getModelHealth, onModelChange } from './modelRegistry.js';
+import { detectAndExecuteArbPackage, syncPackageSettlements, getArbPackageMetrics, loadPackages } from './arbEngine.js';
 import { persist, persistSync, load, FILES, dataPath } from './persistence.js';
 import { placeOrder, placeMarketSell, syncClobBalance } from './trade.js';
 import { checkReadiness } from './readiness.js';
@@ -370,7 +371,7 @@ function repairPaperOverdraft(reason = 'overdraft repair') {
   while (booksCash() < -0.01 && guard < 120) {
     guard += 1;
     const open = botState.positions
-      .filter((p) => !p.closed && p.mode === 'paper')
+      .filter((p) => !p.closed && p.mode === 'paper' && !p.packageId && !p.isArbLeg)
       .sort((a, b) => (a.entryTime || 0) - (b.entryTime || 0));
     if (!open.length) break;
     const pos = open[0];
@@ -732,6 +733,8 @@ async function executePendingTrade(pending) {
     holdToSettle: !!plan.holdToSettle,
     planMethod: plan.planMethod || plan.method || null,
     arb: !!plan.arb,
+    packageId: plan.packageId || null,
+    isArbLeg: !!plan.isArbLeg || !!plan.arb,
     effectiveSlPct: plan.slPct,
     adaptiveSlArmed: false,
     volFactor: plan.volFactor,
@@ -1865,6 +1868,11 @@ export function getState(opts = {}) {
     },
     audit,
     portfolio,
+    packages: (() => {
+      syncPackageSettlements(botState.trades, mode);
+      return loadPackages().filter((p) => p.mode === mode);
+    })(),
+    arbMetrics: getArbPackageMetrics(mode),
   };
   const narrative = buildSystemNarrative(stateCore);
   const liveScoreCards = buildLiveScoreCards(stateCore);
@@ -2129,7 +2137,7 @@ async function scanOpenExitsFast() {
     const prices = await getPricesForMarket(market).catch(() => ({}));
     const depth = await getDepthForMarket(market).catch(() => null);
     for (const pos of positions) {
-      if (pos.closed) continue;
+      if (pos.closed || pos.packageId || pos.isArbLeg) continue;
       const mark = exitMarkPrice(pos.outcome, prices, depth);
       if (!mark) continue;
       markPosition(pos, mark);
@@ -2490,69 +2498,34 @@ async function scan() {
         market.arb = arb;
       }
 
-      // Exploit: buy BOTH legs when ask sum < 1 − minArbGap (guaranteed settlement edge)
-      if (
-        arb
-        && remaining > Number(cfg.minRemainingSec ?? 15)
-        && market.acceptingOrders
-        && countOpenPositions(cfg.mode) + 2 <= Number(cfg.maxOpenPositions ?? 6)
-        && !botState.positions.some((p) => !p.closed && p.slug === market.slug)
-      ) {
-        // Guaranteed settlement edge — size it off the whole book, not a flat $4 cap.
-        // A riskless arb on a $100 account should commit real money, not pocket change.
-        const arbBank = cfg.mode === 'paper'
-          ? Number(cfg.paperBankroll ?? 0)
-          : Number(readiness?.spendableBalance ?? readiness?.clobBalance ?? 0);
-        const shareBudget = Math.max(
-          Number(cfg.minPositionSize ?? 0.5) * 2,
-          Math.min(
-            arbBank * Number(cfg.arbBankrollFrac ?? 0.25),
-            Number(cfg.arbMaxUsd ?? 40),
-          ),
-        );
-        const shares = Math.max(0.5, Math.round((shareBudget / arb.sum) * 1000) / 1000);
-        const costUp = Math.round(shares * arb.upAsk * 100) / 100;
-        const costDown = Math.round(shares * arb.downAsk * 100) / 100;
-        const totalCost = costUp + costDown;
-        const canPay = cfg.mode !== 'paper' || Number(cfg.paperBankroll ?? 0) >= totalCost + 0.01;
-        if (canPay && shares > 0) {
-          for (const [outcome, ask, cost] of [['up', arb.upAsk, costUp], ['down', arb.downAsk, costDown]]) {
-            const plan = buildTradePlan({
-              cfg, market, outcome, price: ask, remaining, signal,
-              sizeUsd: cost, kelly: { method: 'clob_arb', gap: arb.gap }, analysis: signal,
-            });
-            plan.shares = shares;
-            plan.costEst = cost;
-            plan.sizeUsd = cost;
-            plan.targetTp = Math.max(plan.targetTp, arb.edgePct);
-            // Arb legs must hold to settlement — never mid-cycle TP/SL grind
-            plan.holdToSettle = true;
-            plan.adaptiveSlEnabled = false;
-            plan.slPct = Number(cfg.holdToSettleDisasterSlPct ?? 42);
-            plan.partialTpPct = 999;
-            plan.trailActivatePct = 999;
-            const pending = {
-              id: `arb-${outcome}-${Date.now().toString(36)}`,
-              status: 'pending',
-              symbol: market.symbol,
-              slug: market.slug,
-              outcome,
-              tokenId: market.tokenIds?.[outcome] || null,
-              negRisk: !!market.negRisk,
-              tickSize: market.tickSize || '0.01',
-              minShares: 1,
-              plan: { ...plan, arb: true, arbGap: arb.gap, holdToSettle: true },
-            };
-            // Temporarily allow 2 concurrent on slug for dual-leg
-            const prevMax = cfg.maxConcurrentPerSlug;
-            botState.config.maxConcurrentPerSlug = 2;
-            await executePendingTrade(pending);
-            botState.config.maxConcurrentPerSlug = prevMax;
-          }
-          action = 'arb';
-          log(`⚖️ CLOB ARB ${market.symbol} UP@${arb.upAsk.toFixed(3)}+DN@${arb.downAsk.toFixed(3)}=$${arb.sum} · gap +${arb.edgePct}% · ${shares} sh/leg`, 'buy', arb);
+      const edgeGateNow = evaluateEdgeGate(botState.trades, cfg);
+      const isArbOnlyMode = cfg.forceArbOnly === true || (cfg.arbOnlyUntilEdge !== false && !edgeGateNow.edgeOk);
+
+      // Atomic Arb Engine Execution: Execute ArbPackage and bypass directional evaluation when arb-only mode or gap is active
+      if (cfg.clobArbEnabled !== false && (isArbOnlyMode || arb)) {
+        const pkg = await detectAndExecuteArbPackage({
+          market,
+          depth,
+          prices,
+          cfg,
+          mode: cfg.mode || 'paper',
+          readiness,
+          log,
+          executeTrade: executePendingTrade,
+          adjustPaperCash,
+          saveTrade,
+          botState,
+        });
+
+        if (pkg && pkg.status === 'LOCKED') {
           signalsFound += 1;
+          action = 'arb';
         }
+      }
+
+      // When in Arb-Only mode (forceArbOnly or arbOnlyUntilEdge before edge), bypass directional pipeline
+      if (isArbOnlyMode) {
+        continue;
       }
 
       for (const outcome of targetOutcomes) {
@@ -2999,6 +2972,11 @@ async function scan() {
             entryPrice: pos.entryPrice, exitPrice: pos.exitPrice || price, gainPct, pnl: pos.pnl, shares: positionShares(pos),
             windowKey: win.key, openAt: win.startAtMs, endAt: win.endAtMs,
           });
+          continue;
+        }
+
+        // Package legs are immune from mid-window exits — hold strictly to settlement
+        if (pos.packageId || pos.isArbLeg) {
           continue;
         }
 

@@ -385,6 +385,18 @@ export async function createApp() {
     res.json(poly.getState(lean ? { lean: true } : {}));
   });
 
+  app.get('/api/poly/packages', (req, res) => {
+    try {
+      const mode = (req.query.mode as string) || poly.getState()?.config?.mode || 'paper';
+      const { loadPackages, getArbPackageMetrics } = require('./polymarket/arbEngine.js');
+      const packages = loadPackages().filter((p) => p.mode === mode);
+      const metrics = getArbPackageMetrics(mode);
+      res.json({ ok: true, packages, metrics });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
   app.get('/api/poly/stream', (req, res) => {
     const client = { res };
     polySseClients.push(client);
@@ -701,6 +713,7 @@ export async function createApp() {
       const depth = await getOrderBookDepth(tokenId);
       res.json(depth);
     } catch (err) {
+      if (res.headersSent) return;
       res.status(500).json({ error: err.message });
     }
   });
@@ -715,6 +728,7 @@ export async function createApp() {
       const refreshMl = req.query.ml === '1' || req.query.refreshMl === '1';
       res.json(await poly.sampleCharts({ refreshMl }));
     } catch (err) {
+      if (res.headersSent) return;
       res.status(500).json({ error: err.message });
     }
   });
@@ -723,6 +737,7 @@ export async function createApp() {
     try {
       res.json(await poly.refreshMLTraces(true));
     } catch (err) {
+      if (res.headersSent) return;
       res.status(500).json({ error: err.message });
     }
   });
