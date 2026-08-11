@@ -4,6 +4,7 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
+import { decodeSSE } from '@/lib/sse'
 
 const ASSETS = ['btc', 'eth']
 const WINDOWS = [
@@ -188,11 +189,11 @@ export default function SpotChart({ className }) {
 
   useEffect(() => {
     if (esRef.current) esRef.current.close()
-    const es = new EventSource('/api/v1/charts/spot/stream')
+    const es = new EventSource('/api/v1/charts/spot/stream?lz4=1')
     esRef.current = es
     es.onmessage = (e) => {
       try {
-        const data = JSON.parse(e.data)
+        const data = JSON.parse(decodeSSE(e.data))
         if (data.asset && data.tick && data.tick.price) {
           setCurrentPrice((prev) => ({ ...prev, [data.asset]: data.tick.price }))
           setHistory((prev) => {

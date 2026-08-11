@@ -20,6 +20,7 @@ import { polygon } from 'viem/chains';
 import fs from 'fs';
 import { refreshAllTokens, loadAutoSellConfig, saveAutoSellConfig } from './lib/monitor.js';
 import { sellToken, addTransaction, loadTransactions, getTokenFees } from './lib/pons.js';
+import { sseLine } from './lib/sse.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
@@ -69,9 +70,8 @@ async function collectStreamData(publicClient, wallet) {
 }
 
 function broadcast(clients, data) {
-  const msg = `data: ${JSON.stringify(data)}\n\n`;
   for (const client of clients) {
-    try { client.res.write(msg); } catch { /* gone */ }
+    try { client.res.write(client.lz4 ? sseLine(data) : `data: ${JSON.stringify(data)}\n\n`); } catch { /* gone */ }
   }
 }
 
@@ -366,7 +366,7 @@ export async function createApp() {
         return;
       }
       polySseClients = polySseClients.filter(c => {
-        try { c.res.write(`data: ${data}\n\n`); return true; }
+        try { c.res.write(c.lz4 ? sseLine(data) : `data: ${data}\n\n`); return true; }
         catch { try { c.res.end(); } catch {} return false; }
       });
     }, 150);
@@ -386,7 +386,7 @@ export async function createApp() {
   });
 
   app.get('/api/poly/stream', (req, res) => {
-    const client = { res };
+    const client = { res, lz4: req.query.lz4 === '1' || req.query.lz4 === 'true' };
     polySseClients.push(client);
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
@@ -397,7 +397,8 @@ export async function createApp() {
     });
     if (typeof res.flushHeaders === 'function') res.flushHeaders();
     try {
-      res.write(`data: ${JSON.stringify(poly.getState({ lean: true }))}\n\n`);
+      const state = JSON.stringify(poly.getState({ lean: true }));
+      res.write(client.lz4 ? sseLine(state) : `data: ${state}\n\n`);
     } catch (e) {
       console.error('[sse] initial write fail', e.message);
     }
@@ -806,7 +807,7 @@ export async function createApp() {
 
   // --- SSE Data Stream ---
   app.get('/api/stream', (req, res) => {
-    const client = { res };
+    const client = { res, lz4: req.query.lz4 === '1' || req.query.lz4 === 'true' };
     sseClients.push(client);
 
     res.writeHead(200, {

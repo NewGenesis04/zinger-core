@@ -23,6 +23,7 @@ import { AuthGate, ConnectButton, logoutAuth, WalletProviders } from './walletAu
 import { toast } from 'sonner'
 import { LiveCountdown, LiveClock, LiveTimeAgo, fmtTimeMs, POLY_POLL_MS } from './polyTimers'
 import { cn } from '@/lib/utils'
+import { decodeSSE } from '@/lib/sse'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
@@ -256,10 +257,10 @@ function usePolyState(intervalMs = POLY_POLL_MS) {
     function connectSSE() {
       if (!active) return
       try {
-        es = new EventSource('/api/poly/stream')
+        es = new EventSource('/api/poly/stream?lz4=1')
         es.onmessage = (e) => {
           try {
-            const data = JSON.parse(e.data)
+            const data = JSON.parse(decodeSSE(e.data))
             if (active) {
               setState((prev) => {
                 if (prev?.cycle?.serverTime && data.cycle?.serverTime && data.cycle.serverTime < prev.cycle.serverTime) {

@@ -27,6 +27,7 @@
     "dotenv": "^17.4.2",
     "express": "^5.1.0",
     "https-proxy-agent": "^9.1.0",
+    "lz4js": "^0.2.0",
     "node-telegram-bot-api": "^1.2.0",
     "onnxruntime-node": "^1.27.0",
     "openai": "^4.94.0",

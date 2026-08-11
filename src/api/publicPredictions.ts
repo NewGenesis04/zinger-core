@@ -30,6 +30,7 @@ import {
   loadStore as ledgerLoadStore,
   normalizeAddress,
 } from './pilotLedger.js';
+import { sseLine } from '../lib/sse.js';
 
 const predictionSseClients = new Set();
 const spotSseClients = new Set();
@@ -90,9 +91,8 @@ function corsHeaders() {
 }
 
 function sendSSE(clients, data) {
-  const msg = `data: ${JSON.stringify(data)}\n\n`;
   for (const client of clients) {
-    try { client.res.write(msg); } catch { clients.delete(client); }
+    try { client.res.write(client.lz4 ? sseLine(data) : `data: ${JSON.stringify(data)}\n\n`); } catch { clients.delete(client); }
   }
 }
 
@@ -104,7 +104,7 @@ function sseSetup(req, res, clients, metadata = {}) {
     'X-Accel-Buffering': 'no',
     ...corsHeaders(),
   });
-  const client = { res, ...metadata };
+  const client = { res, lz4: req.query.lz4 === '1' || req.query.lz4 === 'true', ...metadata };
   clients.add(client);
   req.on('close', () => clients.delete(client));
 }
@@ -907,8 +907,9 @@ export function registerPublicAPI(app, getPolyState) {
 
   app.get('/api/v1/predictions/stream', (req, res) => {
     sseSetup(req, res, predictionSseClients);
+    const lz4 = req.query.lz4 === '1' || req.query.lz4 === 'true';
     const state = getPolyState({ lean: true });
-    res.write(`data: ${JSON.stringify(buildPredictionResponse(state))}\n\n`);
+    res.write(lz4 ? sseLine(buildPredictionResponse(state)) : `data: ${JSON.stringify(buildPredictionResponse(state))}\n\n`);
     ensurePredictionNotifier();
   });
 
@@ -924,9 +925,10 @@ export function registerPublicAPI(app, getPolyState) {
 
   app.get('/api/v1/paper/stream', (req, res) => {
     sseSetup(req, res, paperSseClients);
+    const lz4 = req.query.lz4 === '1' || req.query.lz4 === 'true';
     const state = getPolyState({ lean: true });
     const body = buildPredictionResponse(state);
-    res.write(`data: ${JSON.stringify(body.botPaper)}\n\n`);
+    res.write(lz4 ? sseLine(body.botPaper) : `data: ${JSON.stringify(body.botPaper)}\n\n`);
     ensurePredictionNotifier();
   });
 
@@ -1441,16 +1443,17 @@ export function registerPublicAPI(app, getPolyState) {
       return res.set(corsHeaders()).status(400).json({ error: 'asset must be btc or eth' });
     }
     sseSetup(req, res, spotSseClients, { asset });
+    const lz4 = req.query.lz4 === '1' || req.query.lz4 === 'true';
     const limit = parseInt(req.query.limit) || 500;
     const data = buildSpotChartResponse(asset, limit);
-    res.write(`data: ${JSON.stringify(data)}\n\n`);
+    res.write(lz4 ? sseLine(data) : `data: ${JSON.stringify(data)}\n\n`);
     if (!_notifySpot) {
       _notifySpot = onSpotTick((asset, price, ts) => {
         if (spotSseClients.size === 0) return;
-        const msg = `data: ${JSON.stringify({ asset, tick: { t: ts, price }, timestamp: Date.now() })}\n\n`;
+        const tick = { asset, tick: { t: ts, price }, timestamp: Date.now() };
         for (const client of spotSseClients) {
           if (client.asset !== asset) continue;
-          try { client.res.write(msg); } catch { spotSseClients.delete(client); }
+          try { client.res.write(client.lz4 ? sseLine(tick) : `data: ${JSON.stringify(tick)}\n\n`); } catch { spotSseClients.delete(client); }
         }
       });
     }
