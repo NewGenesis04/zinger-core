@@ -247,7 +247,7 @@ export function getArbPackageMetrics(mode = 'paper') {
   const concludedCount = settled.length + aborted.length;
   const netProfitUsd = settled.reduce((sum, p) => sum + Number(p.lockedProfitUsd || 0), 0);
   const winCount = settled.length;
-  const winRatePct = concludedCount > 0 ? Math.round((winCount / concludedCount) * 1000) / 10 : 100;
+  const winRatePct = concludedCount > 0 ? Math.round((winCount / concludedCount) * 1000) / 10 : 0;
 
   return {
     totalPackages: all.length,

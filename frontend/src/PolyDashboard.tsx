@@ -2199,8 +2199,8 @@ function PolyShell({
                 const wins = trades.filter((t) => (t.pnl || 0) > 0)
                 const losses = trades.filter((t) => (t.pnl || 0) <= 0)
                 const totalPnl = trades.reduce((s, t) => s + (t.pnl || 0), 0)
-                const best = trades.reduce((b, t) => ((t.pnl || 0) > (b?.pnl || -Infinity) ? t : b), null)
-                const worst = trades.reduce((b, t) => ((t.pnl || 0) < (b?.pnl || Infinity) ? t : b), null)
+                const best = wins.length > 0 ? wins.reduce((b, t) => ((t.pnl || 0) > (b?.pnl || -Infinity) ? t : b), null) : null
+                const worst = losses.length > 0 ? losses.reduce((b, t) => ((t.pnl || 0) < (b?.pnl || Infinity) ? t : b), null) : null
                 const wr = trades.length ? (wins.length / trades.length) * 100 : 0
                 const ca = poly.cashAudit || {}
                 const win = poly.windows?.current || {}
