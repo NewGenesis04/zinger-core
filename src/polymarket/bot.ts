@@ -3951,7 +3951,11 @@ export function resetLiveData({ baselineUsd = null } = {}) {
 async function executeSell(pos, reason = 'manual') {
   if (!pos || pos.closed) return { ok: false, error: 'Position not found or already closed' };
 
-  const price = pos.currentPrice || pos.entryPrice;
+  let price = pos.currentPrice || pos.entryPrice;
+  if (reason === 'settle' && pos.mode === 'paper' && pos.isArbLeg) {
+    price = 0.50; // Guaranteed $1.00 payout distributed evenly across the 2 hedge legs
+  }
+
   markPosition(pos, price);
 
   if (pos.mode === 'live' && pos.tokenId && positionShares(pos) > 0) {
