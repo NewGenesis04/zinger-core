@@ -1,6 +1,13 @@
 // @ts-nocheck
 import fs from 'fs';
 import path from 'path';
+import {
+  SQLITE_AVAILABLE,
+  loadFileOrStore,
+  saveFileOrStore,
+  getDb,
+  migrateDir,
+} from './sqliteStore.js';
 
 const DEFAULT_DATA_DIR = path.resolve(import.meta.dirname, '../../data');
 const DATA_DIR = process.env.ZINGER_DATA_DIR
@@ -11,58 +18,16 @@ if (!fs.existsSync(DATA_DIR)) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
 }
 
-const queues = new Map();
-const pendingFlush = new Map();
-
-function atomicWrite(filePath, data) {
-  const tmp = filePath + '.tmp';
-  fs.writeFileSync(tmp, JSON.stringify(data, null, 2), 'utf-8');
-  fs.renameSync(tmp, filePath);
-}
-
-function enqueue(file, data) {
-  if (!queues.has(file)) queues.set(file, []);
-  queues.get(file).push(data);
-  if (!pendingFlush.has(file)) {
-    pendingFlush.set(file, setTimeout(() => flush(file), 0));
-  }
-}
-
-function flush(file) {
-  pendingFlush.delete(file);
-  const items = queues.get(file);
-  if (!items || items.length === 0) return;
-  queues.set(file, []);
-  const last = items[items.length - 1];
-  try {
-    atomicWrite(file, last);
-  } catch (err) {
-    console.error(`[persist] write error ${path.basename(file)}: ${err.message}`);
-    queues.set(file, [...items]);
-  }
-}
-
 export function persist(file, data) {
-  enqueue(file, data);
+  saveFileOrStore(file, data);
 }
 
 export function persistSync(file, data) {
-  clearTimeout(pendingFlush.get(file));
-  pendingFlush.delete(file);
-  queues.delete(file);
-  try {
-    atomicWrite(file, data);
-  } catch (err) {
-    console.error(`[persist] sync write error ${path.basename(file)}: ${err.message}`);
-  }
+  saveFileOrStore(file, data);
 }
 
 export function load(file, fallback = null) {
-  try {
-    return JSON.parse(fs.readFileSync(file, 'utf-8'));
-  } catch {
-    return fallback;
-  }
+  return loadFileOrStore(file, fallback);
 }
 
 export function loadWithDefault(file, defaults) {
@@ -78,6 +43,15 @@ export function dataPath(name) {
 
 export function getDataDir() {
   return DATA_DIR;
+}
+
+export function migrateLegacyStores() {
+  if (!SQLITE_AVAILABLE) return { imported: 0, skipped: 0 };
+  return migrateDir(DATA_DIR);
+}
+
+export function sqliteEnabled() {
+  return SQLITE_AVAILABLE && getDb() != null;
 }
 
 export const FILES = {

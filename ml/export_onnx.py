@@ -10,6 +10,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from model import ZingerLSTM
+from sqlite_store import store_save
 
 MODEL_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data/ml/models')
 EXPORT_DIR = os.path.join(MODEL_DIR, 'onnx')
@@ -100,11 +101,9 @@ def main():
         if result:
             results.append(result)
 
-    manifest = os.path.join(EXPORT_DIR, 'manifest.json')
-    with open(manifest, 'w') as f:
-        json.dump(results, f, indent=2)
+    store_save('ml/models/onnx/manifest.json', results)
     print(f'\nDone: {len(results)}/{len(pt_files)} models exported')
-    print(f'Manifest: {manifest}')
+    print(f'Manifest saved to sqlite (ml/models/onnx/manifest.json)')
 
 
 if __name__ == '__main__':

@@ -15,6 +15,7 @@ from config import (
     SYMBOLS, TIMEFRAMES, MODEL_DIR, BATCH_SIZE, LR, EPOCHS_LSTM,
     EARLY_STOP_PATIENCE, LSTM_HIDDEN, LSTM_LAYERS, DROPOUT,
 )
+from sqlite_store import store_save
 from data import fetch_all
 from features import add_technical_indicators, add_meta_features
 from dataset import build_dataloader
@@ -191,8 +192,7 @@ def train(force_retrain=False):
                             break
 
                 print(f'  ✓ Best val_loss: {best_val_loss:.4f}, val_acc: {best_acc:.3f}')
-                with open(os.path.join(MODEL_DIR, f'{label}_history.json'), 'w') as f:
-                    json.dump(history, f)
+                store_save(f'ml/models/{label}_history.json', history)
 
                 # Cleanup
                 del model, train_loader, val_loader
