@@ -54,13 +54,17 @@ function saveJson(file, data) {
   fs.renameSync(tmp, file);
 }
 
+let _optCache = null;
 export function getOptimizerStatus() {
-  const disk = loadJson(OPT_FILE, {});
-  return { ..._state, ...disk, llm: llmStatus(), bounds: BOUNDS };
+  if (!_optCache) _optCache = loadJson(OPT_FILE, {});
+  return { ..._state, ..._optCache, llm: llmStatus(), bounds: BOUNDS };
 }
 
+let _perfCache = null;
 export function loadSessionPerf() {
-  return loadJson(PERF_FILE, { sessions: [], updatedAt: null });
+  if (_perfCache) return _perfCache;
+  _perfCache = loadJson(PERF_FILE, { sessions: [], updatedAt: null });
+  return _perfCache;
 }
 
 export function saveSessionPerf(entry) {
@@ -73,6 +77,7 @@ export function saveSessionPerf(entry) {
   store.sessions = [row, ...(store.sessions || [])].slice(0, 200);
   store.updatedAt = Date.now();
   saveJson(PERF_FILE, store);
+  _perfCache = store;
   return row;
 }
 
@@ -275,12 +280,14 @@ export async function runOptimizer({ state, saveConfig, log, apply = true, useLl
     };
 
     _state.lastResult = result;
-    saveJson(OPT_FILE, {
+    const payload = {
       lastRunAt: _state.lastRunAt,
       lastApplyAt: _state.lastApplyAt,
       lastResult: result,
       enabled: _state.enabled,
-    });
+    };
+    saveJson(OPT_FILE, payload);
+    _optCache = payload;
 
     if (applied && log) {
       const keys = Object.keys(merged).join(', ');
