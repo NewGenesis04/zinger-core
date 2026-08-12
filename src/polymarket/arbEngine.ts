@@ -13,7 +13,7 @@ export async function detectAndExecuteArbPackage({
   depth,
   prices,
   cfg,
-  mode = 'paper',
+  mode = 'paper' as 'paper' | 'live',
   readiness,
   log,
   executeTrade,
@@ -22,6 +22,9 @@ export async function detectAndExecuteArbPackage({
   botState,
 }) {
   if (cfg.clobArbEnabled === false) return null;
+  // The $1.00 guaranteed payout (both legs held to settlement) only exists on
+  // negRisk markets — never execute arb packages on markets that can lose both legs.
+  if (market.negRisk !== true) return null;
 
   const upAsk = Number(depth?.up?.bestAsk || prices?.up || 0);
   const downAsk = Number(depth?.down?.bestAsk || prices?.down || 0);
@@ -90,13 +93,24 @@ export async function detectAndExecuteArbPackage({
 
   savePackage(pkg);
 
-  // Execution: Dispatch both legs concurrently
+  // Execution: Dispatch both legs concurrently.
+  // Both legs share the same slug, so raise the per-slug concurrency cap for
+  // the duration of the atomic dispatch and restore it once — doing this inside
+  // each leg races under Promise.allSettled (one leg can restore while the
+  // other still executes).
+  const prevMax = botState?.config?.maxConcurrentPerSlug;
+  if (botState?.config) botState.config.maxConcurrentPerSlug = 2;
+  let results;
   try {
-    const results = await Promise.allSettled([
-      executeArbLeg({ outcome: 'up', price: upAsk, cost: costUp, shares, pkg, market, cfg, mode, executeTrade, botState }),
-      executeArbLeg({ outcome: 'down', price: downAsk, cost: costDown, shares, pkg, market, cfg, mode, executeTrade, botState }),
+    results = await Promise.allSettled([
+      executeArbLeg({ outcome: 'up', price: upAsk, cost: costUp, shares, pkg, market, executeTrade }),
+      executeArbLeg({ outcome: 'down', price: downAsk, cost: costDown, shares, pkg, market, executeTrade }),
     ]);
+  } finally {
+    if (botState?.config && prevMax != null) botState.config.maxConcurrentPerSlug = prevMax;
+  }
 
+  try {
     const upRes = results[0];
     const downRes = results[1];
 
@@ -144,7 +158,7 @@ export async function detectAndExecuteArbPackage({
   }
 }
 
-async function executeArbLeg({ outcome, price, cost, shares, pkg, market, cfg, mode, executeTrade, botState }) {
+async function executeArbLeg({ outcome, price, cost, shares, pkg, market, executeTrade }) {
   const plan = {
     symbol: market.symbol,
     slug: market.slug,
@@ -177,17 +191,7 @@ async function executeArbLeg({ outcome, price, cost, shares, pkg, market, cfg, m
     plan,
   };
 
-  const prevMax = botState.config.maxConcurrentPerSlug;
-  botState.config.maxConcurrentPerSlug = 2;
-
-  try {
-    const res = await executeTrade(pending);
-    botState.config.maxConcurrentPerSlug = prevMax;
-    return !!res;
-  } catch (err) {
-    botState.config.maxConcurrentPerSlug = prevMax;
-    throw err;
-  }
+  return !!(await executeTrade(pending));
 }
 
 async function unwindLeg({ outcome, pkg, market, mode, botState, log, adjustPaperCash }) {
@@ -204,9 +208,11 @@ async function unwindLeg({ outcome, pkg, market, mode, botState, log, adjustPape
     if (adjustPaperCash) {
       adjustPaperCash(refund, `ROLLBACK ${pos.symbol} ${outcome.toUpperCase()}`);
     } else {
-      // Fallback if not injected directly
-      const bot = await import('./bot.js').catch(() => ({ adjustPaperCash: () => {} }));
-      if (bot.adjustPaperCash) bot.adjustPaperCash(refund, `ROLLBACK ${pos.symbol} ${outcome.toUpperCase()}`);
+      // Fallback if not injected directly (typed loosely — dynamic import to avoid a cycle)
+      const mod = (await import('./bot.js').catch(() => null)) as unknown as {
+        adjustPaperCash?: (amount: number, note: string) => void;
+      } | null;
+      if (mod?.adjustPaperCash) mod.adjustPaperCash(refund, `ROLLBACK ${pos.symbol} ${outcome.toUpperCase()}`);
     }
   }
 

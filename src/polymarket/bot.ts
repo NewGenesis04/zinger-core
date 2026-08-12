@@ -334,7 +334,8 @@ function sideBalanceBonus(outcome, cfg) {
   return { bonus: 0, note: null, up, down, upShare };
 }
 
-function detectClobArb(depth, prices, cfg) {
+function detectClobArb(depth, prices, cfg, market) {
+  if (market?.negRisk !== true) return null;
   const upAsk = Number(depth?.up?.bestAsk || prices?.up || 0);
   const downAsk = Number(depth?.down?.bestAsk || prices?.down || 0);
   if (!(upAsk > 0.01 && downAsk > 0.01 && upAsk < 0.99 && downAsk < 0.99)) return null;
@@ -2494,7 +2495,7 @@ async function scan() {
         position.symbol === market.symbol && position.slug === market.slug && !position.closed
       );
 
-      const arb = cfg.clobArbEnabled !== false ? detectClobArb(depth, prices, cfg) : null;
+      const arb = cfg.clobArbEnabled !== false ? detectClobArb(depth, prices, cfg, market) : null;
       if (arb) {
         market.arb = arb;
       }

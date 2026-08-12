@@ -1,4 +1,5 @@
 // @ts-nocheck
+import fs from 'fs';
 import { load, persistSync, FILES } from './persistence.js';
 
 export interface ArbLegInfo {
@@ -36,11 +37,25 @@ export interface ArbPackage {
 }
 
 let packageMemoryCache: ArbPackage[] | null = null;
+let cacheFileState = 0;
+
+// Cheap staleness check so the in-memory cache still picks up external writes
+// (e.g. a second instance sharing the data dir) without a full read each tick.
+function fileState(): number {
+  try {
+    const st = fs.statSync(FILES.PACKAGES);
+    return st.mtimeMs + st.size;
+  } catch {
+    return -1;
+  }
+}
 
 export function loadPackages(): ArbPackage[] {
-  if (packageMemoryCache) return packageMemoryCache;
+  const state = fileState();
+  if (packageMemoryCache && state === cacheFileState) return packageMemoryCache;
   const raw = load(FILES.PACKAGES, []);
   packageMemoryCache = Array.isArray(raw) ? raw : [];
+  cacheFileState = state;
   return packageMemoryCache;
 }
 

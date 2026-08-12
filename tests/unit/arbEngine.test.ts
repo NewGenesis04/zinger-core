@@ -13,6 +13,7 @@ describe('Atomic Arb Engine', () => {
       slug: 'eth-5m-test',
       tokenIds: { up: 'token-up-1', down: 'token-down-1' },
       acceptingOrders: true,
+      negRisk: true,
     };
 
     const depth = {
@@ -57,7 +58,7 @@ describe('Atomic Arb Engine', () => {
   });
 
   it('rejects arbitrage execution when ask sum exceeds 1 - minArbGap', async () => {
-    const market = { symbol: 'BTC', slug: 'btc-5m-test', tokenIds: { up: 'u', down: 'd' } };
+    const market = { symbol: 'BTC', slug: 'btc-5m-test', tokenIds: { up: 'u', down: 'd' }, negRisk: true };
     const depth = { up: { bestAsk: 0.51 }, down: { bestAsk: 0.50 } }; // sum = 1.01 (no gap)
 
     const cfg = { clobArbEnabled: true, minArbGap: 0.015, maxArbPackages: 4, paperBankroll: 100 };
@@ -78,9 +79,23 @@ describe('Atomic Arb Engine', () => {
     expect(pkg).toBeNull();
   });
 
+  it('rejects arb execution on non-negRisk markets', async () => {
+    const market = { symbol: 'ETH', slug: 'eth-nonnegrisk', tokenIds: { up: 'u', down: 'd' }, negRisk: false };
+    const depth = { up: { bestAsk: 0.34 }, down: { bestAsk: 0.62 } }; // big gap, would lock if allowed
+    const cfg = { clobArbEnabled: true, minArbGap: 0.015, maxArbPackages: 4, paperBankroll: 100, mode: 'paper' };
+
+    const pkg = await detectAndExecuteArbPackage({
+      market, depth, prices: { up: 0.34, down: 0.62 }, cfg, mode: 'paper',
+      log: () => {}, executeTrade: async () => true, adjustPaperCash: () => {}, saveTrade: () => {},
+      botState: { config: {}, positions: [] },
+    });
+
+    expect(pkg).toBeNull();
+  });
+
   it('enforces maxArbPackages capacity limit', async () => {
-    const market1 = { symbol: 'ETH', slug: 'eth-1', tokenIds: { up: 'u1', down: 'd1' } };
-    const market2 = { symbol: 'ETH', slug: 'eth-2', tokenIds: { up: 'u2', down: 'd2' } };
+    const market1 = { symbol: 'ETH', slug: 'eth-1', tokenIds: { up: 'u1', down: 'd1' }, negRisk: true };
+    const market2 = { symbol: 'ETH', slug: 'eth-2', tokenIds: { up: 'u2', down: 'd2' }, negRisk: true };
 
     const cfg = { clobArbEnabled: true, minArbGap: 0.015, maxArbPackages: 1, paperBankroll: 100, mode: 'paper' };
     const depth = { up: { bestAsk: 0.34 }, down: { bestAsk: 0.62 } };
@@ -118,7 +133,7 @@ describe('Atomic Arb Engine', () => {
   });
 
   it('passes valid numeric entryPrice in order plans to trade execution', async () => {
-    const market = { symbol: 'ETH', slug: 'eth-plan-test', tokenIds: { up: 'u', down: 'd' } };
+    const market = { symbol: 'ETH', slug: 'eth-plan-test', tokenIds: { up: 'u', down: 'd' }, negRisk: true };
     const depth = { up: { bestAsk: 0.34 }, down: { bestAsk: 0.62 } };
     const cfg = { clobArbEnabled: true, minArbGap: 0.015, paperBankroll: 100, mode: 'paper' };
 

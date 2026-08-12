@@ -20,6 +20,7 @@ import { polygon } from 'viem/chains';
 import fs from 'fs';
 import { refreshAllTokens, loadAutoSellConfig, saveAutoSellConfig } from './lib/monitor.js';
 import { sellToken, addTransaction, loadTransactions, getTokenFees } from './lib/pons.js';
+import { loadPackages, getArbPackageMetrics } from './polymarket/arbEngine.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
@@ -388,7 +389,6 @@ export async function createApp() {
   app.get('/api/poly/packages', (req, res) => {
     try {
       const mode = (req.query.mode as string) || poly.getState()?.config?.mode || 'paper';
-      const { loadPackages, getArbPackageMetrics } = require('./polymarket/arbEngine.js');
       const packages = loadPackages().filter((p) => p.mode === mode);
       const metrics = getArbPackageMetrics(mode);
       res.json({ ok: true, packages, metrics });
