@@ -59,4 +59,6 @@ export const FILES = {
   TRADES: path.join(DATA_DIR, 'poly_trades.json'),
   POSITIONS: path.join(DATA_DIR, 'poly_positions.json'),
   ACTIONS: path.join(DATA_DIR, 'poly_actions.json'),
+  PACKAGES: path.join(DATA_DIR, 'poly_packages.json'),
 };
+

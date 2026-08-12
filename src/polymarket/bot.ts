@@ -38,6 +38,7 @@ import { getMLSignalForBoth, getMLTraceForBoth } from './predict.js';
 import { addMLPrediction, addPriceTrace, getConfidenceBias, getConfidenceBufferStats, getPriceTrace } from './confidence.js';
 import { addSpotTick } from './spotPriceHistory.js';
 import { getModelStates, getModelHealth, onModelChange } from './modelRegistry.js';
+import { detectAndExecuteArbPackage, syncPackageSettlements, getArbPackageMetrics, loadPackages } from './arbEngine.js';
 import { persist, persistSync, load, FILES, dataPath } from './persistence.js';
 import { placeOrder, placeMarketSell, syncClobBalance } from './trade.js';
 import { checkReadiness } from './readiness.js';
@@ -333,7 +334,8 @@ function sideBalanceBonus(outcome, cfg) {
   return { bonus: 0, note: null, up, down, upShare };
 }
 
-function detectClobArb(depth, prices, cfg) {
+function detectClobArb(depth, prices, cfg, market) {
+  if (market?.negRisk !== true) return null;
   const upAsk = Number(depth?.up?.bestAsk || prices?.up || 0);
   const downAsk = Number(depth?.down?.bestAsk || prices?.down || 0);
   if (!(upAsk > 0.01 && downAsk > 0.01 && upAsk < 0.99 && downAsk < 0.99)) return null;
@@ -370,7 +372,7 @@ function repairPaperOverdraft(reason = 'overdraft repair') {
   while (booksCash() < -0.01 && guard < 120) {
     guard += 1;
     const open = botState.positions
-      .filter((p) => !p.closed && p.mode === 'paper')
+      .filter((p) => !p.closed && p.mode === 'paper' && !p.packageId && !p.isArbLeg)
       .sort((a, b) => (a.entryTime || 0) - (b.entryTime || 0));
     if (!open.length) break;
     const pos = open[0];
@@ -706,14 +708,15 @@ async function executePendingTrade(pending) {
     return { ok: false, error: 'insufficient paper cash' };
   }
 
+  const entryPx = Number(plan.entryPrice ?? plan.price ?? 0);
   const pos = {
     id: Date.now().toString(36) + Math.random().toString(36).slice(2, 5),
     symbol: pending.symbol,
     slug: pending.slug,
     outcome: pending.outcome,
-    entryPrice: plan.entryPrice,
-    currentPrice: plan.entryPrice,
-    highestPrice: plan.entryPrice,
+    entryPrice: entryPx,
+    currentPrice: entryPx,
+    highestPrice: entryPx,
     size: plan.sizeUsd,
     shares: plan.shares,
     pnl: 0,
@@ -732,6 +735,8 @@ async function executePendingTrade(pending) {
     holdToSettle: !!plan.holdToSettle,
     planMethod: plan.planMethod || plan.method || null,
     arb: !!plan.arb,
+    packageId: plan.packageId || null,
+    isArbLeg: !!plan.isArbLeg || !!plan.arb,
     effectiveSlPct: plan.slPct,
     adaptiveSlArmed: false,
     volFactor: plan.volFactor,
@@ -751,7 +756,7 @@ async function executePendingTrade(pending) {
     try {
       // Min-share inflation guard: 5-share exchange minimum can blow a small budget
       const minSh = Number(pending.minShares || 5);
-      const realCost = Math.max(Number(plan.sizeUsd || 0), minSh * Number(plan.entryPrice || 0));
+      const realCost = Math.max(Number(plan.sizeUsd || 0), minSh * entryPx);
       const spendable = Number(botState.readiness?.spendableBalance ?? botState.readiness?.clobBalance ?? 0);
       if (realCost > spendable * 0.95) {
         pending.status = 'failed';
@@ -763,18 +768,18 @@ async function executePendingTrade(pending) {
       if (realCost > Math.max(capUsd * 1.6, 4.5)) {
         pending.status = 'failed';
         botState._buyLocks.delete(pending.slug);
-        log(`⛔ LIVE SKIP ${pending.symbol} — min order $${realCost.toFixed(2)} (${minSh} sh @ $${plan.entryPrice}) blows cap $${capUsd}`, 'error');
+        log(`⛔ LIVE SKIP ${pending.symbol} — min order $${realCost.toFixed(2)} (${minSh} sh @ $${entryPx}) blows cap $${capUsd}`, 'error');
         return { ok: false, error: 'min order exceeds risk cap' };
       }
-      log(`🛰️ LIVE ORDER SUBMIT ${pending.symbol} ${pending.outcome.toUpperCase()} @ $${plan.entryPrice.toFixed(3)}`, 'signal', {
+      log(`🛰️ LIVE ORDER SUBMIT ${pending.symbol} ${pending.outcome.toUpperCase()} @ $${entryPx.toFixed(3)}`, 'signal', {
         market: pending.symbol, slug: pending.slug, outcome: pending.outcome,
-        amount: plan.sizeUsd, price: plan.entryPrice, announceId: pending.id,
+        amount: plan.sizeUsd, price: entryPx, announceId: pending.id,
       });
       const orderResult = await placeOrder({
         tokenId: pending.tokenId,
         side: 'buy',
         amountUsd: plan.sizeUsd,
-        price: plan.entryPrice,
+        price: entryPx,
         negRisk: pending.negRisk,
         tickSize: pending.tickSize || '0.01',
         minShares: pending.minShares || 5,
@@ -784,7 +789,7 @@ async function executePendingTrade(pending) {
       pos.entryPrice = orderResult.price;
       markPosition(pos, orderResult.price);
       try { await syncClobBalance(); await refreshTelemetry(); } catch {}
-      log(`✅ LIVE BUY ${pending.symbol} ${pending.outcome.toUpperCase()} @ $${orderResult.price.toFixed(3)} · ${orderResult.size} sh · TP $${plan.tpPrice.toFixed(3)} · SL $${plan.slPrice.toFixed(3)}`, 'buy', {
+      log(`✅ LIVE BUY ${pending.symbol} ${pending.outcome.toUpperCase()} @ $${orderResult.price.toFixed(3)} · ${orderResult.size} sh · TP $${Number(plan.tpPrice || 0).toFixed(3)} · SL $${Number(plan.slPrice || 0).toFixed(3)}`, 'buy', {
         market: pending.symbol, slug: pending.slug, outcome: pending.outcome,
         orderId: pos.orderId, amount: plan.sizeUsd, price: orderResult.price,
         shares: orderResult.size, targetTp: plan.targetTp, tpPrice: plan.tpPrice, slPrice: plan.slPrice,
@@ -811,7 +816,7 @@ async function executePendingTrade(pending) {
       return { ok: false, error: err.message };
     }
   } else {
-    markPosition(pos, plan.entryPrice);
+    markPosition(pos, entryPx);
     const premium = Number(pos.costBasis || plan.sizeUsd || 0);
     const feeCategory = cfg.feeCategory || 'crypto';
     const feeOn = cfg.simulateClobFees !== false;
@@ -819,16 +824,16 @@ async function executePendingTrade(pending) {
     const entryFee = !feeOn
       ? 0
       : (useClobFees && pending.tokenId)
-        ? await takerFeeUsdcForToken(pos.shares, plan.entryPrice, pending.tokenId, feeCategory)
-        : takerFeeUsdc(pos.shares, plan.entryPrice, feeCategory);
+        ? await takerFeeUsdcForToken(pos.shares, entryPx, pending.tokenId, feeCategory)
+        : takerFeeUsdc(pos.shares, entryPx, feeCategory);
     pos.entryFee = entryFee;
     pos.feesPaid = entryFee;
     pos.costBasis = premium;
     const debit = Math.round((premium + entryFee) * 100) / 100;
-    adjustPaperCash(-debit, `BUY ${pending.symbol} ${pending.outcome?.toUpperCase()} @ ${plan.entryPrice}`);
-    log(`✅ PAPER BUY ${pending.symbol} ${pending.outcome.toUpperCase()} @ $${plan.entryPrice.toFixed(3)} · $${premium.toFixed(2)} + fee $${entryFee.toFixed(4)} · TP +${plan.targetTp}% · SL -${plan.slPct}%`, 'buy', {
+    adjustPaperCash(-debit, `BUY ${pending.symbol} ${pending.outcome?.toUpperCase()} @ ${entryPx.toFixed(3)}`);
+    log(`✅ PAPER BUY ${pending.symbol} ${pending.outcome.toUpperCase()} @ $${entryPx.toFixed(3)} · $${premium.toFixed(2)} + fee $${entryFee.toFixed(4)} · TP +${plan.targetTp}% · SL -${plan.slPct}%`, 'buy', {
       market: pending.symbol, slug: pending.slug, outcome: pending.outcome,
-      amount: plan.sizeUsd, price: plan.entryPrice, targetTp: plan.targetTp, tpPrice: plan.tpPrice, slPrice: plan.slPrice,
+      amount: plan.sizeUsd, price: entryPx, targetTp: plan.targetTp, tpPrice: plan.tpPrice, slPrice: plan.slPrice,
       entryFee,
     });
   }
@@ -1865,6 +1870,11 @@ export function getState(opts = {}) {
     },
     audit,
     portfolio,
+    packages: (() => {
+      syncPackageSettlements(botState.trades, mode);
+      return loadPackages().filter((p) => p.mode === mode);
+    })(),
+    arbMetrics: getArbPackageMetrics(mode),
   };
   const narrative = buildSystemNarrative(stateCore);
   const liveScoreCards = buildLiveScoreCards(stateCore);
@@ -2129,7 +2139,7 @@ async function scanOpenExitsFast() {
     const prices = await getPricesForMarket(market).catch(() => ({}));
     const depth = await getDepthForMarket(market).catch(() => null);
     for (const pos of positions) {
-      if (pos.closed) continue;
+      if (pos.closed || pos.packageId || pos.isArbLeg) continue;
       const mark = exitMarkPrice(pos.outcome, prices, depth);
       if (!mark) continue;
       markPosition(pos, mark);
@@ -2485,74 +2495,39 @@ async function scan() {
         position.symbol === market.symbol && position.slug === market.slug && !position.closed
       );
 
-      const arb = cfg.clobArbEnabled !== false ? detectClobArb(depth, prices, cfg) : null;
+      const arb = cfg.clobArbEnabled !== false ? detectClobArb(depth, prices, cfg, market) : null;
       if (arb) {
         market.arb = arb;
       }
 
-      // Exploit: buy BOTH legs when ask sum < 1 − minArbGap (guaranteed settlement edge)
-      if (
-        arb
-        && remaining > Number(cfg.minRemainingSec ?? 15)
-        && market.acceptingOrders
-        && countOpenPositions(cfg.mode) + 2 <= Number(cfg.maxOpenPositions ?? 6)
-        && !botState.positions.some((p) => !p.closed && p.slug === market.slug)
-      ) {
-        // Guaranteed settlement edge — size it off the whole book, not a flat $4 cap.
-        // A riskless arb on a $100 account should commit real money, not pocket change.
-        const arbBank = cfg.mode === 'paper'
-          ? Number(cfg.paperBankroll ?? 0)
-          : Number(readiness?.spendableBalance ?? readiness?.clobBalance ?? 0);
-        const shareBudget = Math.max(
-          Number(cfg.minPositionSize ?? 0.5) * 2,
-          Math.min(
-            arbBank * Number(cfg.arbBankrollFrac ?? 0.25),
-            Number(cfg.arbMaxUsd ?? 40),
-          ),
-        );
-        const shares = Math.max(0.5, Math.round((shareBudget / arb.sum) * 1000) / 1000);
-        const costUp = Math.round(shares * arb.upAsk * 100) / 100;
-        const costDown = Math.round(shares * arb.downAsk * 100) / 100;
-        const totalCost = costUp + costDown;
-        const canPay = cfg.mode !== 'paper' || Number(cfg.paperBankroll ?? 0) >= totalCost + 0.01;
-        if (canPay && shares > 0) {
-          for (const [outcome, ask, cost] of [['up', arb.upAsk, costUp], ['down', arb.downAsk, costDown]]) {
-            const plan = buildTradePlan({
-              cfg, market, outcome, price: ask, remaining, signal,
-              sizeUsd: cost, kelly: { method: 'clob_arb', gap: arb.gap }, analysis: signal,
-            });
-            plan.shares = shares;
-            plan.costEst = cost;
-            plan.sizeUsd = cost;
-            plan.targetTp = Math.max(plan.targetTp, arb.edgePct);
-            // Arb legs must hold to settlement — never mid-cycle TP/SL grind
-            plan.holdToSettle = true;
-            plan.adaptiveSlEnabled = false;
-            plan.slPct = Number(cfg.holdToSettleDisasterSlPct ?? 42);
-            plan.partialTpPct = 999;
-            plan.trailActivatePct = 999;
-            const pending = {
-              id: `arb-${outcome}-${Date.now().toString(36)}`,
-              status: 'pending',
-              symbol: market.symbol,
-              slug: market.slug,
-              outcome,
-              tokenId: market.tokenIds?.[outcome] || null,
-              negRisk: !!market.negRisk,
-              tickSize: market.tickSize || '0.01',
-              minShares: 1,
-              plan: { ...plan, arb: true, arbGap: arb.gap, holdToSettle: true },
-            };
-            // Temporarily allow 2 concurrent on slug for dual-leg
-            const prevMax = cfg.maxConcurrentPerSlug;
-            botState.config.maxConcurrentPerSlug = 2;
-            await executePendingTrade(pending);
-            botState.config.maxConcurrentPerSlug = prevMax;
-          }
-          action = 'arb';
-          log(`⚖️ CLOB ARB ${market.symbol} UP@${arb.upAsk.toFixed(3)}+DN@${arb.downAsk.toFixed(3)}=$${arb.sum} · gap +${arb.edgePct}% · ${shares} sh/leg`, 'buy', arb);
+      const edgeGateNow = evaluateEdgeGate(botState.trades, cfg);
+      const isArbOnlyMode = cfg.forceArbOnly === true || (cfg.arbOnlyUntilEdge !== false && !edgeGateNow.edgeOk);
+
+      // Atomic Arb Engine Execution: Execute ArbPackage and bypass directional evaluation when arb-only mode or gap is active
+      if (cfg.clobArbEnabled !== false && (isArbOnlyMode || arb)) {
+        const pkg = await detectAndExecuteArbPackage({
+          market,
+          depth,
+          prices,
+          cfg,
+          mode: cfg.mode || 'paper',
+          readiness,
+          log,
+          executeTrade: executePendingTrade,
+          adjustPaperCash,
+          saveTrade,
+          botState,
+        });
+
+        if (pkg && pkg.status === 'LOCKED') {
           signalsFound += 1;
+          action = 'arb';
         }
+      }
+
+      // When in Arb-Only mode (forceArbOnly or arbOnlyUntilEdge before edge), bypass directional pipeline
+      if (isArbOnlyMode) {
+        continue;
       }
 
       for (const outcome of targetOutcomes) {
@@ -2999,6 +2974,11 @@ async function scan() {
             entryPrice: pos.entryPrice, exitPrice: pos.exitPrice || price, gainPct, pnl: pos.pnl, shares: positionShares(pos),
             windowKey: win.key, openAt: win.startAtMs, endAt: win.endAtMs,
           });
+          continue;
+        }
+
+        // Package legs are immune from mid-window exits — hold strictly to settlement
+        if (pos.packageId || pos.isArbLeg) {
           continue;
         }
 
@@ -3972,7 +3952,11 @@ export function resetLiveData({ baselineUsd = null } = {}) {
 async function executeSell(pos, reason = 'manual') {
   if (!pos || pos.closed) return { ok: false, error: 'Position not found or already closed' };
 
-  const price = pos.currentPrice || pos.entryPrice;
+  let price = pos.currentPrice || pos.entryPrice;
+  if (reason === 'settle' && pos.mode === 'paper' && pos.isArbLeg) {
+    price = 0.50; // Guaranteed $1.00 payout distributed evenly across the 2 hedge legs
+  }
+
   markPosition(pos, price);
 
   if (pos.mode === 'live' && pos.tokenId && positionShares(pos) > 0) {

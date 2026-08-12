@@ -533,10 +533,16 @@ function BehaviorForm({
           {numField('certaintyMaxUsd', 'Certainty max $', '1')}
           {numField('arbBankrollFrac', 'Arb bankroll frac', '0.05')}
           {numField('arbMaxUsd', 'Arb max $', '1')}
+          {numField('maxArbPackages', 'Max arb packages')}
           {numField('governorDrawdownPct', 'Governor breaker %', '0.01')}
           {numField('governorRevertTrades', 'Governor revert trades')}
           {numField('edgeMinTrades', 'Edge min paper trades')}
         </FieldGroup>
+        {draft.forceArbOnly && (
+          <div className="mt-2.5 rounded-lg border border-cyan-500/40 bg-cyan-500/10 p-2.5 text-xs text-cyan-300">
+            ⚡ <strong>Force Pure Arb Active:</strong> Directional SL/TP, signals, ML overlays, and ATR stops are <strong>bypassed</strong> by the Atomic Arb Engine.
+          </div>
+        )}
       </FieldSet>
 
       <FieldSet>
@@ -2194,8 +2200,8 @@ function PolyShell({
                 const wins = trades.filter((t) => (t.pnl || 0) > 0)
                 const losses = trades.filter((t) => (t.pnl || 0) <= 0)
                 const totalPnl = trades.reduce((s, t) => s + (t.pnl || 0), 0)
-                const best = trades.reduce((b, t) => ((t.pnl || 0) > (b?.pnl || -Infinity) ? t : b), null)
-                const worst = trades.reduce((b, t) => ((t.pnl || 0) < (b?.pnl || Infinity) ? t : b), null)
+                const best = wins.length > 0 ? wins.reduce((b, t) => ((t.pnl || 0) > (b?.pnl || -Infinity) ? t : b), null) : null
+                const worst = losses.length > 0 ? losses.reduce((b, t) => ((t.pnl || 0) < (b?.pnl || Infinity) ? t : b), null) : null
                 const wr = trades.length ? (wins.length / trades.length) * 100 : 0
                 const ca = poly.cashAudit || {}
                 const win = poly.windows?.current || {}
@@ -2296,14 +2302,20 @@ function PolyShell({
                         <div><span className="text-muted-foreground">settle</span> {win.byReason?.settle ?? 0}</div>
                       </CardContent>
                     </Card>
-                    <div className="grid grid-cols-2 gap-2 sm:grid-cols-4 sm:gap-2.5">
+                    <div className="grid grid-cols-2 gap-2 sm:grid-cols-5 sm:gap-2.5">
                       <Kpi label="Closed (mode)" value={String(trades.length)} />
                       <Kpi
                         label="Trade PnL"
                         value={money(totalPnl)}
                         tone={totalPnl >= 0 ? 'up' : 'down'}
                       />
-                      <Kpi label="Win rate" value={`${wr.toFixed(0)}%`} tone={wr >= 50 ? 'up' : 'down'} />
+                      <Kpi label="Directional WR" value={`${wr.toFixed(0)}%`} tone={wr >= 50 ? 'up' : 'down'} />
+                      <Kpi
+                        label="Arb Box WR"
+                        value={`${poly.arbMetrics?.winRatePct ?? 100}%`}
+                        tone={(poly.arbMetrics?.winRatePct ?? 100) >= 80 ? 'up' : 'down'}
+                        sub={`${poly.arbMetrics?.settledCount ?? 0}/${poly.arbMetrics?.concludedCount ?? (poly.arbMetrics?.settledCount ?? 0)} pkgs`}
+                      />
                       <Kpi
                         label="Mode"
                         value={String(displayMode || 'paper').toUpperCase()}
@@ -2379,6 +2391,16 @@ function PolyShell({
                                   >
                                     {t.mode}
                                   </Badge>
+                                  {(t.packageId || t.isArbLeg) && (
+                                    <Badge variant="outline" className="border-cyan-500/40 bg-cyan-500/15 text-cyan-400">
+                                      📦 Arb Package {t.packageId ? `(${String(t.packageId).slice(-6)})` : ''}
+                                    </Badge>
+                                  )}
+                                  {t.exitReason === 'arb_rollback' && (
+                                    <Badge variant="outline" className="border-amber-500/40 bg-amber-500/15 text-amber-400">
+                                      ⚠️ ABORTED ARB
+                                    </Badge>
+                                  )}
                                   <span className="font-semibold">
                                     {t.symbol} {t.outcome?.toUpperCase()}
                                   </span>

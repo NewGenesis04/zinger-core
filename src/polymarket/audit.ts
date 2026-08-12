@@ -4,11 +4,16 @@ import path from 'path';
 
 const BASELINE_FILE = path.resolve(import.meta.dirname, '../../data/poly_baseline.json');
 
+let _baselineCache = undefined;
+
 export function loadBaseline() {
+  if (_baselineCache !== undefined) return _baselineCache;
   try {
     const data = JSON.parse(fs.readFileSync(BASELINE_FILE, 'utf-8'));
-    return Number(data.balanceUsd) || null;
+    _baselineCache = Number(data.balanceUsd) || null;
+    return _baselineCache;
   } catch {
+    _baselineCache = null;
     return null;
   }
 }
@@ -16,6 +21,7 @@ export function loadBaseline() {
 export function saveBaseline(balanceUsd, note = '') {
   const payload = { balanceUsd: Number(balanceUsd), setAt: Date.now(), note };
   fs.writeFileSync(BASELINE_FILE, JSON.stringify(payload, null, 2));
+  _baselineCache = payload.balanceUsd;
   return payload;
 }
 

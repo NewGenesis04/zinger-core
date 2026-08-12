@@ -21,6 +21,7 @@ import fs from 'fs';
 import { refreshAllTokens, loadAutoSellConfig, saveAutoSellConfig } from './lib/monitor.js';
 import { sellToken, addTransaction, loadTransactions, getTokenFees } from './lib/pons.js';
 import { sseLine } from './lib/sse.js';
+import { loadPackages, getArbPackageMetrics } from './polymarket/arbEngine.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
@@ -385,6 +386,17 @@ export async function createApp() {
     res.json(poly.getState(lean ? { lean: true } : {}));
   });
 
+  app.get('/api/poly/packages', (req, res) => {
+    try {
+      const mode = (req.query.mode as string) || poly.getState()?.config?.mode || 'paper';
+      const packages = loadPackages().filter((p) => p.mode === mode);
+      const metrics = getArbPackageMetrics(mode);
+      res.json({ ok: true, packages, metrics });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
   app.get('/api/poly/stream', (req, res) => {
     const client = { res, lz4: req.query.lz4 === '1' || req.query.lz4 === 'true' };
     polySseClients.push(client);
@@ -702,6 +714,7 @@ export async function createApp() {
       const depth = await getOrderBookDepth(tokenId);
       res.json(depth);
     } catch (err) {
+      if (res.headersSent) return;
       res.status(500).json({ error: err.message });
     }
   });
@@ -716,6 +729,7 @@ export async function createApp() {
       const refreshMl = req.query.ml === '1' || req.query.refreshMl === '1';
       res.json(await poly.sampleCharts({ refreshMl }));
     } catch (err) {
+      if (res.headersSent) return;
       res.status(500).json({ error: err.message });
     }
   });
@@ -724,6 +738,7 @@ export async function createApp() {
     try {
       res.json(await poly.refreshMLTraces(true));
     } catch (err) {
+      if (res.headersSent) return;
       res.status(500).json({ error: err.message });
     }
   });
