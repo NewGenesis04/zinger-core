@@ -1,0 +1,979 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="light dark">
+  <title>Zinger · Status</title>
+  <style>
+    /* ──────────────────────────────────────────────────────────────────
+       Tokens. Light is the base; dark is a selected set stepped for the
+       dark surface, declared under both the OS media query and the
+       explicit theme stamp so the toggle wins either way.
+       Money colours split mark vs text: the mark steps clear 3:1 against
+       their surface, the text steps clear 4.5:1. Validated, not eyeballed.
+       ────────────────────────────────────────────────────────────────── */
+    :root {
+      color-scheme: light;
+      --surface:      #fcfcfb;
+      --plane:        #f9f9f7;
+      --ink:          #0b0b0b;
+      --ink2:         #52514e;
+      --muted:        #898781;
+      --grid:         #e1e0d9;
+      --axis:         #c3c2b7;
+      --hairline:     rgba(11,11,11,0.10);
+      --series:       #2a78d6;
+      --gain-mark:    #0ca30c;
+      --loss-mark:    #d03b3b;
+      --gain-text:    #006300;
+      --loss-text:    #b3261e;
+      --warn:         #fab219;
+      --shadow:       0 1px 2px rgba(11,11,11,0.04), 0 4px 12px rgba(11,11,11,0.05);
+
+      --r:      12px;
+      --r-sm:   8px;
+      --pad:    20px;
+
+      --fs-xs:  0.75rem;
+      --fs-sm:  0.875rem;
+      --fs-md:  1rem;
+      --fs-lg:  1.25rem;
+      --fs-xl:  1.75rem;
+      --fs-hero: 3rem;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root:where(:not([data-theme="light"])) {
+        color-scheme: dark;
+        --surface:   #1a1a19;
+        --plane:     #0d0d0d;
+        --ink:       #ffffff;
+        --ink2:      #c3c2b7;
+        --muted:     #898781;
+        --grid:      #2c2c2a;
+        --axis:      #383835;
+        --hairline:  rgba(255,255,255,0.10);
+        --series:    #3987e5;
+        --gain-mark: #0ca30c;
+        --loss-mark: #d03b3b;
+        --gain-text: #0ca30c;
+        --loss-text: #e66767;
+        --shadow:    0 1px 2px rgba(0,0,0,0.30), 0 4px 14px rgba(0,0,0,0.28);
+      }
+    }
+    :root[data-theme="dark"] {
+      color-scheme: dark;
+      --surface:   #1a1a19;
+      --plane:     #0d0d0d;
+      --ink:       #ffffff;
+      --ink2:      #c3c2b7;
+      --muted:     #898781;
+      --grid:      #2c2c2a;
+      --axis:      #383835;
+      --hairline:  rgba(255,255,255,0.10);
+      --series:    #3987e5;
+      --gain-mark: #0ca30c;
+      --loss-mark: #d03b3b;
+      --gain-text: #0ca30c;
+      --loss-text: #e66767;
+      --shadow:    0 1px 2px rgba(0,0,0,0.30), 0 4px 14px rgba(0,0,0,0.28);
+    }
+
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: system-ui, -apple-system, 'Segoe UI', sans-serif;
+      background: var(--plane);
+      color: var(--ink);
+      line-height: 1.5;
+      min-height: 100vh;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    /* tabular figures only where numbers stack vertically */
+    .tnum { font-variant-numeric: tabular-nums; }
+
+    .wrap { max-width: 940px; margin: 0 auto; padding: 16px; }
+    @media (min-width: 700px) { .wrap { padding: 28px 24px 48px; } }
+
+    /* ── Header ───────────────────────────────────────────────────── */
+    header { display: flex; align-items: center; gap: 10px; row-gap: 8px; flex-wrap: wrap; margin-bottom: 18px; }
+    .brand { font-size: var(--fs-md); font-weight: 700; letter-spacing: -0.01em; }
+    .spacer { flex: 1 1 auto; }
+    /* the trailing controls travel as one unit so nothing orphans on a phone */
+    .hgroup { display: flex; align-items: center; gap: 8px; margin-left: auto; }
+
+    .pill {
+      display: inline-flex; align-items: center; gap: 6px;
+      padding: 5px 11px 5px 9px; border-radius: 999px;
+      font-size: var(--fs-xs); font-weight: 600;
+      border: 1px solid transparent; white-space: nowrap;
+    }
+    .pill .dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; flex: none; }
+    .pill-live { color: var(--gain-text); background: color-mix(in srgb, var(--gain-mark) 12%, transparent); border-color: color-mix(in srgb, var(--gain-mark) 30%, transparent); }
+    .pill-off  { color: var(--loss-text); background: color-mix(in srgb, var(--loss-mark) 12%, transparent); border-color: color-mix(in srgb, var(--loss-mark) 30%, transparent); }
+    .pill-idle { color: var(--ink2); background: color-mix(in srgb, var(--muted) 14%, transparent); border-color: var(--hairline); }
+    .pill-live .dot { animation: breathe 2.4s ease-in-out infinite; }
+    @keyframes breathe { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
+
+    .iconbtn {
+      display: inline-flex; align-items: center; justify-content: center;
+      width: 34px; height: 34px; border-radius: var(--r-sm);
+      border: 1px solid var(--hairline); background: var(--surface);
+      color: var(--ink2); cursor: pointer; font-size: var(--fs-sm);
+    }
+    .iconbtn:hover { color: var(--ink); }
+    .iconbtn:focus-visible, a:focus-visible, button:focus-visible, input:focus-visible {
+      outline: 2px solid var(--series); outline-offset: 2px;
+    }
+    .meta { font-size: var(--fs-xs); color: var(--muted); }
+    .linkbtn {
+      font-size: var(--fs-xs); color: var(--muted); background: none; border: none;
+      cursor: pointer; font-family: inherit; padding: 6px; text-decoration: underline;
+    }
+    .linkbtn:hover { color: var(--ink); }
+
+    /* ── Cards ────────────────────────────────────────────────────── */
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--hairline);
+      border-radius: var(--r);
+      padding: var(--pad);
+      box-shadow: var(--shadow);
+      margin-bottom: 14px;
+    }
+    .card > h2 {
+      font-size: var(--fs-sm); font-weight: 600; color: var(--ink2);
+      margin-bottom: 14px; letter-spacing: -0.005em;
+    }
+    .card > h2 .h2note { font-weight: 400; color: var(--muted); font-size: var(--fs-xs); }
+
+    /* ── Headline ─────────────────────────────────────────────────── */
+    .headline { font-size: var(--fs-md); color: var(--ink2); margin-bottom: 2px; }
+    .headline b { color: var(--ink); font-weight: 600; }
+    .hero {
+      font-size: var(--fs-hero); font-weight: 650; letter-spacing: -0.025em;
+      line-height: 1.1; margin: 4px 0 2px; display: flex; align-items: baseline; gap: 10px;
+    }
+    .hero .arrow { font-size: var(--fs-xl); line-height: 1; }
+    .hero-sub { font-size: var(--fs-sm); color: var(--ink2); }
+    .gain { color: var(--gain-text); }
+    .loss { color: var(--loss-text); }
+
+    .stats {
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+      gap: 2px; margin-top: 18px; border-top: 1px solid var(--hairline); padding-top: 16px;
+    }
+    .stat .k { font-size: var(--fs-xs); color: var(--muted); display: block; margin-bottom: 3px; }
+    .stat .v { font-size: var(--fs-lg); font-weight: 600; letter-spacing: -0.015em; }
+    .stat .note { font-size: var(--fs-xs); color: var(--muted); display: block; }
+
+    /* ── Charts ───────────────────────────────────────────────────── */
+    .chartbox { position: relative; border-radius: var(--r-sm); }
+    .chartbox:focus-visible { outline: 2px solid var(--series); outline-offset: 4px; }
+    .chartbox svg { display: block; width: 100%; }
+    /* the hovered bar lifts; its neighbours recede */
+    .tape-bar { transition: opacity .12s, filter .12s; }
+    #tapeSvg.hot .tape-bar { opacity: .45; }
+    #tapeSvg.hot .tape-bar.on { opacity: 1; filter: brightness(1.25); }
+    .chart-empty {
+      display: flex; align-items: center; justify-content: center;
+      color: var(--muted); font-size: var(--fs-sm); text-align: center; padding: 0 12px;
+    }
+    .tip {
+      position: absolute; pointer-events: none; opacity: 0; transition: opacity .12s;
+      background: var(--surface); border: 1px solid var(--hairline);
+      border-radius: var(--r-sm); box-shadow: var(--shadow);
+      padding: 8px 10px; font-size: var(--fs-xs); white-space: nowrap; z-index: 5;
+      transform: translate(-50%, -100%);
+    }
+    .tip.on { opacity: 1; }
+    .tip .tt { color: var(--muted); display: block; }
+    .tip .tv { font-weight: 600; font-size: var(--fs-sm); }
+
+    /* ── Win-rate meter ───────────────────────────────────────────── */
+    .meter-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 8px; }
+    .meter-val { font-size: var(--fs-xl); font-weight: 650; letter-spacing: -0.02em; }
+    .meter-track {
+      position: relative; height: 10px; border-radius: 999px;
+      background: color-mix(in srgb, var(--muted) 22%, transparent); overflow: hidden;
+    }
+    .meter-fill { height: 100%; border-radius: 999px; background: var(--series); width: 0; transition: width .5s ease; }
+    /* must stay visible over both the blue fill and the empty track */
+    .meter-mark { position: absolute; top: -3px; bottom: -3px; left: 50%; width: 2px; background: color-mix(in srgb, var(--ink) 45%, transparent); }
+    .meter-foot { display: flex; justify-content: space-between; margin-top: 7px; font-size: var(--fs-xs); color: var(--muted); }
+
+    /* ── Setup (plain language) ───────────────────────────────────── */
+    .setup { display: flex; flex-direction: column; gap: 11px; }
+    .setup li { display: flex; gap: 10px; font-size: var(--fs-sm); color: var(--ink2); list-style: none; }
+    /* one uniform dot rather than assorted glyphs — no font-coverage roulette */
+    .setup li .ico {
+      flex: none; width: 6px; height: 6px; border-radius: 50%;
+      background: color-mix(in srgb, var(--series) 55%, transparent);
+      margin-top: 8px;
+    }
+    .setup li b { color: var(--ink); font-weight: 600; }
+
+    /* ── Trades table ─────────────────────────────────────────────── */
+    .tablebox { overflow-x: auto; margin: 0 calc(var(--pad) * -1); padding: 0 var(--pad); }
+    table { width: 100%; border-collapse: collapse; font-size: var(--fs-sm); }
+    th {
+      text-align: left; padding: 7px 10px 7px 0; color: var(--muted);
+      font-weight: 500; font-size: var(--fs-xs); border-bottom: 1px solid var(--hairline);
+      white-space: nowrap;
+    }
+    td { padding: 10px 10px 10px 0; border-bottom: 1px solid var(--hairline); white-space: nowrap; }
+    tr:last-child td { border-bottom: none; }
+    th.right, td.right { text-align: right; }
+    /* only the final column loses its gutter, or right-aligned neighbours collide */
+    th:last-child, td:last-child { padding-right: 0; }
+    .market { color: var(--ink); font-weight: 500; white-space: normal; min-width: 130px; }
+    .result { font-weight: 600; }
+    .col-x { display: none; }
+    @media (min-width: 760px) { .col-x { display: table-cell; } }
+
+    .empty { color: var(--muted); font-size: var(--fs-sm); text-align: center; padding: 28px 10px; }
+
+    /* ── Refetch: hold the previous render, never flash ───────────── */
+    #dash { transition: opacity .2s; }
+    #dash.stale { opacity: 0.55; }
+
+    .banner {
+      display: none; align-items: center; gap: 8px;
+      background: color-mix(in srgb, var(--warn) 14%, transparent);
+      border: 1px solid color-mix(in srgb, var(--warn) 40%, transparent);
+      color: var(--ink); border-radius: var(--r-sm);
+      padding: 10px 14px; font-size: var(--fs-sm); margin-bottom: 14px;
+    }
+    .banner.on { display: flex; }
+
+    /* ── Login ────────────────────────────────────────────────────── */
+    #login {
+      position: fixed; inset: 0; z-index: 20; background: var(--plane);
+      display: flex; align-items: center; justify-content: center; padding: 24px;
+    }
+    #login.hidden { display: none; }
+    .login-theme { position: fixed; top: 18px; right: 18px; }
+    .login-card { width: 100%; max-width: 372px; margin-bottom: 0; padding: 30px 28px 26px; }
+
+    .login-brand {
+      display: flex; align-items: center; gap: 8px;
+      font-size: var(--fs-xs); font-weight: 600; letter-spacing: 0.09em;
+      text-transform: uppercase; color: var(--muted); margin-bottom: 18px;
+    }
+    .login-brand::after { content: ''; flex: 1; height: 1px; background: var(--hairline); }
+    .login-card h1 { font-size: var(--fs-xl); font-weight: 650; letter-spacing: -0.025em; margin-bottom: 7px; }
+    .login-card > p { color: var(--ink2); font-size: var(--fs-sm); margin-bottom: 22px; }
+
+    label { display: block; font-size: var(--fs-xs); color: var(--ink2); margin-bottom: 6px; font-weight: 500; }
+    .field { position: relative; }
+    input[type=password], input[type=text].pw {
+      width: 100%; padding: 12px 62px 12px 13px; background: var(--plane);
+      border: 1px solid var(--hairline); border-radius: var(--r-sm);
+      color: var(--ink); font-size: var(--fs-md); font-family: inherit;
+    }
+    /* one ring, not a border change stacked under the global outline */
+    input:focus-visible, input:focus {
+      outline: none; border-color: var(--series);
+      box-shadow: 0 0 0 3px color-mix(in srgb, var(--series) 22%, transparent);
+    }
+    .reveal {
+      position: absolute; right: 5px; top: 50%; transform: translateY(-50%);
+      border: none; background: none; cursor: pointer; font-family: inherit;
+      font-size: var(--fs-xs); font-weight: 600; color: var(--ink2);
+      padding: 8px 9px; border-radius: 6px;
+    }
+    .reveal:hover { color: var(--ink); background: color-mix(in srgb, var(--muted) 16%, transparent); }
+    .err { color: var(--loss-text); font-size: var(--fs-xs); margin-top: 8px; min-height: 17px; }
+    .assure {
+      display: flex; gap: 8px; align-items: flex-start;
+      margin-top: 18px; padding-top: 16px; border-top: 1px solid var(--hairline);
+      color: var(--muted); font-size: var(--fs-xs); line-height: 1.45;
+    }
+    .assure svg { flex: none; margin-top: 1px; }
+    .btn {
+      width: 100%; padding: 11px 20px; border: none; border-radius: var(--r-sm);
+      font-size: var(--fs-sm); font-weight: 600; font-family: inherit; cursor: pointer;
+      background: var(--series); color: #fff; margin-top: 10px;
+    }
+    .btn:hover { filter: brightness(1.06); }
+    .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    .sr {
+      position: absolute; width: 1px; height: 1px; overflow: hidden;
+      clip: rect(0 0 0 0); clip-path: inset(50%); white-space: nowrap;
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { animation: none !important; transition: none !important; }
+    }
+  </style>
+</head>
+<body>
+
+  <!-- ── Login gate ─────────────────────────────────────────────── -->
+  <div id="login">
+    <button class="iconbtn login-theme" id="themeBtnLogin" title="Switch light / dark" aria-label="Switch light or dark theme">
+      <svg width="15" height="15" viewBox="0 0 16 16" aria-hidden="true">
+        <circle cx="8" cy="8" r="6.25" fill="none" stroke="currentColor" stroke-width="1.5"/>
+        <path d="M8 1.75A6.25 6.25 0 0 1 8 14.25Z" fill="currentColor"/>
+      </svg>
+    </button>
+
+    <form class="login-card card" id="loginForm">
+      <div class="login-brand">Zinger</div>
+      <h1>Strategy status</h1>
+      <p>A live view of how the trading strategy is performing right now.</p>
+
+      <label for="pw">Access password</label>
+      <div class="field">
+        <input type="password" id="pw" autocomplete="current-password" autofocus>
+        <button type="button" class="reveal" id="revealBtn" aria-label="Show password">Show</button>
+      </div>
+      <div class="err" id="loginErr" role="alert"></div>
+      <button class="btn" type="submit" id="loginBtn">View status</button>
+
+      <p class="assure">
+        <svg width="13" height="13" viewBox="0 0 16 16" aria-hidden="true">
+          <rect x="3" y="7" width="10" height="7" rx="1.6" fill="none" stroke="currentColor" stroke-width="1.4"/>
+          <path d="M5.5 7V5a2.5 2.5 0 0 1 5 0v2" fill="none" stroke="currentColor" stroke-width="1.4"/>
+        </svg>
+        <span>Viewing only. Nothing on this page can change the strategy or move any money.</span>
+      </p>
+    </form>
+  </div>
+
+  <!-- ── Dashboard ──────────────────────────────────────────────── -->
+  <div class="wrap" id="dash" hidden>
+    <header>
+      <span class="brand">Zinger</span>
+      <span class="pill pill-idle" id="statusPill"><span class="dot"></span><span id="statusLabel">Checking…</span></span>
+      <span class="hgroup">
+        <span class="meta" id="updated"></span>
+        <button class="iconbtn" id="themeBtn" title="Switch light / dark" aria-label="Switch light or dark theme">
+          <svg width="15" height="15" viewBox="0 0 16 16" aria-hidden="true">
+            <circle cx="8" cy="8" r="6.25" fill="none" stroke="currentColor" stroke-width="1.5"/>
+            <path d="M8 1.75A6.25 6.25 0 0 1 8 14.25Z" fill="currentColor"/>
+          </svg>
+        </button>
+        <button class="linkbtn" id="logout">Sign out</button>
+      </span>
+    </header>
+
+    <div class="banner" id="banner"><span aria-hidden="true">⚠</span><span id="bannerText"></span></div>
+
+    <!-- Headline: the answer, in a sentence, before any chart -->
+    <section class="card">
+      <p class="headline" id="headline" aria-live="polite">Loading…</p>
+      <div class="hero" id="hero"><span class="hero-num">—</span></div>
+      <div class="hero-sub" id="heroSub"></div>
+
+      <div class="stats" id="stats"></div>
+    </section>
+
+    <!-- Equity over the session -->
+    <section class="card">
+      <h2>Balance over this session <span class="h2note" id="curveNote"></span></h2>
+      <div class="chartbox" id="equityBox" tabindex="0" role="group"
+           aria-label="Balance over this session. Use the left and right arrow keys to read the balance at each point in time.">
+        <svg id="equitySvg" role="img" aria-label="Account balance over the current session"></svg>
+        <div class="tip" id="equityTip" role="status" aria-live="polite"></div>
+      </div>
+    </section>
+
+    <!-- Win rate + trade-by-trade result -->
+    <section class="card">
+      <h2>How the last trades went</h2>
+      <div id="meterBlock">
+        <div class="meter-head">
+          <div>
+            <span class="meter-val" id="wrPct">—</span>
+            <span class="meta" id="wrLabel">win rate</span>
+          </div>
+          <span class="meta" id="wrCount"></span>
+        </div>
+        <div class="meter-track"><div class="meter-fill" id="wrFill"></div><span class="meter-mark" title="half"></span></div>
+        <div class="meter-foot"><span>0%</span><span>half</span><span>100%</span></div>
+      </div>
+
+      <div class="chartbox" id="tapeBox" style="margin-top:22px">
+        <svg id="tapeSvg" role="img" aria-label="Profit or loss of each recent trade"></svg>
+        <div class="tip" id="tapeTip"></div>
+      </div>
+    </section>
+
+    <!-- Detail table -->
+    <section class="card">
+      <h2>Recent trades</h2>
+      <div class="tablebox">
+        <table>
+          <thead><tr>
+            <th>Market</th>
+            <th>Result</th>
+            <th class="col-x">Bought at</th>
+            <th class="col-x">Sold at</th>
+            <th class="col-x">Why it closed</th>
+            <th class="right">Profit / loss</th>
+            <th class="right">Time</th>
+          </tr></thead>
+          <tbody id="trades"></tbody>
+        </table>
+        <div class="empty" id="noTrades" hidden>No trades have finished yet in this session.</div>
+      </div>
+    </section>
+
+    <!-- Reassurance, last: the rules, in plain language -->
+    <section class="card">
+      <h2>How it's set up <span class="h2note">the rules the bot is following right now</span></h2>
+      <ul class="setup" id="setup"></ul>
+    </section>
+  </div>
+
+  <script>
+    const REFRESH_MS = 10000;
+    let timer = null, tickTimer = null, lastRefresh = 0, lastData = null;
+
+    const $ = (id) => document.getElementById(id);
+
+    /* ── Theme ─────────────────────────────────────────────────── */
+    const savedTheme = localStorage.getItem('zinger-ops-theme');
+    if (savedTheme) document.documentElement.dataset.theme = savedTheme;
+    function toggleTheme() {
+      const isDark = matchMedia('(prefers-color-scheme: dark)').matches;
+      const current = document.documentElement.dataset.theme || (isDark ? 'dark' : 'light');
+      const next = current === 'dark' ? 'light' : 'dark';
+      document.documentElement.dataset.theme = next;
+      localStorage.setItem('zinger-ops-theme', next);
+      if (lastData) render(lastData);
+    }
+    // available on the gate too — the board should not have to sign in to fix contrast
+    $('themeBtn').addEventListener('click', toggleTheme);
+    $('themeBtnLogin').addEventListener('click', toggleTheme);
+
+    $('revealBtn').addEventListener('click', () => {
+      const pw = $('pw'), btn = $('revealBtn'), show = pw.type === 'password';
+      pw.type = show ? 'text' : 'password';
+      pw.classList.toggle('pw', show);
+      btn.textContent = show ? 'Hide' : 'Show';
+      btn.setAttribute('aria-label', show ? 'Hide password' : 'Show password');
+      pw.focus();
+    });
+
+    /* ── Transport ─────────────────────────────────────────────── */
+    async function api(path, opts = {}) {
+      const r = await fetch(path, { headers: { 'Content-Type': 'application/json' }, ...opts });
+      if (r.status === 401) throw new Error('unauthorized');
+      const d = await r.json();
+      if (d && d.ok === false && d.error) throw new Error(d.error);
+      return d;
+    }
+
+    function stopPolling() {
+      if (timer) { clearInterval(timer); timer = null; }
+      if (tickTimer) { clearInterval(tickTimer); tickTimer = null; }
+    }
+    function showLogin() {
+      stopPolling();
+      lastRefresh = 0; lastData = null;
+      $('login').classList.remove('hidden');
+      $('dash').hidden = true;
+    }
+    function hideLogin() {
+      $('login').classList.add('hidden');
+      $('dash').hidden = false;
+    }
+
+    $('loginForm').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const btn = $('loginBtn');
+      $('loginErr').textContent = '';
+      btn.disabled = true;
+      btn.textContent = 'Checking…';
+      try {
+        await api('/api/auth/login', { method: 'POST', body: JSON.stringify({ password: $('pw').value }) });
+        hideLogin();
+        refresh().catch(() => {});
+        startPolling();
+      } catch (err) {
+        $('loginErr').textContent = err.message === 'Failed to fetch'
+          ? 'Could not reach the server. Check your connection and try again.'
+          : 'That password did not work. Please try again.';
+      }
+      btn.disabled = false;
+      btn.textContent = 'View status';
+      $('pw').value = '';
+    });
+
+    $('logout').addEventListener('click', async () => {
+      try { await api('/api/auth/logout', { method: 'POST' }); } catch {}
+      showLogin();
+    });
+
+    /* ── Formatting ────────────────────────────────────────────── */
+    const money = (v, dp = 2) => '$' + Math.abs(Number(v)).toLocaleString('en-US', { minimumFractionDigits: dp, maximumFractionDigits: dp });
+    const signedMoney = (v) => (Number(v) < 0 ? '−' : '+') + money(v);
+    const clockTime = (t) => new Date(t).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+    const isNum = (v) => v != null && Number.isFinite(Number(v));
+    const moneyClass = (v) => (Number(v) < 0 ? 'loss' : 'gain');
+    // Sign is carried by the glyph and the words too — never by colour alone,
+    // because gain/loss hues are indistinguishable under deuteranopia.
+    const arrow = (v) => (Number(v) < 0 ? '▼' : '▲');
+    const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) =>
+      ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+    /* ── Derived numbers ───────────────────────────────────────── */
+    // Worst peak-to-trough dip on the session curve, in dollars.
+    function maxDrawdown(curve) {
+      let peak = -Infinity, worst = 0;
+      for (const p of curve || []) {
+        const v = Number(p.equity);
+        if (!Number.isFinite(v)) continue;
+        if (v > peak) peak = v;
+        if (peak > -Infinity) worst = Math.max(worst, peak - v);
+      }
+      return worst;
+    }
+
+    /* ── Chart helpers ─────────────────────────────────────────── */
+    // Rounded on the data end only, square where it meets the baseline.
+    function barPath(x, w, base, val, r) {
+      const up = val >= 0;
+      const h = Math.abs(val);
+      const rr = Math.min(r, w / 2, h);
+      const y = up ? base - h : base;
+      const bot = up ? base : base + h;
+      return up
+        ? `M${x},${bot}V${y + rr}a${rr},${rr} 0 0 1 ${rr},-${rr}h${w - rr * 2}a${rr},${rr} 0 0 1 ${rr},${rr}V${bot}Z`
+        : `M${x},${y}V${bot - rr}a${rr},${rr} 0 0 0 ${rr},${rr}h${w - rr * 2}a${rr},${rr} 0 0 0 ${rr},-${rr}V${y}Z`;
+    }
+
+    // Tooltips are built as text nodes, never interpolated markup: market names
+    // come from an external API, and textContent makes the whole class of
+    // injection bug impossible rather than merely handled.
+    function setTip(tip, valueText, labelText, valueClass = '') {
+      tip.textContent = '';
+      const v = document.createElement('span');
+      v.className = 'tv tnum' + (valueClass ? ' ' + valueClass : '');
+      v.textContent = valueText;
+      const l = document.createElement('span');
+      l.className = 'tt';
+      l.textContent = labelText;
+      tip.append(v, l);
+    }
+
+    let equityGeom = null, equityIdx = -1;
+
+    function renderEquity(curve) {
+      const box = $('equityBox'), svg = $('equitySvg');
+      const pts = (curve || []).filter((p) => isNum(p.equity));
+      const W = Math.max(240, box.clientWidth || 600);
+      const PLOT = 170, AXIS = 22, H = PLOT + AXIS;
+      const PADX = 4, PADY = 12;
+      svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+      svg.setAttribute('height', H);
+
+      if (pts.length < 2) {
+        equityGeom = null;
+        svg.innerHTML = '';
+        svg.style.display = 'none';   // otherwise the empty card keeps the plot's height
+        box.querySelector('.chart-empty')?.remove();
+        const e = document.createElement('div');
+        e.className = 'chart-empty';
+        e.style.height = '120px';
+        e.textContent = 'The balance chart appears once the bot has been running for a few minutes.';
+        box.prepend(e);
+        $('curveNote').textContent = '';
+        return;
+      }
+      svg.style.display = '';
+      box.querySelector('.chart-empty')?.remove();
+
+      const vals = pts.map((p) => Number(p.equity));
+      const start = vals[0], end = vals[vals.length - 1];
+      // Include the starting line in the domain so "above/below where I began" reads true.
+      let min = Math.min(...vals, start), max = Math.max(...vals, start);
+      const pad = (max - min) * 0.12 || Math.max(1, Math.abs(max) * 0.01);
+      min -= pad; max += pad;
+      const span = max - min || 1;
+
+      const x = (i) => PADX + (i / (pts.length - 1)) * (W - PADX * 2);
+      const y = (v) => PADY + (1 - (v - min) / span) * (PLOT - PADY * 2);
+
+      const line = pts.map((p, i) => `${i ? 'L' : 'M'}${x(i).toFixed(1)},${y(p.equity).toFixed(1)}`).join('');
+      const area = `${line}L${x(pts.length - 1).toFixed(1)},${PLOT}L${x(0).toFixed(1)},${PLOT}Z`;
+      const yStart = y(start);
+
+      const first = pts[0].t, last = pts[pts.length - 1].t;
+
+      svg.innerHTML = `
+        <defs>
+          <linearGradient id="eqfill" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0" stop-color="var(--series)" stop-opacity="0.10"/>
+            <stop offset="1" stop-color="var(--series)" stop-opacity="0"/>
+          </linearGradient>
+        </defs>
+        <line x1="0" y1="${PLOT}" x2="${W}" y2="${PLOT}" stroke="var(--axis)" stroke-width="1"/>
+        <line x1="0" y1="${yStart.toFixed(1)}" x2="${W}" y2="${yStart.toFixed(1)}" stroke="var(--grid)" stroke-width="1"/>
+        <path d="${area}" fill="url(#eqfill)"/>
+        <path d="${line}" fill="none" stroke="var(--series)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+        <circle cx="${x(pts.length - 1).toFixed(1)}" cy="${y(end).toFixed(1)}" r="4" fill="var(--series)" stroke="var(--surface)" stroke-width="2"/>
+        <line id="eqCross" x1="0" y1="0" x2="0" y2="${PLOT}" stroke="var(--axis)" stroke-width="1" opacity="0"/>
+        <circle id="eqDot" r="4.5" fill="var(--series)" stroke="var(--surface)" stroke-width="2" opacity="0"/>
+        <text x="2" y="${H - 6}" font-size="11" fill="var(--muted)">${esc(clockTime(first))}</text>
+        <text x="${W - 2}" y="${H - 6}" text-anchor="end" font-size="11" fill="var(--muted)">${esc(clockTime(last))}</text>
+      `;
+      equityGeom = { pts, x, y, W, PLOT };
+      $('curveNote').textContent = `started at ${money(start)} · now ${money(end)}`;
+    }
+
+    // Crosshair + tooltip: a chart you can't read values off is decoration.
+    // Pointer and keyboard drive the same readout, so hovering is never the
+    // only way to reach an intermediate balance.
+    function showEquityAt(i) {
+      if (!equityGeom || !equityGeom.pts.length) return;
+      const svg = $('equitySvg'), tip = $('equityTip'), r = svg.getBoundingClientRect();
+      i = Math.max(0, Math.min(equityGeom.pts.length - 1, i));
+      equityIdx = i;
+      const p = equityGeom.pts[i];
+      const cx = equityGeom.x(i), cy = equityGeom.y(p.equity);
+      const cross = svg.querySelector('#eqCross'), dot = svg.querySelector('#eqDot');
+      if (cross) { cross.setAttribute('x1', cx); cross.setAttribute('x2', cx); cross.setAttribute('opacity', '1'); }
+      if (dot) { dot.setAttribute('cx', cx); dot.setAttribute('cy', cy); dot.setAttribute('opacity', '1'); }
+      setTip(tip, money(p.equity), clockTime(p.t));
+      tip.style.left = (cx / equityGeom.W) * r.width + 'px';
+      tip.style.top = (cy / (equityGeom.PLOT + 22)) * r.height - 10 + 'px';
+      tip.classList.add('on');
+    }
+
+    function hideEquity() {
+      const svg = $('equitySvg');
+      equityIdx = -1;
+      $('equityTip').classList.remove('on');
+      svg.querySelector('#eqCross')?.setAttribute('opacity', '0');
+      svg.querySelector('#eqDot')?.setAttribute('opacity', '0');
+    }
+
+    function bindEquityHover() {
+      const box = $('equityBox'), svg = $('equitySvg');
+      box.addEventListener('pointermove', (ev) => {
+        if (!equityGeom) return;
+        const r = svg.getBoundingClientRect();
+        const px = ((ev.clientX - r.left) / r.width) * equityGeom.W;
+        let best = 0, bd = Infinity;
+        equityGeom.pts.forEach((_, i) => {
+          const d = Math.abs(equityGeom.x(i) - px);
+          if (d < bd) { bd = d; best = i; }
+        });
+        showEquityAt(best);
+      });
+      box.addEventListener('pointerleave', hideEquity);
+
+      // Arrow keys step the crosshair; Home/End jump to the ends.
+      box.addEventListener('focus', () => { if (equityGeom) showEquityAt(equityIdx < 0 ? equityGeom.pts.length - 1 : equityIdx); });
+      box.addEventListener('blur', hideEquity);
+      box.addEventListener('keydown', (ev) => {
+        if (!equityGeom) return;
+        const last = equityGeom.pts.length - 1;
+        let next = equityIdx;
+        switch (ev.key) {
+          case 'ArrowRight': next = equityIdx + 1; break;
+          case 'ArrowLeft':  next = equityIdx - 1; break;
+          case 'Home':       next = 0; break;
+          case 'End':        next = last; break;
+          case 'Escape':     hideEquity(); return;
+          default: return;
+        }
+        ev.preventDefault();
+        showEquityAt(next);
+      });
+    }
+
+    // Trade tape: zero baseline through the middle, losses hang DOWN, so the
+    // sign is geometry rather than hue.
+    function renderTape(recent) {
+      const box = $('tapeBox'), svg = $('tapeSvg'), tip = $('tapeTip');
+      const trades = (recent || []).filter((t) => isNum(t.pnl)).slice().reverse();
+      const W = Math.max(240, box.clientWidth || 600);
+      const H = 96, MID = H / 2;
+      svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+      svg.setAttribute('height', H);
+
+      if (!trades.length) {
+        svg.innerHTML = '';
+        svg.style.display = 'none';
+        box.querySelector('.chart-empty')?.remove();
+        const e = document.createElement('div');
+        e.className = 'chart-empty';
+        e.style.height = '72px';
+        e.textContent = 'Each finished trade will show up here as a bar — up for a win, down for a loss.';
+        box.prepend(e);
+        return;
+      }
+      svg.style.display = '';
+      box.querySelector('.chart-empty')?.remove();
+
+      const maxAbs = Math.max(0.01, ...trades.map((t) => Math.abs(Number(t.pnl))));
+      const GAP = 2;
+      const slot = W / trades.length;
+      const bw = Math.max(3, Math.min(22, slot - GAP));
+      const scale = (MID - 12) / maxAbs;
+
+      svg.innerHTML =
+        `<line x1="0" y1="${MID}" x2="${W}" y2="${MID}" stroke="var(--axis)" stroke-width="1"/>` +
+        trades.map((t, i) => {
+          const p = Number(t.pnl);
+          const h = Math.max(2, Math.abs(p) * scale);
+          const bx = i * slot + (slot - bw) / 2;
+          const fill = p < 0 ? 'var(--loss-mark)' : 'var(--gain-mark)';
+          return `<path class="tape-bar" d="${barPath(bx, bw, MID, p < 0 ? -h : h, 4)}" fill="${fill}" data-i="${i}"/>`;
+        }).join('') +
+        `<text x="2" y="${H - 2}" font-size="11" fill="var(--muted)">oldest</text>` +
+        `<text x="${W - 2}" y="${H - 2}" text-anchor="end" font-size="11" fill="var(--muted)">newest</text>`;
+
+      const clearHot = () => {
+        svg.classList.remove('hot');
+        svg.querySelector('.tape-bar.on')?.classList.remove('on');
+      };
+      const move = (ev) => {
+        const r = svg.getBoundingClientRect();
+        const i = Math.floor((((ev.clientX - r.left) / r.width) * W) / slot);
+        const t = trades[i];
+        if (!t) { tip.classList.remove('on'); clearHot(); return; }
+        const p = Number(t.pnl);
+        clearHot();
+        svg.classList.add('hot');
+        svg.querySelector(`.tape-bar[data-i="${i}"]`)?.classList.add('on');
+        setTip(tip, `${arrow(p)} ${signedMoney(p)}`, t.symbol || 'Market', moneyClass(p));
+        // clear the bar's own end, or the tooltip hides the mark it describes
+        const barTop = p < 0 ? MID : MID - Math.max(2, Math.abs(p) * scale);
+        tip.style.left = ((i * slot + slot / 2) / W) * r.width + 'px';
+        tip.style.top = (barTop / H) * r.height - 6 + 'px';
+        tip.classList.add('on');
+      };
+      box.onpointermove = move;
+      box.onpointerleave = () => { tip.classList.remove('on'); clearHot(); };
+    }
+
+    /* ── Plain-language setup ──────────────────────────────────── */
+    const pct = (v) => (v == null ? null : (Number(v) * 100).toFixed(0) + '%');
+
+    function renderSetup(p) {
+      const L = [];
+      const b = (s) => `<b>${esc(s)}</b>`;
+
+      if (p.tpPctLow != null || p.tpPctHigh != null) {
+        const lo = pct(p.tpPctLow), hi = pct(p.tpPctHigh);
+        L.push(lo && hi && lo !== hi
+          ? `Takes profit once a trade is up ${b(lo)} to ${b(hi)}.`
+          : `Takes profit once a trade is up ${b(hi || lo)}.`);
+      }
+      if (p.slPct != null) {
+        L.push(`Cuts a losing trade at ${b('−' + pct(p.slPct))}` +
+          (p.adaptiveSl ? ', adjusting that as the market moves.' : '.'));
+      }
+      const size = [];
+      if (p.maxPositionSize != null) size.push(money(p.maxPositionSize, 0));
+      if (p.maxPositionPct != null) size.push(pct(p.maxPositionPct) + ' of the balance');
+      if (size.length) L.push(`Never puts more than ${b(size.join(' or '))} into a single trade.`);
+      if (p.maxOpenPositions != null) {
+        L.push(`Holds at most ${b(p.maxOpenPositions)} trade${Number(p.maxOpenPositions) === 1 ? '' : 's'} at the same time.`);
+      }
+      if (p.minConfidence != null) {
+        L.push(`Only enters when it is at least ${b(pct(p.minConfidence))} confident.`);
+      }
+      if (p.minPrice != null && p.maxPrice != null) {
+        const c = (v) => Math.round(Number(v) * 100) + '¢';
+        L.push(`Only trades contracts priced between ${b(c(p.minPrice))} and ${b(c(p.maxPrice))}.`);
+      }
+      const brains = [];
+      if (p.useSignals) brains.push('price signals');
+      if (p.useML) brains.push('a machine-learning model');
+      if (p.useKellySizing) brains.push('Kelly bet sizing');
+      if (brains.length) L.push(`Decisions use ${b(brains.join(', '))}.`);
+      const durs = Array.isArray(p.enabledDurations) ? p.enabledDurations : null;
+      if (durs && durs.length) L.push(`Watching ${b(durs.join(', '))} markets.`);
+
+      $('setup').innerHTML = L.length
+        ? L.map((txt) => `<li><span class="ico" aria-hidden="true"></span><span>${txt}</span></li>`).join('')
+        : '<li class="empty">Settings are not available right now.</li>';
+    }
+
+    /* ── Trades table ──────────────────────────────────────────── */
+    const REASONS = {
+      take_profit: 'Hit its profit target',
+      tp: 'Hit its profit target',
+      stop_loss: 'Stopped out to limit the loss',
+      sl: 'Stopped out to limit the loss',
+      adaptive_sl: 'Stopped out (adjusted level)',
+      stop_loss_adaptive: 'Stopped out (adjusted level)',
+      settled: 'Market settled',
+      resolved: 'Market settled',
+      expiry: 'Market closed at expiry',
+      manual: 'Closed by hand',
+      timeout: 'Closed after time ran out',
+    };
+    const reasonText = (r) => REASONS[r] || String(r || '—').replace(/_/g, ' ');
+    const priceText = (v) => (isNum(v) ? Math.round(Number(v) * 100) + '¢' : '—');
+
+    function renderTrades(recent) {
+      const rows = (recent || []);
+      $('noTrades').hidden = rows.length > 0;
+      $('trades').innerHTML = rows.map((t) => {
+        const p = Number(t.pnl);
+        const won = p >= 0;
+        return `<tr>
+          <td class="market">${esc(t.symbol || 'Market')}</td>
+          <td class="result ${isNum(p) ? moneyClass(p) : ''}">${isNum(p) ? (won ? '▲ Won' : '▼ Lost') : '—'}</td>
+          <td class="col-x tnum">${esc(priceText(t.entryPrice))}</td>
+          <td class="col-x tnum">${esc(priceText(t.exitPrice))}</td>
+          <td class="col-x">${esc(reasonText(t.exitReason))}</td>
+          <td class="right tnum ${isNum(p) ? moneyClass(p) : ''}">${isNum(p) ? esc(signedMoney(p)) : '—'}</td>
+          <td class="right tnum">${t.time ? esc(clockTime(t.time)) : '—'}</td>
+        </tr>`;
+      }).join('');
+    }
+
+    /* ── Main render ───────────────────────────────────────────── */
+    function render(d) {
+      lastData = d;
+      lastRefresh = Date.now();
+      $('dash').classList.remove('stale');
+      $('banner').classList.remove('on');
+
+      const s = d.session || {};
+      const acct = d.account || {};
+      const pnl = s.pnl;
+      const running = !!d.running;
+
+      // Status pill — icon + word, never colour alone
+      const pill = $('statusPill');
+      pill.className = 'pill ' + (running ? 'pill-live' : 'pill-off');
+      $('statusLabel').textContent = running ? 'Running' : 'Stopped';
+
+      // Headline sentence: the whole answer, before any chart.
+      // Nothing settled yet, and dead-even, are both distinct from "up".
+      const finished = Number(s.wins || 0) + Number(s.losses || 0);
+      const flat = !isNum(pnl) || Number(pnl) === 0;
+      const since = s.startedAt ? ' since ' + clockTime(s.startedAt) : '';
+      const where = running ? 'Zinger is running' : 'Zinger is stopped';
+      if (finished === 0) {
+        $('headline').textContent = `${where}. No trades have finished yet${since}.`;
+      } else if (flat) {
+        $('headline').innerHTML = `${where}. You are <b>exactly even</b>${esc(since)}.`;
+      } else if (Number(pnl) > 0) {
+        $('headline').innerHTML = `${where}. You are <b>up</b>${esc(since)}.`;
+      } else {
+        $('headline').innerHTML = `${where}. You are <b>down</b>${esc(since)}.`;
+      }
+
+      const hero = $('hero');
+      if (!isNum(pnl)) {
+        hero.className = 'hero';
+        hero.innerHTML = '<span>—</span>';
+      } else if (flat) {
+        hero.className = 'hero';
+        hero.innerHTML = `<span>${esc(money(pnl))}</span>`;
+      } else {
+        hero.className = 'hero ' + moneyClass(pnl);
+        hero.innerHTML = `<span class="arrow" aria-hidden="true">${arrow(pnl)}</span><span>${esc(signedMoney(pnl))}</span>`;
+      }
+
+      const base = isNum(acct.equity) && isNum(pnl) ? Number(acct.equity) - Number(pnl) : null;
+      const retPct = base && base !== 0 ? (Number(pnl) / base) * 100 : null;
+      $('heroSub').textContent = finished === 0
+        ? 'it is waiting for a trade that meets its rules'
+        : retPct != null
+          ? `${retPct >= 0 ? '+' : '−'}${Math.abs(retPct).toFixed(2)}% of the balance this session`
+          : 'profit and loss this session';
+
+      // Risk stats — a dashboard that only ever shows a green number misleads
+      const dd = maxDrawdown(d.curve);
+      const exposure = isNum(acct.equity) && isNum(acct.cash) ? Number(acct.equity) - Number(acct.cash) : null;
+      const stats = [
+        ['Balance now', isNum(acct.equity) ? money(acct.equity) : '—', ''],
+        ['Worst dip', dd > 0 ? '−' + money(dd) : money(0), 'largest drop from a high this session'],
+        ['In open trades', exposure != null ? money(Math.max(0, exposure)) : '—',
+          `${acct.openCount ?? 0} trade${Number(acct.openCount) === 1 ? '' : 's'} still running`],
+      ];
+      $('stats').innerHTML = stats.map(([k, v, note]) =>
+        `<div class="stat"><span class="k">${esc(k)}</span><span class="v tnum">${esc(v)}</span>${note ? `<span class="note">${esc(note)}</span>` : ''}</div>`
+      ).join('');
+
+      renderEquity(d.curve || []);
+      renderTape(d.recent || []);
+
+      // Win rate as a meter with a half-way tick, not a two-slice pie
+      const wins = Number(s.wins || 0), losses = Number(s.losses || 0), tot = wins + losses;
+      const wr = tot ? Math.round((wins / tot) * 100) : 0;
+      // A meter with nothing in it just reads as broken — hide it until there's data
+      $('meterBlock').hidden = tot === 0;
+      $('wrPct').textContent = wr + '%';
+      $('wrFill').style.width = wr + '%';
+      $('wrCount').textContent = `${wins} won · ${losses} lost`;
+
+      renderSetup(d.params || {});
+      renderTrades(d.recent || []);
+
+      $('updated').textContent = 'Updated ' + clockTime(d.updatedAt);
+    }
+
+    function showBanner(msg) {
+      $('bannerText').textContent = msg;
+      $('banner').classList.add('on');
+      $('dash').classList.add('stale');
+    }
+
+    function tick() {
+      if (!lastRefresh) return;
+      const age = Date.now() - lastRefresh;
+      if (age > REFRESH_MS * 3) $('dash').classList.add('stale');
+    }
+
+    // Rethrows so callers can tell an expired session from a server hiccup.
+    // A 401 drops to the gate; anything else holds the last render.
+    async function refresh() {
+      try {
+        const d = await api('/api/ops/status');
+        render(d);
+      } catch (err) {
+        if (err.message === 'unauthorized') showLogin();
+        else showBanner('Could not reach the bot just now — showing the last known figures.');
+        throw err;
+      }
+    }
+
+    function startPolling() {
+      if (timer) return;
+      timer = setInterval(() => { refresh().catch(() => {}); }, REFRESH_MS);
+      tickTimer = setInterval(tick, 1000);
+    }
+
+    // Charts are drawn at real pixel sizes, so they redraw on resize.
+    let ro;
+    if (window.ResizeObserver) {
+      let raf = 0;
+      ro = new ResizeObserver(() => {
+        cancelAnimationFrame(raf);
+        raf = requestAnimationFrame(() => {
+          if (!lastData || $('dash').hidden) return;
+          renderEquity(lastData.curve || []);
+          renderTape(lastData.recent || []);
+        });
+      });
+      ro.observe(document.body);
+    }
+
+    bindEquityHover();
+
+    // On load: a valid cookie lands on the dashboard, a 401 shows the gate,
+    // and a server error keeps polling behind a notice.
+    refresh()
+      .then(() => { hideLogin(); startPolling(); })
+      .catch((err) => {
+        if (err.message === 'unauthorized') return;
+        hideLogin();
+        startPolling();
+      });
+  </script>
+</body>
+</html>

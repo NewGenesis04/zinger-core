@@ -12,6 +12,38 @@ function authPassword() {
   return String(process.env.AUTH_PASSWORD || process.env.ZINGER_PASSWORD || '').trim();
 }
 
+function viewerPassword() {
+  return String(process.env.READONLY_PASSWORD || '').trim();
+}
+
+/**
+ * Resolve which role a submitted password grants. Viewers get read-only
+ * access; operators get the full console. Returns null on any mismatch.
+ */
+export function passwordRole(input) {
+  const pw = String(input || '');
+  if (passwordsMatch(pw)) return 'operator';
+  const viewer = viewerPassword();
+  if (viewer && pw.length === viewer.length) {
+    const a = Buffer.from(pw, 'utf8');
+    const b = Buffer.from(viewer, 'utf8');
+    return crypto.timingSafeEqual(a, b) ? 'viewer' : null;
+  }
+  return null;
+}
+
+/**
+ * Viewer tokens are scoped to the curated /ops surface: no writes, and no
+ * reads of operator internals (state, streams, wallet, audit, traces).
+ * `path` is relative to the /api mount, e.g. '/ops/status'.
+ * Returns null when allowed, otherwise the error string to reject with.
+ */
+export function viewerDenial(method, path) {
+  if (method !== 'GET') return 'read-only';
+  if (!String(path || '').startsWith('/ops/')) return 'forbidden';
+  return null;
+}
+
 function authSecret() {
   const fromEnv = String(process.env.AUTH_SECRET || '').trim();
   if (fromEnv) return fromEnv;
@@ -37,9 +69,9 @@ export function passwordsMatch(input) {
   return crypto.timingSafeEqual(a, b);
 }
 
-export function issueToken() {
+export function issueToken(role = 'operator') {
   const exp = Date.now() + TOKEN_TTL_MS;
-  const payload = Buffer.from(JSON.stringify({ v: 1, exp }), 'utf8').toString('base64url');
+  const payload = Buffer.from(JSON.stringify({ v: 1, exp, role }), 'utf8').toString('base64url');
   const sig = crypto.createHmac('sha256', authSecret()).update(payload).digest('base64url');
   return `${payload}.${sig}`;
 }

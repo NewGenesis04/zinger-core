@@ -7,10 +7,11 @@ import {
   clearAuthCookie,
   isAuthConfigured,
   issueToken,
-  passwordsMatch,
+  passwordRole,
   requireAuth,
   setAuthCookie,
   verifyToken,
+  viewerDenial,
   extractToken,
 } from './lib/auth.js';
 import { generateTokenFromPrompt } from './lib/ai.js';
@@ -128,12 +129,13 @@ export async function createApp() {
       return res.status(503).json({ ok: false, error: 'AUTH_PASSWORD not configured' });
     }
     const password = req.body?.password ?? req.body?.pass ?? '';
-    if (!passwordsMatch(password)) {
+    const role = passwordRole(password);
+    if (!role) {
       return res.status(401).json({ ok: false, error: 'invalid password' });
     }
-    const token = issueToken();
+    const token = issueToken(role);
     setAuthCookie(res, token);
-    res.json({ ok: true, authenticated: true });
+    res.json({ ok: true, authenticated: true, role });
   });
 
   app.post('/api/auth/logout', (req, res) => {
@@ -147,7 +149,13 @@ export async function createApp() {
   // Protect all other /api routes (cookie works for EventSource same-origin)
   app.use('/api', (req, res, next) => {
     if (req.path.startsWith('/auth/')) return next();
-    return requireAuth(req, res, next);
+    return requireAuth(req, res, () => {
+      if (req.auth?.role === 'viewer') {
+        const denial = viewerDenial(req.method, req.path);
+        if (denial) return res.status(403).json({ ok: false, error: denial });
+      }
+      next();
+    });
   });
 
   // --- API Routes ---
@@ -678,6 +686,96 @@ export async function createApp() {
     }
   });
 
+  // Curated read-only status for the /ops viewer page — session stats,
+  // active params, recent trades. No internals, no write surface.
+  app.get('/api/ops/status', (req, res) => {
+    try {
+      const state = poly.getState({ lean: true });
+      const cfg = state.config || {};
+      const session = state.session || null;
+      const cash = state.cashAudit || {};
+      const closed = (state.trades || []).filter((t) => t.exitPrice != null || t.closed);
+      res.json({
+        ok: true,
+        updatedAt: Date.now(),
+        running: !!state.running,
+        mode: state.mode,
+        session: session
+          ? {
+              id: session.id || null,
+              startedAt: session.startedAt || null,
+              status: session.status || null,
+              trades: session.trades || 0,
+              wins: session.wins || 0,
+              losses: session.losses || 0,
+              pnl: session.pnl ?? 0,
+              uptimeMs: session.uptimeMs || 0,
+            }
+          : null,
+        account: {
+          equity: cash.equity ?? null,
+          cash: cash.cash ?? null,
+          realizedPnl: cash.realizedPnl ?? null,
+          unrealizedPnl: cash.unrealizedPnl ?? null,
+          netPnl: cash.netPnl ?? null,
+          openCount: cash.openCount ?? 0,
+        },
+        params: {
+          minConfidence: cfg.minConfidence ?? null,
+          minPrice: cfg.minPrice ?? null,
+          maxPrice: cfg.maxPrice ?? null,
+          tpPctLow: cfg.tpPctLow ?? null,
+          tpPctHigh: cfg.tpPctHigh ?? null,
+          slPct: cfg.slPct ?? null,
+          adaptiveSl: cfg.adaptiveSl ?? null,
+          kellyFraction: cfg.kellyFraction ?? null,
+          maxPositionPct: cfg.maxPositionPct ?? null,
+          maxPositionSize: cfg.maxPositionSize ?? null,
+          minPositionSize: cfg.minPositionSize ?? null,
+          maxOpenPositions: cfg.maxOpenPositions ?? null,
+          useKellySizing: cfg.useKellySizing ?? null,
+          useSignals: cfg.useSignals ?? null,
+          useML: cfg.useML ?? null,
+          enabledDurations: cfg.enabledDurations ?? null,
+        },
+        recent: closed.slice(0, 20).map((t) => ({
+          symbol: t.symbol,
+          outcome: t.outcome,
+          entryPrice: t.entryPrice,
+          exitPrice: t.exitPrice,
+          pnl: t.pnl,
+          exitReason: t.exitReason,
+          time: t.timestamp || t.entryTime || null,
+        })),
+        // Session equity curve (fallback to mode curve), downsampled ≤60 pts
+        curve: (() => {
+          try {
+            const pts = (state.account?.curve?.points || []).filter(
+              (p) => p && Number.isFinite(Number(p.equity)),
+            );
+            const sessId = state.session?.id;
+            const src = sessId
+              ? pts.filter((p) => p.sessionId === sessId)
+              : [];
+            const base = src.length > 1 ? src : pts;
+            const step = Math.max(1, Math.ceil(base.length / 60));
+            return base
+              .filter((_, i) => i % step === 0)
+              .slice(-60)
+              .map((p) => ({
+                t: p.t,
+                equity: Math.round(Number(p.equity) * 100) / 100,
+              }));
+          } catch {
+            return [];
+          }
+        })(),
+      });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
   app.post('/api/poly/approve', async (req, res) => {
     try {
       const { id } = req.body || {};
@@ -851,6 +949,12 @@ export async function createApp() {
   // Legacy playground URLs → public UI
   app.use('/playground', (req, res) => {
     res.redirect(301, '/public/');
+  });
+
+  // Read-only strategy status dashboard (viewer password)
+  app.get('/ops', (req, res) => {
+    res.set('Cache-Control', 'no-store');
+    res.sendFile(path.join(__dirname, 'public', 'ops.html'));
   });
 
   // --- Static ---
