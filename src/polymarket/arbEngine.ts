@@ -244,15 +244,25 @@ export function syncPackageSettlements(trades = [], mode = 'paper') {
 /**
  * Computes package-level metrics for dashboard header KPI card.
  */
-export function getArbPackageMetrics(mode = 'paper') {
+export function getArbPackageMetrics(mode = 'paper', trades = []) {
   const all = loadPackages().filter((p) => p.mode === mode);
   const settled = all.filter((p) => p.status === 'SETTLED');
   const locked = all.filter((p) => p.status === 'LOCKED');
   const aborted = all.filter((p) => p.status === 'ABORTED');
 
+  // Realized PnL is truth: sum the closed leg trades when available (covers
+  // force-closed / rolled-back legs), falling back to the nominal entry edge.
+  const realizedFor = (pkg) => {
+    const legTrades = trades.filter((t) => t.packageId === pkg.packageId && t.closed && t.pnl != null);
+    if (legTrades.length >= 2) {
+      return Math.round(legTrades.reduce((s, t) => s + Number(t.pnl || 0), 0) * 100) / 100;
+    }
+    return Number(pkg.lockedProfitUsd || 0);
+  };
+
   const concludedCount = settled.length + aborted.length;
-  const netProfitUsd = settled.reduce((sum, p) => sum + Number(p.lockedProfitUsd || 0), 0);
-  const winCount = settled.length;
+  const netProfitUsd = Math.round(settled.reduce((sum, p) => sum + realizedFor(p), 0) * 100) / 100;
+  const winCount = settled.filter((p) => realizedFor(p) > 0).length;
   const winRatePct = concludedCount > 0 ? Math.round((winCount / concludedCount) * 1000) / 10 : 0;
 
   return {

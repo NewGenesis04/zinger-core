@@ -1874,7 +1874,7 @@ export function getState(opts = {}) {
       syncPackageSettlements(botState.trades, mode);
       return loadPackages().filter((p) => p.mode === mode);
     })(),
-    arbMetrics: getArbPackageMetrics(mode),
+    arbMetrics: getArbPackageMetrics(mode, botState.trades),
   };
   const narrative = buildSystemNarrative(stateCore);
   const liveScoreCards = buildLiveScoreCards(stateCore);
@@ -2691,6 +2691,9 @@ async function scan() {
             log(`🔴 MAX DRAWDOWN ${cfg.mode.toUpperCase()} · ${ddPct}% off cost (limit ${(maxDd * 100)}%) — closing all positions`, 'system', { totalCost, totalUnrealized, ddPct, limit: maxDd });
             botState._ddTriggered = true;
             for (const op of modePositions) {
+              // Arb legs are hedged to $1.00 at settlement — force-closing mid-window
+              // forfeits the locked edge and books the spread. Keep them immune.
+              if (op.packageId || op.isArbLeg) continue;
               if (op.mode === 'live' && op.tokenId && op.shares > 0) {
                 try {
                   const sellRes = await placeMarketSell({

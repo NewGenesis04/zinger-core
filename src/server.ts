@@ -396,9 +396,10 @@ export async function createApp() {
 
   app.get('/api/poly/packages', (req, res) => {
     try {
-      const mode = (req.query.mode as string) || poly.getState()?.config?.mode || 'paper';
+      const state = poly.getState();
+      const mode = (req.query.mode as string) || state?.config?.mode || 'paper';
       const packages = loadPackages().filter((p) => p.mode === mode);
-      const metrics = getArbPackageMetrics(mode);
+      const metrics = getArbPackageMetrics(mode, state?.trades);
       res.json({ ok: true, packages, metrics });
     } catch (err) {
       res.status(500).json({ ok: false, error: err.message });
