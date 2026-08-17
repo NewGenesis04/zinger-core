@@ -1,22 +1,15 @@
 // @ts-nocheck
-import fs from 'fs';
-import { dataPath } from './persistence.js';
+import { dataPath, load, persistSync } from './persistence.js';
 
 const FILE = dataPath('poly_config_sessions.json');
 
 function readStore() {
-  try {
-    const parsed = JSON.parse(fs.readFileSync(FILE, 'utf8'));
-    return Array.isArray(parsed.sessions) ? parsed : { sessions: [] };
-  } catch {
-    return { sessions: [] };
-  }
+  const parsed = load(FILE, null);
+  return parsed && Array.isArray(parsed.sessions) ? parsed : { sessions: [] };
 }
 
 function writeStore(store) {
-  const tmp = `${FILE}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(store, null, 2));
-  fs.renameSync(tmp, FILE);
+  persistSync(FILE, store);
 }
 
 function summarizeTrades(trades, mode, limit = 100) {

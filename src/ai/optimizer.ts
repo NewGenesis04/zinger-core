@@ -1,7 +1,7 @@
 // @ts-nocheck
-import fs from 'fs';
 import path from 'path';
 import { chat, llmStatus } from './llm.js';
+import { loadFileOrStore, saveFileOrStore } from '../polymarket/sqliteStore.js';
 
 const DATA_DIR = path.resolve(import.meta.dirname, '../../data');
 const PERF_FILE = path.join(DATA_DIR, 'session_perf.json');
@@ -41,17 +41,11 @@ function clamp(v, [lo, hi]) {
 }
 
 function loadJson(file, fallback) {
-  try {
-    return JSON.parse(fs.readFileSync(file, 'utf-8'));
-  } catch {
-    return fallback;
-  }
+  return loadFileOrStore(file, fallback);
 }
 
 function saveJson(file, data) {
-  const tmp = `${file}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
-  fs.renameSync(tmp, file);
+  saveFileOrStore(file, data);
 }
 
 let _optCache = null;

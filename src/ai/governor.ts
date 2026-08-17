@@ -12,9 +12,9 @@
  *   - live safety               → never relaxes the live edge-gate lock
  * Every action is logged with its rationale.
  */
-import fs from 'fs';
 import path from 'path';
 import { chat, llmStatus } from './llm.js';
+import { loadFileOrStore, saveFileOrStore } from '../polymarket/sqliteStore.js';
 
 const DATA_DIR = path.resolve(import.meta.dirname, '../../data');
 const GOV_FILE = path.join(DATA_DIR, 'governor_state.json');
@@ -108,13 +108,11 @@ function round(n, d = 2) {
 }
 
 function loadJson(file, fallback) {
-  try { return JSON.parse(fs.readFileSync(file, 'utf-8')); } catch { return fallback; }
+  return loadFileOrStore(file, fallback);
 }
 
 function saveJson(file, data) {
-  const tmp = `${file}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
-  fs.renameSync(tmp, file);
+  saveFileOrStore(file, data);
 }
 
 export function getGovernorStatus() {
@@ -209,13 +207,7 @@ function applyProfile(name, { saveConfig, config }) {
   return true;
 }
 
-function record(entry) {
-  const result = { ...entry, at: Date.now() };
-  _state.regime = entry.regime;
-  _state.lastResult = result;
-  if (entry.changed) {
-    _state.history = [result, ..._state.history].slice(0, 40);
-  }
+function persistState() {
   saveJson(GOV_FILE, {
     enabled: _state.enabled,
     profile: _state.profile,
@@ -227,9 +219,35 @@ function record(entry) {
     peakEquity: _state.peakEquity,
     peakEquityByMode: _state.peakEquityByMode,
     breakerActiveByMode: _state.breakerActiveByMode,
-    lastResult: result,
+    lastResult: _state.lastResult,
     history: _state.history.slice(0, 20),
   });
+}
+
+/** Clear peak/breaker memory for a mode so a data reset starts from a clean slate. */
+export function resetGovernorPeak(mode) {
+  _state.peakEquityByMode = { ...(_state.peakEquityByMode || {}), [mode]: null };
+  _state.breakerActiveByMode = { ...(_state.breakerActiveByMode || {}), [mode]: false };
+  if (mode === _state.lastMode) {
+    _state.peakEquity = null;
+    _state.breakerActive = false;
+    _state.profile = null;
+    _state.prevProfile = null;
+    _state.switchBaseline = null;
+    _state.lastSwitchAt = 0;
+    _state.cooling = {};
+  }
+  persistState();
+}
+
+function record(entry) {
+  const result = { ...entry, at: Date.now() };
+  _state.regime = entry.regime;
+  _state.lastResult = result;
+  if (entry.changed) {
+    _state.history = [result, ..._state.history].slice(0, 40);
+  }
+  persistState();
   return result;
 }
 

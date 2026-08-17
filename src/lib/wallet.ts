@@ -3,6 +3,7 @@ import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { loadFileOrStore, saveFileOrStore } from '../polymarket/sqliteStore.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '../..');
@@ -29,7 +30,7 @@ export function loadOrCreateWallet() {
     instance: process.env.ZINGER_INSTANCE || 'experiment',
   };
 
-  fs.writeFileSync(WALLET_FILE, JSON.stringify(wallet, null, 2));
+  saveFileOrStore(WALLET_FILE, wallet);
   console.log(`\n🔐 Generated new wallet`);
   console.log(`   Instance: ${wallet.instance}`);
   console.log(`   Address: ${wallet.address}`);
@@ -39,12 +40,7 @@ export function loadOrCreateWallet() {
 }
 
 export function tryLoadWallet() {
-  try {
-    if (fs.existsSync(WALLET_FILE)) {
-      return JSON.parse(fs.readFileSync(WALLET_FILE, 'utf-8'));
-    }
-  } catch {}
-  return null;
+  return loadFileOrStore(WALLET_FILE, null);
 }
 
 export function getWallet() {

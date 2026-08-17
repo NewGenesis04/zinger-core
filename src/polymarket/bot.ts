@@ -83,7 +83,7 @@ import {
 } from './configSessions.js';
 import { llmStatus } from '../ai/llm.js';
 import { runOptimizer, getOptimizerStatus, recordCycleSession, loadSessionPerf } from '../ai/optimizer.js';
-import { runGovernor, getGovernorStatus, getActiveProfile, computeProfilePerf } from '../ai/governor.js';
+import { runGovernor, getGovernorStatus, getActiveProfile, computeProfilePerf, resetGovernorPeak } from '../ai/governor.js';
 
 let botState = {
   running: false,
@@ -3869,6 +3869,7 @@ export function resetPaperData({ initialDeposit = 100 } = {}) {
   persistSync(FILES.TRADES, botState.trades);
   persistSync(FILES.POSITIONS, botState.positions);
   persistSync(FILES.ACTIONS, botState.actions);
+  resetGovernorPeak('paper');
   saveConfig({ mode: 'paper', enabled: false, paperBankroll: amount, paperInitialDeposit: amount });
   refreshKellyHistory();
   log(`♻️ PAPER DATA RESET · $${amount.toFixed(2)} initial · removed ${removed.trades} trades`, 'system', removed);
@@ -3929,6 +3930,7 @@ export function resetLiveData({ baselineUsd = null } = {}) {
   persistSync(FILES.TRADES, botState.trades);
   persistSync(FILES.POSITIONS, botState.positions);
   persistSync(FILES.ACTIONS, botState.actions);
+  resetGovernorPeak('live');
 
   const cash = Number(
     baselineUsd

@@ -22,6 +22,7 @@ import { refreshAllTokens, loadAutoSellConfig, saveAutoSellConfig } from './lib/
 import { sellToken, addTransaction, loadTransactions, getTokenFees } from './lib/pons.js';
 import { sseLine } from './lib/sse.js';
 import { loadPackages, getArbPackageMetrics } from './polymarket/arbEngine.js';
+import { loadFileOrStore, saveFileOrStore } from './polymarket/sqliteStore.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
@@ -29,14 +30,13 @@ const DATA_DIR = path.join(ROOT, 'data');
 const SESSIONS_FILE = path.join(DATA_DIR, 'sessions.json');
 
 export function getSessions() {
-  try { return JSON.parse(fs.readFileSync(SESSIONS_FILE, 'utf-8')); }
-  catch { return []; }
+  return loadFileOrStore(SESSIONS_FILE, []);
 }
 
 export function addSession(session) {
   const sessions = getSessions();
   sessions.push({ id: Date.now().toString(36), ...session, timestamp: new Date().toISOString() });
-  fs.writeFileSync(SESSIONS_FILE, JSON.stringify(sessions, null, 2));
+  saveFileOrStore(SESSIONS_FILE, sessions);
   return sessions[sessions.length - 1];
 }
 

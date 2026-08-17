@@ -27,6 +27,9 @@ from collections import defaultdict
 import numpy as np
 from scipy import stats as sp_stats
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'ml'))
+from sqlite_store import store_save, store_load
+
 DATA_DIR = Path(__file__).resolve().parent.parent / 'data'
 SAMPLES_FILE = DATA_DIR / 'trade_samples.json'
 OUTPUT_FILE = DATA_DIR / 'heuristics_optimized.json'
@@ -37,11 +40,7 @@ PRIOR_ALPHA = 2.0
 PRIOR_BETA = 2.0
 
 def load_samples():
-    if not SAMPLES_FILE.exists():
-        return []
-    with open(SAMPLES_FILE) as f:
-        samples = json.load(f)
-    return samples
+    return store_load('trade_samples.json', [])
 
 def duration_label(dur):
     d = str(dur or '5m').lower()
@@ -410,10 +409,8 @@ def main():
         ],
     }
 
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    with open(OUTPUT_FILE, 'w') as f:
-        json.dump(payload, f, indent=2, default=str)
-    print(f'Wrote {OUTPUT_FILE}')
+    store_save('heuristics_optimized.json', payload)
+    print('Wrote heuristics_optimized.json (sqlite)')
 
     # Write fund_heuristics.json in the format fundHeuristics.js expects
     fund_payload = {
@@ -472,9 +469,8 @@ def main():
             'suggested': st.get('suggested', 'base'),
         }
 
-    with open(FUND_FILE, 'w') as f:
-        json.dump(fund_payload, f, indent=2, default=str)
-    print(f'Wrote {FUND_FILE}')
+    store_save('fund_heuristics.json', fund_payload)
+    print('Wrote fund_heuristics.json (sqlite)')
 
     print(f'  Samples: {len(samples)}')
     print(f'  Strata: {len(strata)}')
