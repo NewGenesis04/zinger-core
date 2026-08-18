@@ -38,7 +38,7 @@ import { getMLSignalForBoth, getMLTraceForBoth } from './predict.js';
 import { addMLPrediction, addPriceTrace, getConfidenceBias, getConfidenceBufferStats, getPriceTrace } from './confidence.js';
 import { addSpotTick } from './spotPriceHistory.js';
 import { getModelStates, getModelHealth, onModelChange } from './modelRegistry.js';
-import { detectAndExecuteArbPackage, syncPackageSettlements, getArbPackageMetrics, loadPackages } from './arbEngine.js';
+import { detectAndExecuteArbPackage, isComplementaryBinary, syncPackageSettlements, getArbPackageMetrics, loadPackages } from './arbEngine.js';
 import { persist, persistSync, load, FILES, dataPath } from './persistence.js';
 import { placeOrder, placeMarketSell, syncClobBalance } from './trade.js';
 import { checkReadiness } from './readiness.js';
@@ -183,6 +183,19 @@ function syncConfigFromStore() {
 export function saveConfig(cfg) {
   const patch = cfg || {};
   let store = applyConfigPatch(botState.configStore || loadConfigStore(), patch);
+
+  // Invariant: forceArbOnly mutes directional trading and relies entirely on
+  // the arb engine — if clobArbEnabled is off too, the bot locks into a dead
+  // state (no directional, no arb) that can persist indefinitely. Authoritative
+  // guard here since every config write (UI, governor, session restore) funnels
+  // through this function.
+  for (const modeKey of ['paper', 'live']) {
+    const strat = store.profiles[modeKey];
+    if (strat?.forceArbOnly === true && strat?.clobArbEnabled === false) {
+      strat.clobArbEnabled = true;
+      log(`⚠️ Config guard: forceArbOnly requires clobArbEnabled — auto-enabled CLOB arb on the ${modeKey} profile (was about to trade nothing).`, 'system');
+    }
+  }
 
   // Switching to live: evaluate gate against PAPER expectancy only (isolation)
   if (store.mode === 'live') {
@@ -335,7 +348,7 @@ function sideBalanceBonus(outcome, cfg) {
 }
 
 function detectClobArb(depth, prices, cfg, market) {
-  if (market?.negRisk !== true) return null;
+  if (!isComplementaryBinary(market)) return null;
   const upAsk = Number(depth?.up?.bestAsk || prices?.up || 0);
   const downAsk = Number(depth?.down?.bestAsk || prices?.down || 0);
   if (!(upAsk > 0.01 && downAsk > 0.01 && upAsk < 0.99 && downAsk < 0.99)) return null;
@@ -2228,7 +2241,18 @@ async function scan() {
     const readiness = await refreshTelemetry();
 
     if (cfg.useSignals) {
-      botState.signals = await getSignalForBoth();
+      // A signal-feed outage must not abort the whole scan pass: the arb engine
+      // further down needs only the Polymarket book, and the directional path
+      // already refuses stale/missing signals via data assurance. Keep the last
+      // known signals and carry on rather than throwing out of scan().
+      const freshSignals = await getSignalForBoth().catch((err) => {
+        if (Date.now() - (botState._signalFailLoggedAt || 0) > 60_000) {
+          botState._signalFailLoggedAt = Date.now();
+          log(`⚠️ Signal feed unavailable — ${String(err?.message || err).slice(0, 90)} · reusing last signals`, 'error');
+        }
+        return null;
+      });
+      if (freshSignals) botState.signals = freshSignals;
       // Prefer cached ML ladder from background refresh; only force a light signal nudge
       const mlOverride = cfg.useML
         ? await getMLSignalForBoth('5m', 1).catch(() => ({ btc: null, eth: null }))

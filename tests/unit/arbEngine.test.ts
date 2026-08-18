@@ -11,9 +11,10 @@ describe('Atomic Arb Engine', () => {
     const market = {
       symbol: 'ETH',
       slug: 'eth-5m-test',
+      conditionId: '0xeth5mtest',
+      outcomes: ['Up', 'Down'],
       tokenIds: { up: 'token-up-1', down: 'token-down-1' },
       acceptingOrders: true,
-      negRisk: true,
     };
 
     const depth = {
@@ -58,7 +59,7 @@ describe('Atomic Arb Engine', () => {
   });
 
   it('rejects arbitrage execution when ask sum exceeds 1 - minArbGap', async () => {
-    const market = { symbol: 'BTC', slug: 'btc-5m-test', tokenIds: { up: 'u', down: 'd' }, negRisk: true };
+    const market = { symbol: 'BTC', slug: 'btc-5m-test', conditionId: '0xbtc5m', outcomes: ['Up', 'Down'], tokenIds: { up: 'u', down: 'd' } };
     const depth = { up: { bestAsk: 0.51 }, down: { bestAsk: 0.50 } }; // sum = 1.01 (no gap)
 
     const cfg = { clobArbEnabled: true, minArbGap: 0.015, maxArbPackages: 4, paperBankroll: 100 };
@@ -79,8 +80,38 @@ describe('Atomic Arb Engine', () => {
     expect(pkg).toBeNull();
   });
 
-  it('rejects arb execution on non-negRisk markets', async () => {
-    const market = { symbol: 'ETH', slug: 'eth-nonnegrisk', tokenIds: { up: 'u', down: 'd' }, negRisk: false };
+  // Polymarket reports negRisk:false on every btc/eth-updown market, yet those are
+  // ordinary complementary binaries whose legs still redeem exactly $1.00 together.
+  // Gating on negRisk disabled arb entirely; the payout guarantee comes from the
+  // binary condition, so that is what must be checked.
+  it('locks arb on a complementary binary even when negRisk is false', async () => {
+    const market = {
+      symbol: 'ETH',
+      slug: 'eth-updown-5m-1787012400',
+      conditionId: '0x6e68da643a31',
+      outcomes: ['Up', 'Down'],
+      tokenIds: { up: 'token-up-1', down: 'token-down-1' },
+      negRisk: false,
+    };
+    const depth = { up: { bestAsk: 0.34 }, down: { bestAsk: 0.62 } };
+    const cfg = { clobArbEnabled: true, minArbGap: 0.015, maxArbPackages: 4, paperBankroll: 100, mode: 'paper' };
+
+    const pkg = await detectAndExecuteArbPackage({
+      market, depth, prices: { up: 0.34, down: 0.62 }, cfg, mode: 'paper',
+      log: () => {}, executeTrade: async () => true, adjustPaperCash: () => {}, saveTrade: () => {},
+      botState: { config: {}, positions: [] },
+    });
+
+    expect(pkg?.status).toBe('LOCKED');
+  });
+
+  it.each([
+    ['no conditionId', { outcomes: ['Up', 'Down'], tokenIds: { up: 'u', down: 'd' } }],
+    ['more than two outcomes', { conditionId: '0xabc', outcomes: ['A', 'B', 'C'], tokenIds: { up: 'u', down: 'd' } }],
+    ['a missing leg token', { conditionId: '0xabc', outcomes: ['Up', 'Down'], tokenIds: { up: 'u' } }],
+    ['both legs sharing one token', { conditionId: '0xabc', outcomes: ['Up', 'Down'], tokenIds: { up: 'u', down: 'u' } }],
+  ])('rejects arb execution on a market with %s', async (_label, marketShape) => {
+    const market = { symbol: 'ETH', slug: 'eth-not-a-binary', ...marketShape };
     const depth = { up: { bestAsk: 0.34 }, down: { bestAsk: 0.62 } }; // big gap, would lock if allowed
     const cfg = { clobArbEnabled: true, minArbGap: 0.015, maxArbPackages: 4, paperBankroll: 100, mode: 'paper' };
 
@@ -94,8 +125,8 @@ describe('Atomic Arb Engine', () => {
   });
 
   it('enforces maxArbPackages capacity limit', async () => {
-    const market1 = { symbol: 'ETH', slug: 'eth-1', tokenIds: { up: 'u1', down: 'd1' }, negRisk: true };
-    const market2 = { symbol: 'ETH', slug: 'eth-2', tokenIds: { up: 'u2', down: 'd2' }, negRisk: true };
+    const market1 = { symbol: 'ETH', slug: 'eth-1', conditionId: '0xeth1', outcomes: ['Up', 'Down'], tokenIds: { up: 'u1', down: 'd1' } };
+    const market2 = { symbol: 'ETH', slug: 'eth-2', conditionId: '0xeth2', outcomes: ['Up', 'Down'], tokenIds: { up: 'u2', down: 'd2' } };
 
     const cfg = { clobArbEnabled: true, minArbGap: 0.015, maxArbPackages: 1, paperBankroll: 100, mode: 'paper' };
     const depth = { up: { bestAsk: 0.34 }, down: { bestAsk: 0.62 } };
@@ -133,7 +164,7 @@ describe('Atomic Arb Engine', () => {
   });
 
   it('passes valid numeric entryPrice in order plans to trade execution', async () => {
-    const market = { symbol: 'ETH', slug: 'eth-plan-test', tokenIds: { up: 'u', down: 'd' }, negRisk: true };
+    const market = { symbol: 'ETH', slug: 'eth-plan-test', conditionId: '0xethplan', outcomes: ['Up', 'Down'], tokenIds: { up: 'u', down: 'd' } };
     const depth = { up: { bestAsk: 0.34 }, down: { bestAsk: 0.62 } };
     const cfg = { clobArbEnabled: true, minArbGap: 0.015, paperBankroll: 100, mode: 'paper' };
 

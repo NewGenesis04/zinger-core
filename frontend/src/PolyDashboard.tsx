@@ -595,7 +595,9 @@ function BehaviorForm({
             </FieldContent>
             <Switch
               checked={!!draft.forceArbOnly}
-              onCheckedChange={(forceArbOnly) => patch({ forceArbOnly })}
+              onCheckedChange={(forceArbOnly) =>
+                patch(forceArbOnly ? { forceArbOnly, clobArbEnabled: true } : { forceArbOnly })
+              }
             />
           </Field>
           <Field orientation="horizontal">

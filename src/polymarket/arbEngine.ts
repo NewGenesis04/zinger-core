@@ -5,6 +5,24 @@ export type { ArbPackage };
 export { getActivePackages, loadPackages };
 
 /**
+ * True when both legs are complementary outcomes of one binary condition, so
+ * holding the pair to settlement redeems exactly $1.00 — precisely one token
+ * resolves to $1 and the other to $0.
+ *
+ * This is a property of the CTF binary split, NOT of `negRisk`. That flag marks
+ * the NegRiskAdapter used to bundle multi-outcome events, and Polymarket reports
+ * it false on every btc/eth-updown market this bot trades — gating arb on it
+ * disabled the strategy outright.
+ */
+export function isComplementaryBinary(market): boolean {
+  if (!market?.conditionId) return false;
+  if (!Array.isArray(market.outcomes) || market.outcomes.length !== 2) return false;
+  const up = market.tokenIds?.up;
+  const down = market.tokenIds?.down;
+  return Boolean(up && down && up !== down);
+}
+
+/**
  * Detects an orderbook gap and executes an atomic ArbPackage.
  * Completely bypasses directional signals, indicator filters, ML overlays, and ATR stop-losses.
  */
@@ -22,9 +40,8 @@ export async function detectAndExecuteArbPackage({
   botState,
 }) {
   if (cfg.clobArbEnabled === false) return null;
-  // The $1.00 guaranteed payout (both legs held to settlement) only exists on
-  // negRisk markets — never execute arb packages on markets that can lose both legs.
-  if (market.negRisk !== true) return null;
+  // Never execute arb packages on markets where both legs could lose.
+  if (!isComplementaryBinary(market)) return null;
 
   const upAsk = Number(depth?.up?.bestAsk || prices?.up || 0);
   const downAsk = Number(depth?.down?.bestAsk || prices?.down || 0);
