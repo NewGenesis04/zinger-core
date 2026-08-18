@@ -76,14 +76,30 @@ nothing while the UI shows "Force Pure Arb Active" — could be set at all.
 Guarded for now in `saveConfig` (`bot.ts:187-198`) plus a UI-side patch, but the
 invariant belongs somewhere declarative alongside the field definitions.
 
-### 4. Tests write to the live data store
+### 4. Arb legs pollute the directional edge gate
+
+`closedPnls` (`edge.ts:7-19`) selects every closed paper trade with no filter on
+`isArbLeg` / `packageId`, so arb legs feed the expectancy, win-rate and Kelly
+figures that `evaluateEdgeGate` uses to decide whether *directional* trading has
+proven itself. Arb legs are structurally paired (one leg near +$1/share, the
+other near -$1/share) and say nothing about directional skill — e.g. the six
+legs currently on record read as 50% WR with ~$2 average win and ~$1.94 average
+loss, which is arb mechanics, not signal quality.
+
+Consequences both ways: in `forceArbOnly` mode the 40-close `edgeMinTrades`
+sample fills up with arb noise and can unlock directional trading (or live, via
+`requireEdgeForLive`) on evidence that never tested a directional signal; and a
+run of arb legs can equally suppress a genuine directional edge. The gate should
+either exclude arb legs or score them in a separate bucket.
+
+### 5. Tests write to the live data store
 
 `tests/unit/arbEngine.test.ts` fixtures persisted into the real `data/` store —
 a package with `slug: "eth-plan-test"` and tokenIds `"u"`/`"d"` ended up in
 production package history and skewed `arbMetrics`. Tests need an isolated
 `ZINGER_DATA_DIR`.
 
-### 5. Observability gaps
+### 6. Observability gaps
 
 - Skip/decline reasons log under types `'scan'` and `'signal'`, but the
   notifications panel only offers `all/buy/arb/sl/tp/announce/error`
