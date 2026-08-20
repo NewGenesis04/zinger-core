@@ -461,3 +461,74 @@ describe('INVARIANT: the directional edge gate scores directional trades only', 
     expect(gate.edgeOk).toBe(true);
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+describe('INVARIANT: engine slot budgets are independent (D5)', () => {
+  // D5: cash is one pool, slots are per engine. Slots are internal counters
+  // with nothing to reconcile, and for directional they ARE the risk dial —
+  // worst case = slots x position size x SL%. A single shared count makes one
+  // number serve two unrelated jobs: raising it for arb headroom silently
+  // authorises that much more directional exposure, and arb legs occupying it
+  // silently shrink the directional budget.
+  //
+  // Arb legs contribute ~nothing to worst-case drawdown (hold-to-settle, no
+  // meaningful stop), so the two dials are genuinely independent.
+  //
+  // These test the shape of the accounting, which is what the D4 position
+  // manager must preserve in slice 2. `countOpenPositions` is not exported, so
+  // the classifier it filters on is what is asserted here.
+
+  const leg = (over = {}) => ({ mode: 'paper', closed: false, packageId: 'pkg-1', isArbLeg: true, ...over });
+  const dir = (over = {}) => ({ mode: 'paper', closed: false, ...over });
+
+  const countBy = (positions, engine) =>
+    positions.filter((p) => !p.closed && p.mode === 'paper' && tradeEngine(p) === engine).length;
+
+  it('never charges an arb leg against the directional budget', () => {
+    const book = [leg({ outcome: 'up' }), leg({ outcome: 'down' }), dir({ outcome: 'up' })];
+    expect(countBy(book, 'directional')).toBe(1);
+    expect(countBy(book, 'arb')).toBe(2);
+  });
+
+  it('a full arb book leaves the directional budget untouched', () => {
+    // The concrete failure this prevents: with maxOpenPositions 4 and a shared
+    // count, two locked packages (4 legs) blocked directional entry outright,
+    // and the boot-time trim then closed legs to get back under 4.
+    const book = [];
+    for (let i = 0; i < 20; i += 1) {
+      book.push(leg({ packageId: `pkg-${i}`, outcome: 'up' }), leg({ packageId: `pkg-${i}`, outcome: 'down' }));
+    }
+    expect(countBy(book, 'arb')).toBe(40);
+    expect(countBy(book, 'directional')).toBe(0);
+  });
+
+  it('the two counts always partition the book — nothing double-counted or lost', () => {
+    const book = [
+      leg({ outcome: 'up' }), leg({ outcome: 'down' }),
+      dir({ outcome: 'up' }), dir({ outcome: 'down' }),
+      dir({ closed: true }),                      // closed: in neither
+      { mode: 'live', closed: false },            // other mode: in neither
+      dir({ arb: true }),                         // legacy arb marker
+      { mode: 'paper', closed: false, engine: 'arb' },        // explicit tag
+      { mode: 'paper', closed: false, engine: 'directional', isArbLeg: true }, // tag beats marker
+    ];
+    const open = book.filter((p) => !p.closed && p.mode === 'paper').length;
+    expect(countBy(book, 'arb') + countBy(book, 'directional')).toBe(open);
+  });
+
+  it('closing a directional position never touches a hedged pair', () => {
+    // Backlog item 25: the boot-time trim selected the oldest open paper
+    // position of any engine, so trimming to maxOpenPositions could close one
+    // leg of a pair — manufacturing the naked leg item 8 settles at $0.50.
+    const book = [
+      leg({ entryTime: 1 }), leg({ entryTime: 2 }),   // oldest, and hedged
+      dir({ entryTime: 3 }),
+    ];
+    const trimCandidates = book
+      .filter((p) => !p.closed && p.mode === 'paper' && tradeEngine(p) === 'directional')
+      .sort((a, b) => (a.entryTime || 0) - (b.entryTime || 0));
+    expect(trimCandidates).toHaveLength(1);
+    expect(trimCandidates[0].entryTime).toBe(3);
+    expect(trimCandidates.some((p) => p.isArbLeg || p.packageId)).toBe(false);
+  });
+});

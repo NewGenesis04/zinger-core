@@ -179,3 +179,71 @@ describe('PENDING INVARIANT: settlement valuation depends on the sibling leg', (
   // this expressible as a fixture test.
   it.todo('settles a naked arb leg against the real outcome, not $0.50 — needs positions/settle.ts (slice 3)');
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+describe('PENDING INVARIANT: a declined leg is never recorded as filled', () => {
+  // Backlog item 27, found 2026-08-20 while decoupling the slot budgets (D5).
+  //
+  // `executeArbLeg` ends with `return !!(await executeTrade(pending))`
+  // (arbEngine.ts:211), and `executePendingTrade` returns an *object* on every
+  // path — `{ ok: false, error: 'max open positions' }` as readily as
+  // `{ ok: true, position }`. Both are truthy, so `!!` is always true and the
+  // engine cannot distinguish a fill from a refusal.
+  //
+  // Consequence: the "Emergency Rollback Handler" (arbEngine.ts:153-168) is
+  // unreachable for every decline. It fires only when executeTrade *throws*.
+  //
+  // Verified against the real engine, 2026-08-20:
+  //
+  //   both legs fill           -> LOCKED   up=true  down=true   (correct)
+  //   both legs DECLINED       -> LOCKED   up=true  down=true   (zero positions)
+  //   up fills, down DECLINED  -> LOCKED   up=true  down=true   (naked leg)
+  //   both legs throw          -> ABORTED  up=false down=false  (correct)
+
+  const declined = { ok: false, error: 'max open positions' };
+  const filled = { ok: true, position: {} };
+
+  const run = (executeTrade) => detectAndExecuteArbPackage({
+    market: market(),
+    depth: { up: { bestAsk: 0.34 }, down: { bestAsk: 0.62 } },
+    prices: { up: 0.34, down: 0.62 },
+    cfg: cfg(),
+    mode: 'paper',
+    log: () => {},
+    executeTrade,
+    botState: { config: {}, positions: [] },
+  });
+
+  it.fails('does not lock a package when both legs were refused', async () => {
+    const pkg = await run(async () => declined);
+    // Nothing was bought. Locking this reports profit on a position that does
+    // not exist, and getArbPackageMetrics then reads lockedProfitUsd gross of
+    // fees because there are no leg trades to correct it (item 24).
+    expect(pkg.status).not.toBe('LOCKED');
+    expect(pkg.legs.up.filled).toBe(false);
+    expect(pkg.legs.down.filled).toBe(false);
+  });
+
+  it.fails('aborts and unwinds when only one leg was accepted', async () => {
+    let n = 0;
+    const pkg = await run(async () => (++n === 1 ? filled : declined));
+    // This is the naked leg of items 8 and 25 — real directional exposure held
+    // in the belief that it is hedged. In live mode that is unhedged money.
+    expect(pkg.status).toBe('ABORTED');
+    expect(pkg.abortReason).toMatch(/mismatch/i);
+  });
+
+  it.fails('reports a refusal distinctly from a fill', async () => {
+    // The root cause, isolated: the boolean the engine branches on carries no
+    // information, because every return value of executePendingTrade is truthy.
+    //
+    // The reset between runs is load-bearing — the first package consumes a
+    // maxArbPackages slot, so without it the second detection returns null and
+    // this fails on a TypeError instead of on its own assertion, which would
+    // make the it.fails() worthless.
+    const both = await run(async () => declined);
+    saveAllPackages([]);
+    const good = await run(async () => filled);
+    expect(both.status).not.toBe(good.status);
+  });
+});

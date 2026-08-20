@@ -341,8 +341,28 @@ function adjustPaperCash(delta, reason = '') {
   return next;
 }
 
-function countOpenPositions(mode = botState.config.mode) {
-  return botState.positions.filter((p) => !p.closed && (!mode || p.mode === mode)).length;
+/**
+ * Open position count, optionally for one engine (D5).
+ *
+ * `engine` omitted counts every open position — correct for reporting, wrong for
+ * a capacity gate. The two engines' slot counts are independent by decision:
+ *
+ *   directional   maxOpenPositions   risk dial: slots x size x SL%
+ *   arb           maxArbPackages     2 positions per package, hold-to-settle
+ *
+ * They were cross-wired. `maxOpenPositions` counted arb legs too, so a hedged
+ * pair consumed two directional slots and the two settings contradicted each
+ * other outright — the VPS runs maxArbPackages 40 (authorising 80 legs) against
+ * maxOpenPositions 4. Arb was therefore capped at two packages regardless of
+ * its own setting, and the boot-time trim closed arb legs to get under a limit
+ * that was never meant to govern them.
+ */
+function countOpenPositions(mode = botState.config.mode, engine = null) {
+  return botState.positions.filter((p) => (
+    !p.closed
+    && (!mode || p.mode === mode)
+    && (!engine || tradeEngine(p) === engine)
+  )).length;
 }
 
 /** Recent closed/open outcome mix — used to break chronic UP-only bias */
@@ -416,13 +436,21 @@ function repairPaperOverdraft(reason = 'overdraft repair') {
     log(`🧰 PAPER REPAIR close ${pos.symbol} ${pos.outcome?.toUpperCase()} @ $${price.toFixed(3)} · freed $${proceeds.toFixed(2)}`, 'system');
   }
 
-  // Also trim down to max open so we don't sit oversized after a near-zero cash repair
+  // Also trim down to max open so we don't sit oversized after a near-zero cash repair.
+  //
+  // Directional only, on both the count and the selection (backlog item 25 —
+  // the repair loop above already excluded hedges, this one did not). Closing
+  // one leg of a pair manufactures the naked leg item 8 settles at a fabricated
+  // $0.50, and leaves the package holding a maxArbPackages slot (item 9).
+  // maxOpenPositions is the directional risk dial (D5); arb capacity is
+  // maxArbPackages, and arb legs are hold-to-settle with no stop, so trimming
+  // them serves nothing.
   const maxOpen = Number(botState.config.maxOpenPositions ?? 6);
   let trim = 0;
-  while (countOpenPositions('paper') > maxOpen && trim < 80) {
+  while (countOpenPositions('paper', 'directional') > maxOpen && trim < 80) {
     trim += 1;
     const open = botState.positions
-      .filter((p) => !p.closed && p.mode === 'paper')
+      .filter((p) => !p.closed && p.mode === 'paper' && tradeEngine(p) === 'directional')
       .sort((a, b) => (a.entryTime || 0) - (b.entryTime || 0));
     if (!open.length) break;
     const pos = open[0];
@@ -738,12 +766,19 @@ async function executePendingTrade(pending) {
   const cfg = botState.config;
   const plan = pending.plan;
   const costNeeded = Number(plan.costEst || plan.sizeUsd || 0);
-  const maxOpen = Number(cfg.maxOpenPositions ?? 6);
-  if (countOpenPositions(cfg.mode) >= maxOpen) {
+  // D5: each engine is gated by its own dial, counting its own positions. Arb
+  // legs used to be charged against maxOpenPositions, which is the directional
+  // risk dial — so a hedged pair ate two directional slots, and arb's effective
+  // capacity was maxOpenPositions/2 no matter what maxArbPackages said.
+  const engine = tradeEngine(plan);
+  const budget = engine === 'arb'
+    ? { max: Number(cfg.maxArbPackages ?? 4) * 2, label: `max arb legs (${Number(cfg.maxArbPackages ?? 4)} packages)` }
+    : { max: Number(cfg.maxOpenPositions ?? 6), label: `max open directional positions (${Number(cfg.maxOpenPositions ?? 6)})` };
+  if (countOpenPositions(cfg.mode, engine) >= budget.max) {
     pending.status = 'skipped';
     botState._buyLocks.delete(pending.slug);
-    log(`⛔ SKIP ${pending.symbol} — max open positions (${maxOpen})`, 'signal');
-    return { ok: false, error: 'max open positions' };
+    log(`⛔ SKIP ${pending.symbol} — ${budget.label}`, 'signal');
+    return { ok: false, error: `${engine} capacity` };
   }
   if (cfg.mode === 'paper' && costNeeded > Number(cfg.paperBankroll ?? 0) + 0.001) {
     pending.status = 'skipped';
@@ -1559,6 +1594,30 @@ export function getState(opts = {}) {
       return loadPackages().filter((p) => p.mode === mode);
     })(),
     arbMetrics: getArbPackageMetrics(mode, botState.trades),
+    // Per-engine capacity, so "why didn't it trade?" is answerable without
+    // reading the code (objective 1). The two budgets are independent (D5):
+    // directional slots are the risk dial, arb capacity is a package count.
+    slots: (() => {
+      const maxDirectional = Number(botState.config.maxOpenPositions ?? 6);
+      const maxArbPackages = Number(botState.config.maxArbPackages ?? 4);
+      const openDirectional = countOpenPositions(mode, 'directional');
+      const openArbLegs = countOpenPositions(mode, 'arb');
+      return {
+        directional: {
+          open: openDirectional,
+          max: maxDirectional,
+          full: openDirectional >= maxDirectional,
+          note: 'Directional trades held now, out of the maximum allowed at once.',
+        },
+        arb: {
+          openLegs: openArbLegs,
+          maxLegs: maxArbPackages * 2,
+          maxPackages: maxArbPackages,
+          full: openArbLegs >= maxArbPackages * 2,
+          note: 'Arbitrage buys two sides per trade, so each package uses two of these.',
+        },
+      };
+    })(),
   };
   const narrative = buildSystemNarrative(stateCore);
   const liveScoreCards = buildLiveScoreCards(stateCore);
@@ -2292,8 +2351,12 @@ async function scan() {
       }
 
       if (action === 'buy' && buyOutcome) {
+        // Directional positions only (D5). manageEnvironment derives heat and a
+        // per-duration open cap (maxOpensFor: 2 for 5m/15m, 1 for 30m/1h), so
+        // counting arb legs here meant a single hedged pair on a 5m market
+        // exhausted that duration's directional budget outright.
         const env = manageEnvironment({
-          opens: botState.positions,
+          opens: botState.positions.filter((p) => tradeEngine(p) === 'directional'),
           mode: cfg.mode,
           maxOpenPositions: Number(cfg.maxOpenPositions ?? 6),
           cash: readiness?.spendableBalance ?? cfg.paperBankroll,
@@ -2304,7 +2367,7 @@ async function scan() {
           buyOutcome = null;
         } else if (hasOpenOnSlug(market.slug)) {
           action = 'hold';
-        } else if (countOpenPositions(cfg.mode) >= Number(cfg.maxOpenPositions ?? 6)) {
+        } else if (countOpenPositions(cfg.mode, 'directional') >= Number(cfg.maxOpenPositions ?? 6)) {
           action = 'hold';
         } else {
         botState._buyLocks.add(market.slug);
