@@ -498,6 +498,51 @@ since the edge gate then filters to directional trades only. Emit decision event
 *Gate:* arb continues trading nightly, untouched. Zero live risk — directional is
 not currently trading.
 
+#### Progress, 2026-08-20
+
+| Step | State |
+|---|---|
+| extract `buildDecision` + `resolveOrderSize` | ✅ `engines/directional.ts`, `bot.ts` 4105 → 3733 |
+| tag trades by engine · item 6 | ✅ `engine` field + `tradeEngine()` + `closedPnls` filter |
+| per-engine slot budget (D5) | ⬜ not started |
+| decision events (D8) | ⬜ **deliberately not started — see below** |
+
+Committed as two commits on purpose: the extraction changes no behaviour, the
+item 6 fix changes what the gate reads. Split so a regression in the nightly
+paper run attributes to one or the other rather than to "slice 1".
+
+**The extraction was verified equivalent, not assumed.** A one-shot differential
+run drove the pre-extraction copies (lifted from `bot.ts` @ `e710de2`) and the
+new module over **1,739,090** input combinations — 0 mismatches. The harness was
+itself mutation-checked: changing one scoring weight from `160` to `161`
+produced 1,128,960 mismatches, so the zero means something. Throwaway, under
+`tmp/diffcheck/` (gitignored); re-creatable from the commit message.
+
+**The seam.** The two exports are pure functions — no module state, no clock, no
+store. The three `botState` reads `buildDecision` needed became a `portfolio`
+argument assembled by `portfolioView()` in `bot.ts`:
+
+```
+bot.ts (scan)                        engines/directional.ts
+─────────────                        ──────────────────────
+botState ──> portfolioView(slug,cfg) ──> buildDecision({ …, portfolio })
+               hasOpenOnSlug                   ↑ imports nothing from bot.ts
+               sideBalance                     ↑ same inputs → same decision
+               dataAssurance
+```
+
+`portfolioView` is a seam, not a home — the D4 position manager owns those three
+facts in slice 2.
+
+**Why D8 events are not in this slice.** D8 is explicit that the event system
+"should be the persistence layer, not a fourth log beside it", and that building
+it separately reproduces the defect this document exists to remove. Emitting
+took/skipped from the directional engine before that schema exists means writing
+a fifth event path (`actions`, session traces, `liveAccount` traces,
+`executionLog`, and now decisions) and migrating it later. Deferred to land with
+the D8 emitter rather than ahead of it. Recorded here so the omission is a
+decision, not a gap.
+
 ### Slice 2 — Shared layer
 
 Position manager plus the policy interface (D4), with the zero-strategy-
@@ -669,7 +714,32 @@ nothing while the UI shows "Force Pure Arb Active" — could be set at all.
 Guarded for now in `saveConfig` (`bot.ts:187-198`) plus a UI-side patch, but the
 invariant belongs somewhere declarative alongside the field definitions.
 
-### 6. Arb legs pollute the directional edge gate
+### 6. Arb legs pollute the directional edge gate ✅ FIXED
+
+*Fixed in slice 1, 2026-08-20.* Trades now carry an explicit
+`engine: 'arb' | 'directional'` tag and `closedPnls` filters on it. Two
+corrections to the write-up below, both found while fixing it:
+
+- **The tag already existed, negatively.** `bot.ts` wrote `isArbLeg` /
+  `packageId` / `arb` onto every position and all nine `saveTrade` call sites
+  spread the position, so the data was on the record all along — the fix was a
+  filter, not a tagging project. What was missing was the *positive* direction:
+  nothing said "directional", only "not arb", so a third engine would have
+  silently inherited the directional bucket. `tradeEngine()` in `audit.ts` now
+  answers it, with legacy records classified from the old markers.
+- **The measured pollution was worse than "six legs".** On the local store
+  **6 of 7** paper trades were arb legs: 3 artificial wins, 3 artificial losses,
+  expectancy **−$0.010**. That near-zero is not a measurement — it is three
+  hedges cancelling. The gate was judging a directional signal it had tested
+  exactly once. After the fix: 1 of 7 scored, expectancy −$0.72, arb-only.
+
+The live-money exposure was concrete: 20 packages is 40 rows, which clears the
+default `edgeMinTrades: 40`. Armed but not fired — n was 7.
+
+---
+
+*Original write-up:*
+
 
 `closedPnls` (`edge.ts:7-19`) selects every closed paper trade with no filter on
 `isArbLeg` / `packageId`, so arb legs feed the expectancy, win-rate and Kelly
@@ -1323,8 +1393,16 @@ Written so a fresh session can continue without re-deriving any of the above.
 
 ### Where things stand
 
-**Slice 0 is complete and committed** on branch `refactor/slice-0-safety-net`
-(5 commits off `main`). `npm run ci` is green: 56 unit + 4 perf, 1 todo.
+**Slice 0 is complete and committed. Slice 1 is two-thirds done** — branch
+`refactor/slice-0-safety-net`, 8 commits off `main`. `npm run ci` is green:
+75 unit + 4 perf, 1 todo.
+
+| Slice-1 step | State |
+|---|---|
+| extract the engine (`2339b3a`) | ✅ verified equivalent over 1.74M input combinations |
+| item 6 — engine tag + gate filter (`8104e49`) | ✅ 4 invariants, mutation-tested |
+| per-engine slot budget (D5) | ⬜ next |
+| decision events (D8) | ⬜ deferred to the D8 emitter, on purpose |
 
 | Slice-0 item | State |
 |---|---|
@@ -1348,6 +1426,9 @@ Written so a fresh session can continue without re-deriving any of the above.
   `session_perf` is already intact (200 = 200), so this is cleanup of 13 stale
   JSON files, not recovery.
 - **Items 24 and 25** are filed, not fixed. Both are slice 3.
+- **Item 26** is filed, not fixed — the entry-gate thresholds ignore operator,
+  governor and optimizer alike. Slice 2, with the D3 config resolver, because
+  reversing the precedence changes a live gate.
 
 ### Known live-data facts (do not re-derive)
 
@@ -1376,15 +1457,36 @@ Written so a fresh session can continue without re-deriving any of the above.
    sidecar mtime moves on any connection, so compare row content, not file
    mtimes.
 
-### Suggested next step — slice 1
+### Conventions added in slice 1 — keep them
 
-Per D6 and the plan above: extract `buildDecision` (247 lines) and
-`resolveOrderSize` (121) out of `bot.ts` into `engines/directional.ts`, and tag
-every trade with its engine — that alone closes item 6, since the edge gate can
-then filter to directional trades only. Zero live risk: directional is not
-currently trading.
+5. **A "behaviour-neutral" move is proved, not asserted.** Drive the old and new
+   code over a large input grid and diff, then mutation-check the harness so a
+   zero-mismatch result means something. `tmp/diffcheck/` shows the shape.
+6. **Mutation-test every safety invariant, and believe the survivors.** Two of
+   the slice-1 invariants passed under mutation, and both times the test was
+   wrong about *where* the property was enforced — one found item 26. A
+   surviving mutant is a finding, not a nuisance to silence.
+7. **Extracted engines take state as an argument.** No module in `engines/` may
+   import `bot.ts`; a test asserts it. State it needs arrives through a view
+   built by whoever owns that state.
 
-Open question to settle first: **item 23 left the duplication in place.**
-`paperBooksCash()` is now the single formula, but two functions still decide
-when to write cash. D5 says one pool, one owner — collapsing that into
-`ledger/cash.ts` is slice 2 work, and slice 1 should not add a third writer.
+### Suggested next step
+
+Remaining in slice 1: **per-engine slot budgets (D5).** Arb and directional
+currently share one `maxOpenPositions` count, so raising it for arb headroom
+silently authorises that much more directional exposure. Measured worst case is
+`slots × position size × SL%`. Note `maxOpenPositions` is also one of item 19's
+inflated caps and an aggravating factor in item 25, so this touches live risk —
+unlike the two commits already landed.
+
+Then slice 2. Two things are queued for it specifically:
+
+- **Item 23 left the duplication in place.** `paperBooksCash()` is the single
+  formula, but two functions still decide when to write cash. D5 says one pool,
+  one owner — collapse into `ledger/cash.ts`. Nothing should add a third writer
+  before then.
+- **`portfolioView()` in `bot.ts` is a placeholder** for the D4 position
+  manager, which should own `hasOpenOnSlug` / side balance / data assurance.
+- **Item 26** wants the D3 resolver: reverse the `??` chain in
+  `resolveEntryWindows` so an explicitly set value beats the trained heuristic,
+  and report which tier supplied each threshold.
