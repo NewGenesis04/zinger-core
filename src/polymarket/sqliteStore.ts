@@ -6,7 +6,15 @@
  * needs no native module compilation. Mirrors the persistence.js API surface
  * (load / persist / persistSync) keyed by the JSON store's relative path.
  *
- * Enable with ZINGER_SQLITE=1 (or set ZINGER_DB_PATH to the .db file path).
+ * Backend selection (backlog item 15). `ZINGER_SQLITE`:
+ *   unset        — auto: use sqlite when `node:sqlite` loads, else JSON files
+ *   1/true/on    — require sqlite; **throws at import** if unavailable
+ *   0/false/off  — force the JSON fallback even where sqlite would work
+ *
+ * The explicit-but-unavailable case is fatal on purpose. Persistence silently
+ * changing under a live-money bot — a Node downgrade swapping `zinger.db` for
+ * whatever stale JSON is on disk — is the failure this switch exists to stop.
+ * Set `ZINGER_DB_PATH` to move the .db file itself.
  *
  * The `node:sqlite` built-in is loaded lazily through createRequire so the
  * module can be imported on Node 20/21 — SQLITE_AVAILABLE is false there and
@@ -15,6 +23,7 @@
 import fs from 'fs';
 import path from 'path';
 import { createRequire } from 'module';
+import { getDataDir } from './dataDir.js';
 
 const require = createRequire(import.meta.url);
 
@@ -25,12 +34,33 @@ try {
   _DatabaseSync = null;
 }
 
-export const SQLITE_AVAILABLE = _DatabaseSync !== null;
+const MODULE_AVAILABLE = _DatabaseSync !== null;
 
-const DEFAULT_DATA_DIR = path.resolve(import.meta.dirname, '../../data');
-const DATA_DIR = process.env.ZINGER_DATA_DIR
-  ? path.resolve(process.env.ZINGER_DATA_DIR)
-  : DEFAULT_DATA_DIR;
+/** 'on' | 'off' | 'auto' — the operator's stated intent, from ZINGER_SQLITE. */
+function readBackendPreference() {
+  const raw = process.env.ZINGER_SQLITE;
+  if (raw == null || String(raw).trim() === '') return 'auto';
+  const v = String(raw).trim().toLowerCase();
+  if (['1', 'true', 'on', 'yes'].includes(v)) return 'on';
+  if (['0', 'false', 'off', 'no'].includes(v)) return 'off';
+  throw new Error(
+    `[sqlite] ZINGER_SQLITE="${raw}" is not a recognised value — use 1/true/on, 0/false/off, or leave it unset.`,
+  );
+}
+
+const BACKEND_PREFERENCE = readBackendPreference();
+
+if (BACKEND_PREFERENCE === 'on' && !MODULE_AVAILABLE) {
+  throw new Error(
+    '[sqlite] ZINGER_SQLITE=1 requires the node:sqlite built-in, which this runtime ' +
+      `does not provide (Node ${process.version}; needs 22+). Refusing to fall back to JSON ` +
+      'silently — unset ZINGER_SQLITE to allow the fallback, or run on Node 22+.',
+  );
+}
+
+export const SQLITE_AVAILABLE = MODULE_AVAILABLE && BACKEND_PREFERENCE !== 'off';
+
+const DATA_DIR = getDataDir();
 
 export const DB_PATH = process.env.ZINGER_DB_PATH
   ? path.resolve(process.env.ZINGER_DB_PATH)
@@ -193,4 +223,30 @@ export function docCount() {
   if (!db) return 0;
   const row = db.prepare('SELECT COUNT(*) AS n FROM docs').get();
   return row?.n ?? 0;
+}
+
+/**
+ * Which store is actually in force, and why (backlog item 15).
+ * Surfaced on /api/ops/status and logged once at boot so an operator never has
+ * to infer the persistence backend from the Node version.
+ */
+export function describeBackend() {
+  const active = SQLITE_AVAILABLE && getDb() != null ? 'sqlite' : 'json';
+  return {
+    backend: active,
+    preference: BACKEND_PREFERENCE,
+    moduleAvailable: MODULE_AVAILABLE,
+    nodeVersion: process.version,
+    dataDir: DATA_DIR,
+    dbPath: active === 'sqlite' ? DB_PATH : null,
+    docCount: active === 'sqlite' ? docCount() : null,
+    reason:
+      active === 'sqlite'
+        ? BACKEND_PREFERENCE === 'on'
+          ? 'ZINGER_SQLITE=1 (explicitly required)'
+          : 'node:sqlite available'
+        : BACKEND_PREFERENCE === 'off'
+          ? 'ZINGER_SQLITE=0 (explicitly disabled) — writing JSON files'
+          : `node:sqlite unavailable on Node ${process.version} — writing JSON files`,
+  };
 }

@@ -1,9 +1,9 @@
 // @ts-nocheck
 import TelegramBot from 'node-telegram-bot-api';
-import path from 'path';
 import { generateSummary, generateSummaryIfStale, ask } from '../ai/monitor.js';
 import { chat } from '../ai/llm.js';
 import { loadFileOrStore, saveFileOrStore } from '../polymarket/sqliteStore.js';
+import { dataPath } from '../polymarket/dataDir.js';
 
 let bot = null;
 let chatId = null;
@@ -12,7 +12,7 @@ let dashboardMsgId = null;
 let pinnedMsgId = null;
 
 const TRADE_EMOJI = { tp: '✅', sl: '❌', panic: '⚠️', rapid: '⚡', settle: '🏁', partial: '🔹' };
-const TG_CHAT_FILE = path.resolve(import.meta.dirname, '../../data/telegram_chat.json');
+const TG_CHAT_FILE = dataPath('telegram_chat.json');
 
 function loadPersistedChatId() {
   const data = loadFileOrStore(TG_CHAT_FILE, null);

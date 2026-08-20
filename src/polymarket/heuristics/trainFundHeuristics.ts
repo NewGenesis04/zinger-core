@@ -10,16 +10,13 @@
  *   node src/polymarket/heuristics/trainFundHeuristics.js
  *   node src/polymarket/heuristics/trainFundHeuristics.js --apply
  */
-import path from 'path';
-import { fileURLToPath } from 'url';
 import { loadFileOrStore, saveFileOrStore } from '../sqliteStore.js';
+import { dataPath } from '../dataDir.js';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const DATA = path.resolve(__dirname, '../../../data');
-const OUT = path.join(DATA, 'fund_heuristics.json');
+const OUT = dataPath('fund_heuristics.json');
 
 function loadJson(name, fallback) {
-  return loadFileOrStore(path.join(DATA, name), fallback);
+  return loadFileOrStore(dataPath(name), fallback);
 }
 
 function durationFromSlug(slug) {

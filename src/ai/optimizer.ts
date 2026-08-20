@@ -1,11 +1,10 @@
 // @ts-nocheck
-import path from 'path';
 import { chat, llmStatus } from './llm.js';
 import { loadFileOrStore, saveFileOrStore } from '../polymarket/sqliteStore.js';
+import { dataPath } from '../polymarket/dataDir.js';
 
-const DATA_DIR = path.resolve(import.meta.dirname, '../../data');
-const PERF_FILE = path.join(DATA_DIR, 'session_perf.json');
-const OPT_FILE = path.join(DATA_DIR, 'optimizer_state.json');
+const PERF_FILE = dataPath('session_perf.json');
+const OPT_FILE = dataPath('optimizer_state.json');
 
 const BOUNDS = {
   kellyFraction: [0.1, 0.35],

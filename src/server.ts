@@ -24,6 +24,7 @@ import { sellToken, addTransaction, loadTransactions, getTokenFees } from './lib
 import { sseLine } from './lib/sse.js';
 import { loadPackages, getArbPackageMetrics } from './polymarket/arbEngine.js';
 import { loadFileOrStore, saveFileOrStore } from './polymarket/sqliteStore.js';
+import { describeBackend } from './polymarket/persistence.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
@@ -696,11 +697,25 @@ export async function createApp() {
       const session = state.session || null;
       const cash = state.cashAudit || {};
       const closed = (state.trades || []).filter((t) => t.exitPrice != null || t.closed);
+      // Backlog item 15 — the active store, in plain language for the /ops audience.
+      const backend = describeBackend();
       res.json({
         ok: true,
         updatedAt: Date.now(),
         running: !!state.running,
         mode: state.mode,
+        store: {
+          backend: backend.backend,
+          label:
+            backend.backend === 'sqlite'
+              ? 'Database (zinger.db)'
+              : 'Plain files (no database)',
+          healthy: backend.backend === 'sqlite',
+          detail: backend.reason,
+          records: backend.docCount,
+          dataDir: backend.dataDir,
+          nodeVersion: backend.nodeVersion,
+        },
         session: session
           ? {
               id: session.id || null,

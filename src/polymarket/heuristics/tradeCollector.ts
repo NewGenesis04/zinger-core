@@ -4,11 +4,11 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { spawn } from 'child_process';
 import { loadFileOrStore, saveFileOrStore } from '../sqliteStore.js';
+import { dataPath } from '../dataDir.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const DATA_DIR = path.resolve(__dirname, '../../../data');
-const SAMPLES_FILE = path.join(DATA_DIR, 'trade_samples.json');
-const OPTIMIZED_FILE = path.join(DATA_DIR, 'heuristics_optimized.json');
+const SAMPLES_FILE = dataPath('trade_samples.json');
+const OPTIMIZED_FILE = dataPath('heuristics_optimized.json');
 const SCRIPTS_DIR = path.resolve(__dirname, '../../../scripts');
 
 let _samples = null;

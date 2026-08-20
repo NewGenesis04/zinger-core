@@ -12,12 +12,11 @@
  *   - live safety               → never relaxes the live edge-gate lock
  * Every action is logged with its rationale.
  */
-import path from 'path';
 import { chat, llmStatus } from './llm.js';
 import { loadFileOrStore, saveFileOrStore } from '../polymarket/sqliteStore.js';
+import { dataPath } from '../polymarket/dataDir.js';
 
-const DATA_DIR = path.resolve(import.meta.dirname, '../../data');
-const GOV_FILE = path.join(DATA_DIR, 'governor_state.json');
+const GOV_FILE = dataPath('governor_state.json');
 
 // Bounded knob overlays per regime. Values stay inside optimizer/primitive bounds.
 export const REGIME_PROFILES = {
