@@ -1238,6 +1238,83 @@ or — better under D4 — closing a leg must go through whatever owns package
 lifecycle so the sibling is unwound with it. Never leave a pair half-open.
 Slice 3.
 
+### 26. The entry-gate thresholds ignore every writer except the trained policy
+
+Found 2026-08-20 while mutation-testing the slice-1 engine invariants: a test
+that zeroed `cfg.minRemainingSec` had no effect on the gate.
+
+`resolveEntryWindows` (`fundHeuristics.ts:130-151`) resolves each threshold with
+a `??` chain that puts the heuristic first:
+
+```js
+minRemainingSec: Number(
+  heur.minRemainingSec               // ← always wins
+    ?? cfg[`minRemainingSec_${dur}`]
+    ?? (dur === '5m' ? cfg.minRemainingSec : null)
+    ?? prior.minRemainingSec,
+),
+```
+
+The fallbacks are unreachable, because `heuristicForTrade` merges the priors in
+*before* returning (`fundHeuristics.ts:97-100`):
+
+```js
+const merged = { ...defaults, ...(durationPolicy || {}) };
+```
+
+`defaults` is `DURATION_ENTRY_DEFAULTS[dur]`, which defines all three fields, so
+`merged.minRemainingSec` is never nullish and `?? cfg…` never evaluates. Same for
+`maxEntryRemainingSec` and `minConfidence`.
+
+Measured — identical output whether the operator sets nothing or sets all three,
+including the per-duration key form:
+
+```
+resolveEntryWindows('5m', {})                                    → min 25 · max 270 · conf 0.38
+resolveEntryWindows('5m', { minRemainingSec: 0,
+                            maxEntryRemainingSec: 298,
+                            minConfidence: 0.9 })                → min 25 · max 270 · conf 0.38
+resolveEntryWindows('5m', { minRemainingSec_5m: 0,
+                            maxEntryRemainingSec_5m: 298 })      → min 25 · max 270 · conf 0.38
+```
+
+**All three are live operator config.** They are in `STRATEGY_KEYS`
+(`modeConfig.ts:25,28`), so they persist, appear per-profile and are editable
+from the dashboard, which reads `minConfidence` back for display
+(`server.ts:740`). Four independent writers act on fields the gate cannot see:
+
+| Writer | Where | Cadence |
+|---|---|---|
+| operator | dashboard → `saveConfig` | manual |
+| mode defaults | `modeConfig.ts:76,77,83` paper · `:142` live | on migration |
+| governor | `governor.ts:30,36,49,55,64` | every ~120s |
+| optimizer | `ai/primitives.ts:131,143` | every ~180s |
+
+`buildDecision` reads only `entryWin.minConfidence`
+(`engines/directional.ts`), so the confidence floor actually in force is
+whatever `trainFundHeuristics.ts:70` derived from win rate — self-tuning, with
+every human and automated input inert.
+
+Three consequences:
+
+- **It sharpens item 19.** That item records live `minConfidence` as 0.38 where
+  the live default is 0.50, i.e. "looser". In fact *neither* applies — the live
+  safety value is not merely overwritten, it is unreachable. A live cap that
+  cannot be enforced is worse than one that is set wrong, because the audit
+  above would report it as correct.
+- **It is the sharpest instance of objective 4 / item 3a.** The governor
+  rewriting `minConfidence` every two minutes is not a precedence conflict; it
+  is churn on a dead field, with no log line and no way to notice from outside.
+- **It will corrupt D8.** A skip event reporting `confidence 41% < 45%` would
+  name a threshold no writer chose and no operator can change.
+
+Fix: this is exactly the D3 precedence model — operator > guardrail >
+automation — with the *trained policy as the automation tier*, not the top one.
+Reverse the `??` chain so an explicitly set value wins and the heuristic is the
+fallback, and have the resolver report which tier supplied each threshold. Note
+the reversal is a behaviour change on a live gate, so it belongs with the config
+resolver in slice 2 rather than as a one-line flip now.
+
 ---
 
 ## Handoff — state as of 2026-08-20
