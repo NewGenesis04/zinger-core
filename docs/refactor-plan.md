@@ -504,7 +504,7 @@ not currently trading.
 |---|---|
 | extract `buildDecision` + `resolveOrderSize` | ✅ `engines/directional.ts`, `bot.ts` 4105 → 3733 |
 | tag trades by engine · item 6 | ✅ `engine` field + `tradeEngine()` + `closedPnls` filter |
-| per-engine slot budget (D5) | ⬜ not started |
+| per-engine slot budget (D5) | ✅ four cross-wirings fixed; closes item 25 |
 | decision events (D8) | ⬜ **deliberately not started — see below** |
 
 Committed as two commits on purpose: the extraction changes no behaviour, the
@@ -1275,7 +1275,18 @@ lifecycle (D4). A reset must clear them with everything else, or explicitly
 archive them. Until then, treat any `arbMetrics` figure spanning a reset as
 unreliable. Slice 3, with the D4 manager.
 
-### 25. The overdraft trim loop can close one leg of a hedged pair
+### 25. The overdraft trim loop can close one leg of a hedged pair ✅ FIXED
+
+*Fixed in slice 1, 2026-08-20*, as a consequence of the D5 slot split rather
+than as a standalone patch. The trim loop now counts and selects directional
+positions only, because `maxOpenPositions` is the directional dial — arb
+capacity is `maxArbPackages`, and arb legs are hold-to-settle with no stop, so
+trimming them served nothing. The D4-routed version (closing a leg goes through
+whoever owns package lifecycle, so the sibling unwinds with it) remains slice 3.
+
+---
+
+*Original write-up:*
 
 Found 2026-08-20 while finishing item 23.
 
@@ -1385,6 +1396,71 @@ fallback, and have the resolver report which tier supplied each threshold. Note
 the reversal is a behaviour change on a live gate, so it belongs with the config
 resolver in slice 2 rather than as a one-line flip now.
 
+### 27. A refused arb leg is recorded as filled, so the rollback never runs
+
+Found 2026-08-20 while decoupling the slot budgets (D5). **This is the most
+consequential item on the list** — it manufactures the artifacts items 8, 9 and
+24 describe, and it is a live-money blocker under D11.
+
+`executeArbLeg` ends with a boolean coercion (`arbEngine.ts:211`):
+
+```js
+return !!(await executeTrade(pending));
+```
+
+`executeTrade` is `executePendingTrade` (`bot.ts:2211`), and **every return path
+of that function is an object**:
+
+```js
+{ ok: false, error: 'max open positions' }      // capacity refusal
+{ ok: false, error: 'insufficient paper cash' } // cash refusal
+{ ok: false, error: 'min order exceeds spendable' }
+{ ok: false, error: 'min order exceeds risk cap' }
+{ ok: false, error: err.message }              // live order failure
+{ ok: true,  position: pos }                   // an actual fill
+```
+
+Objects are truthy, so `!!` is `true` in all six cases. The boolean the engine
+branches on carries **no information**. Consequently the "Emergency Rollback
+Handler" (`arbEngine.ts:153-168`) is unreachable for every refusal — it fires
+only when `executeTrade` *throws*.
+
+Verified against the real engine, all four paths:
+
+| `executeTrade` returns | package status | `up.filled` | `down.filled` | positions |
+|---|---|---|---|---|
+| both fill | `LOCKED` | true | true | 2 ✅ |
+| **both refused** | `LOCKED` | true | true | **0** |
+| **up fills, down refused** | `LOCKED` | true | true | **1 — naked** |
+| both throw | `ABORTED` | false | false | 0 ✅ |
+
+Two distinct corruptions:
+
+- **Both refused → a wholly phantom package.** `LOCKED`, both legs "filled",
+  nothing bought. It reports `lockedProfitUsd` forever, and because it has no
+  leg trades `getArbPackageMetrics` takes the gross fallback
+  (`arbEngine.ts:272-278`). **This is a second, independent mechanism for the
+  orphaned packages of item 24**, which attributed all 24 of them to
+  `resetPaperData`. It produces an identical artifact with no reset involved.
+- **One leg refused → a naked leg, believed hedged.** No `ABORT`, no
+  `unwindLeg`. In paper it settles at the fabricated $0.50 of item 8. **In live
+  it is real unhedged directional exposure held in the belief that it is
+  hedged** — which is why this gates D11 dimension 1, not merely dimension 3.
+
+**What made it fire.** The dominant refusal was `'max open positions'`: arb legs
+were charged against `maxOpenPositions` (see item 25 and the D5 fix), so on the
+VPS every package past the second was refused and locked as a phantom.
+Decoupling the budgets removes that trigger, so the *frequency* drops sharply —
+but the defect is untouched. Cash refusals and live order failures reach it by
+the same path.
+
+Fix: `executeArbLeg` must return `res?.ok === true`, and `executePendingTrade`
+should not signal failure through a truthy object at all — a refusal is not a
+result. Guard it with the three pending invariants already written
+(`invariants.pending.test.ts`). Slice 3 with the rest of arb correctness, unless
+promoted: unlike items 7–11 this one is silently writing false history on every
+refusal, so it may deserve to jump the queue.
+
 ---
 
 ## Handoff — state as of 2026-08-20
@@ -1393,15 +1469,15 @@ Written so a fresh session can continue without re-deriving any of the above.
 
 ### Where things stand
 
-**Slice 0 is complete and committed. Slice 1 is two-thirds done** — branch
-`refactor/slice-0-safety-net`, 8 commits off `main`. `npm run ci` is green:
-75 unit + 4 perf, 1 todo.
+**Slices 0 and 1 are complete and committed** — branch
+`refactor/slice-0-safety-net`, 10 commits off `main`. `npm run ci` is green:
+82 unit + 4 perf, 1 todo.
 
 | Slice-1 step | State |
 |---|---|
 | extract the engine (`2339b3a`) | ✅ verified equivalent over 1.74M input combinations |
 | item 6 — engine tag + gate filter (`8104e49`) | ✅ 4 invariants, mutation-tested |
-| per-engine slot budget (D5) | ⬜ next |
+| per-engine slot budget (D5) | ✅ `b2dc6fc` — closes item 25, uncovered item 27 |
 | decision events (D8) | ⬜ deferred to the D8 emitter, on purpose |
 
 | Slice-0 item | State |
@@ -1426,6 +1502,10 @@ Written so a fresh session can continue without re-deriving any of the above.
   `session_perf` is already intact (200 = 200), so this is cleanup of 13 stale
   JSON files, not recovery.
 - **Items 24 and 25** are filed, not fixed. Both are slice 3.
+- **Item 27** is filed, not fixed, and is the sharpest open defect: a refused
+  arb leg is recorded as filled, so the rollback never runs. It writes false
+  history on every refusal and blocks going live. Consider promoting it ahead of
+  the rest of slice 3.
 - **Item 26** is filed, not fixed — the entry-gate thresholds ignore operator,
   governor and optimizer alike. Slice 2, with the D3 config resolver, because
   reversing the precedence changes a live gate.
@@ -1470,16 +1550,37 @@ Written so a fresh session can continue without re-deriving any of the above.
    import `bot.ts`; a test asserts it. State it needs arrives through a view
    built by whoever owns that state.
 
-### Suggested next step
+### Suggested next step — an open question, not a task
 
-Remaining in slice 1: **per-engine slot budgets (D5).** Arb and directional
-currently share one `maxOpenPositions` count, so raising it for arb headroom
-silently authorises that much more directional exposure. Measured worst case is
-`slots × position size × SL%`. Note `maxOpenPositions` is also one of item 19's
-inflated caps and an aggravating factor in item 25, so this touches live risk —
-unlike the two commits already landed.
+**Slice 1 is done.** The next scheduled work is slice 2 (shared layer). But
+slice 1 turned up item 27, and it is worth deciding explicitly whether to take
+it out of order rather than defaulting to the plan.
 
-Then slice 2. Two things are queued for it specifically:
+The case for promoting it: it is not a latent defect. Every refused arb leg —
+capacity, cash, or a live order failure — is recorded as a fill *right now*,
+writing packages that never existed into the record the whole plan depends on
+for evidence (D6: "the bot must keep paper trading… it is the only regression
+detector"). It also blocks D11 dimension 1 outright, since in live mode the
+one-leg case is unhedged money believed hedged. And it is a small fix: return
+`res?.ok === true`, with three pending invariants already in place to catch it.
+
+The case for leaving it in slice 3: D6 sequences arb last deliberately, so the
+only working strategy and only data generator stays untouched longest. Its
+frequency has already dropped sharply now that the D5 split removed the
+`'max open positions'` refusal that was firing it.
+
+**Two decisions the operator should make, independent of the above:**
+
+1. **`maxArbPackages: 40` on the VPS is now load-bearing.** It was raised as an
+   item 10 workaround while `maxOpenPositions: 4` silently capped arb at two
+   packages. With the budgets decoupled, 40 means 40 — up to 80 open legs,
+   bounded thereafter only by paper cash. That is probably not the intended
+   risk limit; pick a deliberate number.
+2. **Item 10 is still unfixed**, so packages only settle while a dashboard is
+   open. Higher arb concurrency plus a capacity that does not drain is the
+   combination that produced the original jam.
+
+Then slice 2. Three things are queued for it specifically:
 
 - **Item 23 left the duplication in place.** `paperBooksCash()` is the single
   formula, but two functions still decide when to write cash. D5 says one pool,
