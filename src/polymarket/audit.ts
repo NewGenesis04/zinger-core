@@ -1,8 +1,8 @@
 // @ts-nocheck
-import path from 'path';
 import { loadFileOrStore, saveFileOrStore } from './sqliteStore.js';
+import { dataPath } from './dataDir.js';
 
-const BASELINE_FILE = path.resolve(import.meta.dirname, '../../data/poly_baseline.json');
+const BASELINE_FILE = dataPath('poly_baseline.json');
 
 let _baselineCache = undefined;
 
@@ -34,6 +34,32 @@ export function tradeRealizedPnl(trade) {
     : (trade.size > 0 ? trade.size / trade.entryPrice : 0);
   if (!shares) return trade.pnl ?? 0;
   return Math.round((trade.exitPrice - trade.entryPrice) * shares * 100) / 100;
+}
+
+/**
+ * Total fees recorded against a position/trade.
+ *
+ * `feesPaid` is the canonical running total (entry fee, plus any exit fee once
+ * the position closes). The component fields are a fallback for records written
+ * before it existed.
+ */
+export function tradeFeesPaid(trade) {
+  const total = Number(trade?.feesPaid);
+  if (Number.isFinite(total)) return total;
+  return Number(trade?.entryFee || 0) + Number(trade?.exitFee || 0);
+}
+
+/**
+ * Realized P/L **net of fees** — the only convention paper cash reconciles
+ * against (backlog item 23).
+ *
+ * Derived from primitives (entry, exit, shares, fees) rather than from the
+ * stored `pnl` field on purpose: records written before the fix carry a *gross*
+ * `pnl`, and nothing distinguishes them from net ones. Recomputing means the
+ * ledger is correct for historical trades too, with no migration.
+ */
+export function tradeNetPnl(trade) {
+  return Math.round((tradeRealizedPnl(trade) - tradeFeesPaid(trade)) * 100) / 100;
 }
 
 export function normalizeTrade(trade) {

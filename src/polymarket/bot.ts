@@ -51,6 +51,7 @@ import {
   saveBaseline,
   normalizeTrade,
   tradeRealizedPnl,
+  tradeNetPnl,
   tradeCostBasis,
 } from './audit.js';
 import { evaluateEdgeGate, passesEdgeFilter } from './edge.js';
@@ -229,13 +230,29 @@ function loadPositions() {
   return load(FILES.POSITIONS, []);
 }
 
+/**
+ * Retention for the in-memory action / execution logs (slice 0).
+ *
+ * Was 300 and 500 — small enough that `'scan'`-type history was evicted within
+ * hours, so multi-day "why didn't the bot trade?" investigations had nothing to
+ * read (backlog item 13). Env-overridable so the VPS can be tuned without a
+ * redeploy.
+ *
+ * Note the cost model: `saveState()` re-serialises the whole array on every
+ * call, so this cap is bounded by serialisation time (~11ms per 1,000 entries
+ * at ~350 B/entry), not by memory. D8's append-only event store is what removes
+ * that ceiling — see backlog item 20.
+ */
+const ACTION_LOG_CAP = Number(process.env.ZINGER_ACTION_LOG_CAP || 5000);
+const EXECUTION_LOG_CAP = Number(process.env.ZINGER_EXECUTION_LOG_CAP || 5000);
+
 function loadActions() {
   return load(FILES.ACTIONS, []);
 }
 
 function saveState() {
   persist(FILES.POSITIONS, botState.positions);
-  persist(FILES.ACTIONS, botState.actions.slice(0, 300));
+  persist(FILES.ACTIONS, botState.actions.slice(0, ACTION_LOG_CAP));
   notifyStateChange();
 }
 
@@ -268,15 +285,36 @@ function saveTrade(trade) {
   refreshKellyHistory();
 }
 
-/** Rebuild paper spendable cash from initial + closed PnL − open cost (idempotent). */
+/**
+ * Rebuild paper spendable cash from initial + closed PnL − open cost (idempotent).
+ *
+ * The identity this must satisfy (backlog item 23):
+ *
+ *   cash = initial
+ *        + Σ net realized P/L over closed trades      (gross − entry fee − exit fee)
+ *        − Σ (cost basis + entry fee) over open positions
+ *
+ * Both fee terms used to be missing, so this function silently refunded every
+ * fee the incremental ledger (`adjustPaperCash`) had correctly charged — and
+ * because it recomputes from scratch and overwrites, it always won. Measured on
+ * production before the fix: it would have moved cash $100.70 → $102.66, a
+ * phantom gain exactly equal to fees paid.
+ *
+ * Realized P/L is recomputed from primitives via `tradeNetPnl` rather than read
+ * from `trade.pnl`, because records written before this fix carry a *gross*
+ * `pnl` and nothing marks them as such. Recomputing makes the ledger correct
+ * for existing history with no migration.
+ */
 function reconcilePaperCash(reason = 'reconcile') {
   if (botState.config.mode !== 'paper') return null;
   const initial = Number(botState.config.paperInitialDeposit ?? 100);
   const paperTrades = dedupeTrades(botState.trades).filter((t) => t.mode === 'paper');
-  const realized = paperTrades.reduce((s, t) => s + Number(t.pnl || 0), 0);
+  const realized = paperTrades.reduce((s, t) => s + tradeNetPnl(t), 0);
   const openCost = botState.positions
     .filter((p) => !p.closed && p.mode === 'paper')
-    .reduce((s, p) => s + Number(p.costBasis || p.size || 0), 0);
+    // The entry fee left the account with the premium, so it is part of what an
+    // open position has tied up.
+    .reduce((s, p) => s + Number(p.costBasis || p.size || 0) + Number(p.entryFee || 0), 0);
   const next = Math.round((initial + realized - openCost) * 100) / 100;
   const prev = Number(botState.config.paperBankroll ?? initial);
   if (Math.abs(prev - next) < 0.01) return prev;
@@ -921,12 +959,12 @@ const AGILE_NOTIFY_TYPES = new Set(['buy', 'sl', 'tp', 'error', 'announce', 'sys
 function log(msg, type = 'info', meta = null) {
   const entry = { id: `a-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 5)}`, msg, type, time: Date.now(), meta };
   botState.actions.unshift(entry);
-  if (botState.actions.length > 300) botState.actions.length = 300;
+  if (botState.actions.length > ACTION_LOG_CAP) botState.actions.length = ACTION_LOG_CAP;
   botState.executionLog.unshift({
     ...entry,
     level: type,
   });
-  if (botState.executionLog.length > 500) botState.executionLog.length = 500;
+  if (botState.executionLog.length > EXECUTION_LOG_CAP) botState.executionLog.length = EXECUTION_LOG_CAP;
 
   if (AGILE_NOTIFY_TYPES.has(type) || (meta && meta.arb)) {
     pushNotification({
@@ -994,7 +1032,9 @@ function logScan(msg, meta) {
   botState.lastScanLog = entry;
   botState.executionLog = botState.executionLog.filter((e) => e.type !== 'scan' && e.level !== 'scan' && e.id !== 'latest-scan');
   botState.executionLog.unshift(entry);
-  if (botState.executionLog.length > 500) botState.executionLog.length = 500;
+  // Same cap as log(); this runs every cycle, so a smaller literal here would
+  // silently truncate the log back down and undo the retention raise.
+  if (botState.executionLog.length > EXECUTION_LOG_CAP) botState.executionLog.length = EXECUTION_LOG_CAP;
 }
 
 function summarizeSignal(signal) {
@@ -4006,7 +4046,23 @@ async function executeSell(pos, reason = 'manual') {
   pos.closed = true;
   pos.exitReason = reason;
   if (pos.mode === 'paper') {
-    const proceeds = Math.round(positionShares(pos) * price * 100) / 100;
+    // Fees on the way out (backlog item 23). This path used to credit the raw
+    // premium and never set an exit fee, so its trades booked P/L gross while
+    // the in-scan TP/SL path booked net — two conventions in one ledger.
+    // `closeProceedsWithFee` returns fee 0 for settle/redeem, which is correct:
+    // redeeming a resolved token is not a taker CLOB sell.
+    const feeOn = botState.config.simulateClobFees !== false;
+    const shares = positionShares(pos);
+    const pack = closeProceedsWithFee(shares, price, botState.config.feeCategory || 'crypto', reason);
+    const exitFee = feeOn ? pack.fee : 0;
+    const proceeds = Math.round((pack.premium - exitFee) * 100) / 100;
+
+    pos.exitFee = exitFee;
+    pos.feesPaid = Math.round((Number(pos.entryFee || 0) + exitFee) * 1e5) / 1e5;
+    pos.pnl = Math.round(
+      ((price - pos.entryPrice) * shares - Number(pos.entryFee || 0) - exitFee) * 100,
+    ) / 100;
+
     adjustPaperCash(proceeds, `${reason.toUpperCase()} ${pos.symbol} ${pos.outcome?.toUpperCase()}`);
   }
   saveTrade({ ...pos, timestamp: Date.now(), orderId: pos.orderId });
