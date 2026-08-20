@@ -62,12 +62,32 @@ export function tradeNetPnl(trade) {
   return Math.round((tradeRealizedPnl(trade) - tradeFeesPaid(trade)) * 100) / 100;
 }
 
+/**
+ * Which engine produced this trade — the D5 tag that lets per-engine P/L be
+ * read off without segregating capital (backlog item 6).
+ *
+ * Records written before the tag existed are classified from the fields that
+ * were always there. That is exact, not a guess: `arbEngine.ts:189` is the only
+ * writer of `isArbLeg` / `packageId`, and the directional plan builder never
+ * sets `arb` (`detectClobArb` only annotates `market.arb` for display — the
+ * package path executes through `executeArbLeg`). So an untagged trade with no
+ * arb marker came from the directional path.
+ *
+ * Kept here with the other trade primitives on purpose: one owner for "what a
+ * trade is", derived from the record rather than stored twice.
+ */
+export function tradeEngine(trade) {
+  const tagged = trade?.engine;
+  if (tagged === 'arb' || tagged === 'directional') return tagged;
+  return (trade?.isArbLeg || trade?.packageId || trade?.arb) ? 'arb' : 'directional';
+}
+
 export function normalizeTrade(trade) {
   const cost = tradeCostBasis(trade);
   const pnl = tradeRealizedPnl(trade);
   // Live is only verified when CLOB returned a real orderId (phantom fills had none).
   const verified = trade.mode === 'paper' ? false : !!trade.orderId;
-  return { ...trade, costBasis: cost, pnl, verified };
+  return { ...trade, costBasis: cost, pnl, verified, engine: tradeEngine(trade) };
 }
 
 export function dedupeTrades(trades) {

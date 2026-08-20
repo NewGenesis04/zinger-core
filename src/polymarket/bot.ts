@@ -53,6 +53,7 @@ import {
   tradeRealizedPnl,
   tradeNetPnl,
   tradeCostBasis,
+  tradeEngine,
 } from './audit.js';
 import { evaluateEdgeGate, passesEdgeFilter } from './edge.js';
 import { buildDecision, resolveOrderSize, sideBalanceBonus } from './engines/directional.js';
@@ -780,6 +781,12 @@ async function executePendingTrade(pending) {
     arb: !!plan.arb,
     packageId: plan.packageId || null,
     isArbLeg: !!plan.isArbLeg || !!plan.arb,
+    // D5: per-engine P/L comes from tagging trades, not from segregating
+    // capital. `isArbLeg` already says "not directional"; this says which
+    // engine positively, so a third strategy does not silently inherit the
+    // directional bucket. Every saveTrade() call spreads the position, so the
+    // tag reaches the trade record.
+    engine: tradeEngine(plan),
     effectiveSlPct: plan.slPct,
     adaptiveSlArmed: false,
     volFactor: plan.volFactor,

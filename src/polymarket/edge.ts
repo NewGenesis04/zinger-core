@@ -2,12 +2,28 @@
 /**
  * Expectancy / edge gate for directional trading vs arb-only.
  * Live mode stays locked until recent paper expectancy is positive.
+ *
+ * **This gate scores directional trades only** (backlog item 6). Arb legs are
+ * structurally paired — the engine buys both sides, and paper settlement books
+ * one leg near +$1/share and the other near −$1/share — so which leg "wins" is
+ * fixed at purchase time, before the market resolves. Feeding them to an
+ * expectancy calculation measures nothing about whether a *signal* predicts
+ * direction; it measures that the two halves of a hedge cancel.
+ *
+ * Measured on the local store 2026-08-20, before the filter: 6 of 7 paper
+ * trades were arb legs, giving 3 artificial wins, 3 artificial losses and an
+ * expectancy of −$0.010 — arithmetic noise around zero, from a sample that had
+ * tested a directional signal exactly once. Since `requireEdgeForLive` gates
+ * real money on this number, a run of lucky packages could have unlocked live
+ * trading on evidence that never tested the strategy.
  */
+import { tradeEngine } from './audit.js';
 
-function closedPnls(trades, { mode = 'paper', lookback = 100 } = {}) {
+function closedPnls(trades, { mode = 'paper', lookback = 100, engine = 'directional' } = {}) {
   const list = (trades || [])
     .filter((t) => t && (t.closed !== false) && (t.exitReason || t.exitPrice != null || t.pnl != null))
     .filter((t) => !mode || t.mode === mode)
+    .filter((t) => !engine || tradeEngine(t) === engine)
     .slice()
     .sort((a, b) => (b.timestamp || b.entryTime || 0) - (a.timestamp || a.entryTime || 0))
     .slice(0, Math.max(1, lookback));
@@ -21,7 +37,10 @@ function closedPnls(trades, { mode = 'paper', lookback = 100 } = {}) {
 export function computeRecentExpectancy(trades, opts = {}) {
   const lookback = Number(opts.lookback ?? 100);
   const mode = opts.mode ?? 'paper';
-  const rows = closedPnls(trades, { mode, lookback });
+  // `engine: null` scores every trade — for reporting total P/L, never for the
+  // gate. Arb's edge is arithmetic and does not need proving by sample (D11).
+  const engine = opts.engine === undefined ? 'directional' : opts.engine;
+  const rows = closedPnls(trades, { mode, lookback, engine });
   const n = rows.length;
   if (n === 0) {
     return {
@@ -37,6 +56,7 @@ export function computeRecentExpectancy(trades, opts = {}) {
       totalPnl: 0,
       lookback,
       mode,
+      engine,
     };
   }
 
@@ -64,6 +84,7 @@ export function computeRecentExpectancy(trades, opts = {}) {
     totalPnl: Math.round(totalPnl * 100) / 100,
     lookback,
     mode,
+    engine,
   };
 }
 
@@ -88,7 +109,9 @@ export function evaluateEdgeGate(trades, cfg = {}) {
 
   let reason = 'edge ok — directional + live unlocked';
   if (arbOnlyForced) reason = 'forceArbOnly';
-  else if (!sampleOk) reason = `need ${minTrades} paper closes (have ${stats.n}) — arb-only`;
+  // Say "directional" out loud: the count dropped when item 6 stopped arb legs
+  // padding the sample, and an operator watching the number needs to know why.
+  else if (!sampleOk) reason = `need ${minTrades} directional paper closes (have ${stats.n}) — arb-only`;
   else if (!(stats.expectancy > minExpectancy)) reason = `expectancy ${stats.expectancy} ≤ ${minExpectancy} — arb-only`;
   else if (!(stats.kelly > 0)) reason = `kelly ${stats.kelly} ≤ 0 — arb-only`;
   else if (!liveAllowed) reason = 'live locked';

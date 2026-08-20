@@ -6,7 +6,8 @@ import {
 } from '../../src/polymarket/arbEngine.js';
 import { saveAllPackages, loadPackages, getActivePackages, savePackage } from '../../src/polymarket/arbPersistence.js';
 import { takerFeeUsdc, closeProceedsWithFee, FEE_RATES } from '../../src/polymarket/fees.js';
-import { tradeNetPnl, tradeFeesPaid, tradeRealizedPnl } from '../../src/polymarket/audit.js';
+import { tradeNetPnl, tradeFeesPaid, tradeRealizedPnl, tradeEngine } from '../../src/polymarket/audit.js';
+import { computeRecentExpectancy, evaluateEdgeGate } from '../../src/polymarket/edge.js';
 import { normalizeConfigStore, defaultLiveStrategy } from '../../src/polymarket/modeConfig.js';
 
 /**
@@ -372,5 +373,91 @@ describe('INVARIANT: operator settings are never silently overwritten', () => {
     const defaults = defaultLiveStrategy();
     expect(migrated.profiles.live.maxPositionCap).toBe(defaults.maxPositionCap);
     expect(migrated.profiles.live.arbMaxUsd).toBe(defaults.arbMaxUsd);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+describe('INVARIANT: the directional edge gate scores directional trades only', () => {
+  // Backlog item 6. The gate decides whether directional trading is allowed and
+  // whether real money is allowed (`requireEdgeForLive`). Its input must be
+  // trades that tested a directional signal.
+  //
+  // An arb package buys both sides of one market, so paper settlement books one
+  // leg near +$1/share and the other near −$1/share. Which leg "wins" is fixed
+  // at purchase time by which side was cheaper — before the market resolves. A
+  // win rate computed over them measures that a hedge cancels, not that a
+  // signal predicts.
+
+  const arbPair = (pkgId, upEntry, downEntry, shares = 10) => [
+    {
+      id: `${pkgId}-up`, mode: 'paper', closed: true, exitReason: 'settle',
+      packageId: pkgId, isArbLeg: true, outcome: 'up', shares,
+      entryPrice: upEntry, exitPrice: 0.5, feesPaid: 0,
+      pnl: Math.round((0.5 - upEntry) * shares * 100) / 100, timestamp: Date.now(),
+    },
+    {
+      id: `${pkgId}-down`, mode: 'paper', closed: true, exitReason: 'settle',
+      packageId: pkgId, isArbLeg: true, outcome: 'down', shares,
+      entryPrice: downEntry, exitPrice: 0.5, feesPaid: 0,
+      pnl: Math.round((0.5 - downEntry) * shares * 100) / 100, timestamp: Date.now(),
+    },
+  ];
+
+  const directional = (id, entry, exit, shares = 10) => ({
+    id, mode: 'paper', closed: true, exitReason: exit > entry ? 'tp' : 'sl',
+    outcome: 'up', shares, entryPrice: entry, exitPrice: exit, feesPaid: 0,
+    pnl: Math.round((exit - entry) * shares * 100) / 100, timestamp: Date.now(),
+  });
+
+  it('classifies every trade to exactly one engine', () => {
+    const [up, down] = arbPair('pkg-1', 0.25, 0.72);
+    expect(tradeEngine(up)).toBe('arb');
+    expect(tradeEngine(down)).toBe('arb');
+    expect(tradeEngine(directional('d1', 0.6, 0.7))).toBe('directional');
+    // An explicit tag wins over the legacy markers, so a future engine cannot
+    // be misfiled by inheriting the directional default.
+    expect(tradeEngine({ engine: 'arb' })).toBe('arb');
+    expect(tradeEngine({ engine: 'directional', isArbLeg: true })).toBe('directional');
+  });
+
+  it('ignores arb legs no matter how many there are', () => {
+    const legs = [
+      ...arbPair('pkg-1', 0.25, 0.72),
+      ...arbPair('pkg-2', 0.29, 0.65),
+      ...arbPair('pkg-3', 0.39, 0.50),
+    ];
+    const only = computeRecentExpectancy(legs);
+    expect(only.n).toBe(0);
+
+    // Adding them to a directional sample must not move a single statistic.
+    const dirs = [directional('d1', 0.6, 0.7), directional('d2', 0.5, 0.42), directional('d3', 0.3, 0.55)];
+    const clean = computeRecentExpectancy(dirs);
+    const polluted = computeRecentExpectancy([...dirs, ...legs]);
+    expect(polluted).toEqual(clean);
+  });
+
+  it('cannot be pushed past the sample threshold by arb legs alone', () => {
+    // The live-money failure mode: 20 packages is 40 rows, which would clear
+    // `edgeMinTrades: 40` on evidence that never tested a directional signal.
+    const legs = [];
+    for (let i = 0; i < 20; i += 1) legs.push(...arbPair(`pkg-${i}`, 0.25, 0.72));
+    expect(legs.length).toBe(40);
+
+    const gate = evaluateEdgeGate(legs, { edgeMinTrades: 40 });
+    expect(gate.n).toBe(0);
+    expect(gate.edgeOk).toBe(false);
+    expect(gate.arbOnly).toBe(true);
+    expect(gate.liveAllowed).toBe(false);
+  });
+
+  it('still scores a genuine directional sample', () => {
+    // The filter must not be so broad that the gate can never open — that would
+    // be a silent, permanent lock rather than a fix.
+    const dirs = [];
+    for (let i = 0; i < 40; i += 1) dirs.push(directional(`d${i}`, 0.4, i % 4 === 0 ? 0.3 : 0.55));
+    const gate = evaluateEdgeGate(dirs, { edgeMinTrades: 40 });
+    expect(gate.n).toBe(40);
+    expect(gate.expectancy).toBeGreaterThan(0);
+    expect(gate.edgeOk).toBe(true);
   });
 });
