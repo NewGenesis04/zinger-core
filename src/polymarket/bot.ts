@@ -305,8 +305,7 @@ function saveTrade(trade) {
  * `pnl` and nothing marks them as such. Recomputing makes the ledger correct
  * for existing history with no migration.
  */
-function reconcilePaperCash(reason = 'reconcile') {
-  if (botState.config.mode !== 'paper') return null;
+function paperBooksCash() {
   const initial = Number(botState.config.paperInitialDeposit ?? 100);
   const paperTrades = dedupeTrades(botState.trades).filter((t) => t.mode === 'paper');
   const realized = paperTrades.reduce((s, t) => s + tradeNetPnl(t), 0);
@@ -315,7 +314,12 @@ function reconcilePaperCash(reason = 'reconcile') {
     // The entry fee left the account with the premium, so it is part of what an
     // open position has tied up.
     .reduce((s, p) => s + Number(p.costBasis || p.size || 0) + Number(p.entryFee || 0), 0);
-  const next = Math.round((initial + realized - openCost) * 100) / 100;
+  return Math.round((initial + realized - openCost) * 100) / 100;
+}
+
+function reconcilePaperCash(reason = 'reconcile') {
+  if (botState.config.mode !== 'paper') return null;
+  const next = paperBooksCash();
   const prev = Number(botState.config.paperBankroll ?? initial);
   if (Math.abs(prev - next) < 0.01) return prev;
   botState.config.paperBankroll = next;
@@ -409,18 +413,11 @@ function detectClobArb(depth, prices, cfg, market) {
  */
 function repairPaperOverdraft(reason = 'overdraft repair') {
   if (botState.config.mode !== 'paper') return null;
-  const booksCash = () => {
-    const initial = Number(botState.config.paperInitialDeposit ?? 100);
-    const paperTrades = dedupeTrades(botState.trades).filter((t) => t.mode === 'paper');
-    const realized = paperTrades.reduce((s, t) => s + Number(t.pnl || 0), 0);
-    const openCost = botState.positions
-      .filter((p) => !p.closed && p.mode === 'paper')
-      .reduce((s, p) => s + Number(p.costBasis || p.size || 0), 0);
-    return Math.round((initial + realized - openCost) * 100) / 100;
-  };
-
+  // Was a third copy of the cash formula, fee-blind and reading `t.pnl`
+  // directly (backlog item 23). It read cash as higher than reality, so the
+  // repair loop could exit while the account was genuinely overdrawn.
   let guard = 0;
-  while (booksCash() < -0.01 && guard < 120) {
+  while (paperBooksCash() < -0.01 && guard < 120) {
     guard += 1;
     const open = botState.positions
       .filter((p) => !p.closed && p.mode === 'paper' && !p.packageId && !p.isArbLeg)

@@ -1204,3 +1204,110 @@ Fix: packages are position state and belong to whatever owns the position
 lifecycle (D4). A reset must clear them with everything else, or explicitly
 archive them. Until then, treat any `arbMetrics` figure spanning a reset as
 unreliable. Slice 3, with the D4 manager.
+
+### 25. The overdraft trim loop can close one leg of a hedged pair
+
+Found 2026-08-20 while finishing item 23.
+
+`repairPaperOverdraft` has two loops. The first — the actual overdraft repair —
+deliberately protects hedges:
+
+```js
+.filter((p) => !p.closed && p.mode === 'paper' && !p.packageId && !p.isArbLeg)
+```
+
+The second, which trims down to `maxOpenPositions`, does not:
+
+```js
+.filter((p) => !p.closed && p.mode === 'paper')
+```
+
+So trimming can close **one leg of a hedged pair**, manufacturing exactly the
+naked leg that item 8 then settles at a fabricated $0.50 — and the surviving
+package keeps a `maxArbPackages` slot per item 9. The author excluded arb legs
+in the first loop and not the second, which reads as an oversight rather than
+intent.
+
+Two aggravating factors: it runs at boot (both call sites are `feeds start` and
+`bot start`), which is precisely when a restart-interrupted package is already
+in a bad state; and `maxOpenPositions` is one of the caps item 19 shows inflated
+(4 vs a live default of 1), so the trim triggers more readily than intended.
+
+Fix: the trim loop must carry the same `!p.packageId && !p.isArbLeg` exclusion,
+or — better under D4 — closing a leg must go through whatever owns package
+lifecycle so the sibling is unwound with it. Never leave a pair half-open.
+Slice 3.
+
+---
+
+## Handoff — state as of 2026-08-20
+
+Written so a fresh session can continue without re-deriving any of the above.
+
+### Where things stand
+
+**Slice 0 is complete and committed** on branch `refactor/slice-0-safety-net`
+(5 commits off `main`). `npm run ci` is green: 56 unit + 4 perf, 1 todo.
+
+| Slice-0 item | State |
+|---|---|
+| 16 — one `getDataDir()` owner | ✅ `polymarket/dataDir.ts`, 7 modules rerouted |
+| 12 — test isolation | ✅ per-worker dirs + tripwire |
+| 15 — explicit backend | ✅ `ZINGER_SQLITE`, surfaced at boot and `/api/ops/status` |
+| log caps | ✅ 300/500 → 5000, env-overridable |
+| audit (local + VPS) | ✅ `scripts/audit-store.ts`, results recorded above |
+| 14 — unshadow the store | ✅ `scripts/reconcile-store.ts`, applied locally |
+| invariant suite | ✅ `tests/unit/invariants{,.pending}.test.ts` |
+| 23 — paper cash net of fees | ✅ fixed and verified against production data |
+
+### What is NOT done
+
+- **Not deployed.** The VPS runs `3a9a69e` at `/opt/apps/ZINGER` (ssh host
+  `contabo`), up since 2026-08-18. Slice 0 is inert there apart from item 23,
+  and the reconciler is **boot-only** — nothing fires it on a timer — so there
+  is no clock running. The requirement is "the fix is in before the next
+  restart", not "deploy soon". Deploying is best bundled with slice 1.
+- **`reconcile-store.ts` has not been run on the VPS.** Production's
+  `session_perf` is already intact (200 = 200), so this is cleanup of 13 stale
+  JSON files, not recovery.
+- **Items 24 and 25** are filed, not fixed. Both are slice 3.
+
+### Known live-data facts (do not re-derive)
+
+- VPS: 31 packages · 13 trades · 13 positions. Paper bankroll $100.70, which is
+  **correct** — it is the pre-reconcile fee-aware value.
+- `pkg-btc-msyglw8m` is stuck `PENDING_FILL` with a naked UP leg, 40h+ as of the
+  audit. It is the live instance of items 8 and 9.
+- 24 of 31 packages are orphaned from their trades (item 24); 15 settled orphans
+  report $4.65 of fee-blind profit via the `lockedProfitUsd` fallback.
+- The VPS sets no `ZINGER_DATA_DIR`, `ZINGER_DB_PATH` or `ZINGER_SQLITE`.
+
+### Conventions established in slice 0 — keep them
+
+1. **Fixtures for permanent tests, the real store for one-shot audits. Never
+   conflate.** A suite whose result depends on what is in `data/` cannot
+   separate a code defect from a data artifact, and against an empty store it
+   passes trivially.
+2. **Invariants that do not hold yet go in `invariants.pending.test.ts` under
+   `it.fails()`.** CI stays green; the file goes red when the defect is fixed,
+   which is the signal to promote the test. Verify each fails on its own
+   assertion, not on an error.
+3. **Derive money from primitives, not from stored derived fields.**
+   `tradeNetPnl` recomputes from entry/exit/shares/fees precisely because
+   pre-fix records carry a gross `pnl` with nothing to distinguish them.
+4. **Audit scripts are read-only and say so.** Verify it: sqlite's `-shm`
+   sidecar mtime moves on any connection, so compare row content, not file
+   mtimes.
+
+### Suggested next step — slice 1
+
+Per D6 and the plan above: extract `buildDecision` (247 lines) and
+`resolveOrderSize` (121) out of `bot.ts` into `engines/directional.ts`, and tag
+every trade with its engine — that alone closes item 6, since the edge gate can
+then filter to directional trades only. Zero live risk: directional is not
+currently trading.
+
+Open question to settle first: **item 23 left the duplication in place.**
+`paperBooksCash()` is now the single formula, but two functions still decide
+when to write cash. D5 says one pool, one owner — collapsing that into
+`ledger/cash.ts` is slice 2 work, and slice 1 should not add a third writer.
