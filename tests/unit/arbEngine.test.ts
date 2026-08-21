@@ -55,7 +55,15 @@ describe('Atomic Arb Engine', () => {
     expect(pkg?.symbol).toBe('ETH');
     expect(pkg?.totalCost).toBe(20);
     expect(pkg?.expectedPayout).toBe(20.83); // 20.833 shares * $1.00
-    expect(pkg?.lockedProfitUsd).toBe(0.83);
+    // Net of both entry taker fees (item 7). This asserted 0.83 — the gross
+    // figure — which is precisely the number the dashboard overstated by 5.2x.
+    // Settlement redeems the set fee-free, so the two entry fees are the whole
+    // cost: 20.833 sh at 0.34 and 0.62 => $0.67 combined.
+    expect(pkg?.lockedProfitUsd).toBe(0.16);
+    expect(pkg?.feesEstUsd).toBeCloseTo(0.67, 2);
+    // Gross minus fees, restated so the relationship is explicit rather than a
+    // magic constant.
+    expect(pkg!.expectedPayout - pkg!.totalCost - pkg!.feesEstUsd!).toBeCloseTo(pkg!.lockedProfitUsd, 2);
     expect(pkg?.legs.up.filled).toBe(true);
     expect(pkg?.legs.down.filled).toBe(true);
   });

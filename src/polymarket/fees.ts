@@ -87,6 +87,67 @@ export function takerFeeUsdc(shares, price, categoryOrRate = 'crypto') {
   return roundFeeUsdc(C * rate * curve);
 }
 
+/**
+ * Live fee params for a token **only if already cached** — never fetches.
+ *
+ * For use on hot paths that must not block. The arb gap gate is the motivating
+ * caller: it runs per market per scan, and the 2026-08-12 outage was caused by
+ * exactly this shape — a network fetch sitting in `scan()` upstream of the arb
+ * engine, which needs nothing but the order book. A 4s timeout per market per
+ * window rollover is not worth trading for parameters that are, on every market
+ * this bot touches, identical to the category schedule (verified live:
+ * `{"r":0.07,"e":1,"to":true}` vs `FEE_RATES.crypto = 0.07`, exponent 1).
+ *
+ * The fill path already calls `takerFeeUsdcForToken`, so the cache warms itself
+ * and later scans in the same window get the live numbers for free.
+ */
+export function peekClobFeeParams(tokenId) {
+  const id = String(tokenId || '').trim();
+  if (!id) return null;
+  const hit = feeCache.get(id);
+  if (!hit || (Date.now() - hit.at) >= FEE_CACHE_TTL_MS) return null;
+  return hit;
+}
+
+/**
+ * The book gap at which an arb pair exactly breaks even, per share.
+ *
+ * A full set redeems exactly $1.00, so profit per share **is** the gap
+ * (1 − upPrice − downPrice). Each leg is a taker buy paying
+ * `rate × (p(1−p))^exponent` per share, at its own price. Hence:
+ *
+ *   break-even gap = rate × [ (u(1−u))^e + (d(1−d))^e ]
+ *
+ * which is **price-dependent, not flat**. Verified against the recomputed
+ * 2026-08-18 overnight sample (backlog item 7):
+ *
+ *   0.50 / 0.50 → 3.50%      0.23 / 0.77 → 2.48%      0.10 / 0.90 → 1.26%
+ *
+ * Exit is free — settlement/redemption is not a CLOB sell, see
+ * FEE_FREE_EXIT_REASONS — so the two entry fees are the whole cost.
+ *
+ * The legs are deliberately *not* assumed symmetric. In a tradable book they
+ * sum to under $1.00 (that gap is the entire point), so `d != 1 − u` and each
+ * leg's curve is evaluated at its own price.
+ *
+ * Returns Infinity for an unpriceable book, so a caller comparing
+ * `gap > breakEven` fails closed.
+ */
+export function arbBreakEvenGap(upPrice, downPrice, categoryOrRate = 'crypto') {
+  const u = Number(upPrice);
+  const d = Number(downPrice);
+  if (!(u > 0 && u < 1) || !(d > 0 && d < 1)) return Infinity;
+  const { rate, exponent } = categoryParams(categoryOrRate);
+  if (!(rate > 0)) return 0;
+  const e = Math.max(0, exponent);
+  const curve = (p) => (p * (1 - p)) ** e;
+  // Deliberately NOT passed through roundFeeUsdc: this is a price *fraction*,
+  // not a USDC amount. Rounding it to the protocol's 5dp money precision puts
+  // an error into the rate itself, which then scales with share count — at 500
+  // shares it drifts a tenth of a cent away from the fees actually charged.
+  return rate * (curve(u) + curve(d));
+}
+
 async function clobGet(path) {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), 4000);

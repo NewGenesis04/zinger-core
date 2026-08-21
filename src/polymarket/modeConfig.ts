@@ -37,7 +37,7 @@ export const STRATEGY_KEYS = [
   'governorDrawdownPct', 'governorRevertTrades',
   'evalBothSides', 'sideBalanceEnabled', 'sideBalanceWeight',
   'preferShortTf', 'shortTfWeight',
-  'clobArbEnabled', 'minArbGap', 'arbExploreRate', 'maxArbPackages',
+  'clobArbEnabled', 'minArbGap', 'arbMinMarginPct', 'arbExploreRate', 'maxArbPackages',
   'arbOnlyUntilEdge', 'forceArbOnly', 'requireEdgeForLive',
   'edgeLookback', 'edgeMinTrades', 'edgeMinExpectancy',
   'holdToSettleUnderdogs', 'underdogMaxPrice', 'holdToSettleDisasterSlPct',
@@ -117,7 +117,13 @@ export function defaultPaperStrategy() {
     preferShortTf: true,
     shortTfWeight: 2.0,
     clobArbEnabled: true,
+    // Absolute floor: "how big a dislocation is worth the trouble". Profitability
+    // is no longer this field's job — the fee-aware break-even gate owns that
+    // (item 7), and it cannot be turned off. Safe to lower to capture skewed
+    // books, which need far less gap than a 50/50 one.
     minArbGap: 0.015,
+    // Required profit *above* break-even, in gap terms. Profit = shares x this.
+    arbMinMarginPct: 0.005,
     arbExploreRate: 0.08,
     arbOnlyUntilEdge: false,
     forceArbOnly: false,
@@ -145,6 +151,9 @@ export function defaultLiveStrategy() {
     certaintyMaxUsd: 2.0,
     arbBankrollFrac: 0.03,
     arbMaxUsd: 1,
+    // Wider than paper on purpose: a quoted ask is not a fill price, and this
+    // margin is what absorbs the difference when real money is at stake.
+    arbMinMarginPct: 0.010,
     autoApprovePaper: false,
     autoApproveLive: true,
     slPct: 8,

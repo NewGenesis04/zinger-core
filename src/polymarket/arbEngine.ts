@@ -1,5 +1,10 @@
 import { savePackage, loadPackages, getActivePackages } from './arbPersistence.js';
-import { closeProceedsWithFee } from './fees.js';
+import {
+  closeProceedsWithFee,
+  takerFeeUsdc,
+  arbBreakEvenGap,
+  peekClobFeeParams,
+} from './fees.js';
 import type { ArbPackage } from './arbPersistence.js';
 
 export type { ArbPackage };
@@ -50,6 +55,46 @@ export async function detectAndExecuteArbPackage({
 
   const sum = upAsk + downAsk;
   const gap = 1 - sum;
+
+  // Fee-aware threshold (backlog item 7). Profit per share IS the gap, because
+  // a full set redeems exactly $1.00 — and each leg pays a taker fee of
+  // rate × (p(1−p))^e per share. So break-even is a function of the book, not a
+  // constant: 3.5% at 50/50, 1.88% at 0.83/0.15, 1.26% at 0.10/0.90.
+  //
+  // A flat threshold is wrong in *both* directions. The shipped 0.015 default
+  // loses money on any book between roughly $0.12 and $0.88; a 0.035 stop-gap
+  // is right at 50/50 but throws away profitable skewed books. Measured on the
+  // 2026-08-18 overnight run, this gate rejects both losing packages and keeps
+  // all four winners, including one a flat 0.035 would have refused.
+  //
+  // Live params when they are already cached, category schedule otherwise —
+  // `peekClobFeeParams` never fetches. Deliberate: this gate runs per market
+  // per scan, and putting a 4s-timeout network call in the arb path is the
+  // shape that caused the 2026-08-12 outage. The fallback is not a compromise
+  // on these markets anyway — crypto reports {"r":0.07,"e":1} live, which is
+  // exactly FEE_RATES.crypto with exponent 1. Both legs share one conditionId,
+  // so one lookup covers the pair, and the fill path warms the cache for the
+  // scans that follow.
+  const feeParams = (cfg.useClobMarketFees !== false && peekClobFeeParams(market.tokenIds?.up))
+    || (cfg.feeCategory || 'crypto');
+  const breakEvenGap = arbBreakEvenGap(upAsk, downAsk, feeParams);
+  const marginPct = Number(cfg.arbMinMarginPct ?? 0.005);
+  const requiredGap = breakEvenGap + marginPct;
+  if (!(gap > requiredGap)) {
+    if (log && gap > 0) {
+      log(
+        `⏭️ ARB SKIP ${market.symbol} gap ${(gap * 100).toFixed(2)}% ≤ break-even ${(breakEvenGap * 100).toFixed(2)}%${marginPct ? ` + margin ${(marginPct * 100).toFixed(2)}%` : ''} — would not cover its own fees`,
+        'scan',
+        { slug: market.slug, gap, breakEvenGap, requiredGap, upAsk, downAsk },
+      );
+    }
+    return null;
+  }
+
+  // The operator's absolute floor. Semantics unchanged, and kept separate on
+  // purpose: this answers "how big a dislocation is worth the trouble", the
+  // gate above answers "can this trade make money at all". Setting it below
+  // break-even is now safe — the fee gate is not optional.
   const minGap = Number(cfg.minArbGap ?? 0.015);
   if (gap < minGap) return null;
 
@@ -85,7 +130,20 @@ export async function detectAndExecuteArbPackage({
 
   const packageId = `pkg-${market.symbol.toLowerCase()}-${Date.now().toString(36)}`;
   const expectedPayout = Math.round(shares * 1.00 * 100) / 100;
-  const lockedProfitUsd = Math.round((expectedPayout - totalCost) * 100) / 100;
+
+  // Locked profit is reported NET (backlog item 7, second half). It used to be
+  // `expectedPayout − totalCost`, gross of fees, so the UI overstated every
+  // package — the 2026-08-18 run reported $2.66 against a real $0.85. That also
+  // fed item 24: `getArbPackageMetrics` falls back to `lockedProfitUsd` for any
+  // package whose leg trades are gone, so the gross figure became permanent,
+  // uncorrectable phantom profit.
+  //
+  // Only the two entry fees apply. Holding to settlement redeems the set
+  // fee-free (FEE_FREE_EXIT_REASONS), which is exactly why the strategy works.
+  const feesEstUsd = Math.round(
+    (takerFeeUsdc(shares, upAsk, feeParams) + takerFeeUsdc(shares, downAsk, feeParams)) * 100,
+  ) / 100;
+  const lockedProfitUsd = Math.round((expectedPayout - totalCost - feesEstUsd) * 100) / 100;
   const lockedProfitPct = Math.round((lockedProfitUsd / totalCost) * 10000) / 100;
 
   const pkg: ArbPackage = {
@@ -100,6 +158,9 @@ export async function detectAndExecuteArbPackage({
     expectedPayout,
     lockedProfitUsd,
     lockedProfitPct,
+    feesEstUsd,
+    breakEvenGap,
+    gap: Math.round(gap * 100000) / 100000,
     status: 'PENDING_FILL',
     mode,
     createdAt: Date.now(),

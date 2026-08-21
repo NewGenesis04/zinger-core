@@ -52,56 +52,6 @@ beforeEach(() => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-describe('PENDING INVARIANT: an accepted arb package is profitable after fees', () => {
-  // Backlog item 7. `arbEngine.ts:52-53` compares the raw book gap against
-  // minArbGap with no fee term. Break-even is 2 x rate x (p(1-p))^e — 3.5% at a
-  // 50/50 book — so the shipped 0.015 default takes structural losers.
-  it.fails('does not open a package whose gap cannot cover both legs\' fees', async () => {
-    const up = 0.492;
-    const down = 0.492; // gap = 1.6%, above minArbGap 1.5%, below break-even 3.5%
-
-    const pkg = await detectAndExecuteArbPackage({
-      market: market(),
-      depth: { up: { bestAsk: up }, down: { bestAsk: down } },
-      prices: { up, down },
-      cfg: cfg(),
-      mode: 'paper',
-      log: () => {},
-      executeTrade: async () => true,
-      botState: { config: {}, positions: [] },
-    });
-
-    if (pkg) {
-      const shares = pkg.shares;
-      const grossProfit = pkg.expectedPayout - pkg.totalCost;
-      const fees = takerFeeUsdc(shares, up, 'crypto') + takerFeeUsdc(shares, down, 'crypto');
-      // The engine took this trade; it must at least make money.
-      expect(grossProfit - fees).toBeGreaterThan(0);
-    }
-    expect(pkg).toBeNull();
-  });
-
-  it.fails('reports locked profit net of fees, not gross', async () => {
-    const up = 0.34;
-    const down = 0.62;
-    const pkg = await detectAndExecuteArbPackage({
-      market: market(),
-      depth: { up: { bestAsk: up }, down: { bestAsk: down } },
-      prices: { up, down },
-      cfg: cfg(),
-      mode: 'paper',
-      log: () => {},
-      executeTrade: async () => true,
-      botState: { config: {}, positions: [] },
-    });
-    const fees = takerFeeUsdc(pkg.shares, up, 'crypto') + takerFeeUsdc(pkg.shares, down, 'crypto');
-    const netProfit = pkg.expectedPayout - pkg.totalCost - fees;
-    // lockedProfitUsd is what the UI and session stats report.
-    expect(pkg.lockedProfitUsd).toBeCloseTo(netProfit, 2);
-  });
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
 describe('PENDING INVARIANT: every package reaches a terminal state', () => {
   // Backlog item 9. A package interrupted mid-dispatch (process restart during
   // Promise.allSettled) stays PENDING_FILL forever. getActivePackages counts

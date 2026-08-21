@@ -22,8 +22,15 @@ export interface ArbPackage {
   downCost: number;
   totalCost: number;
   expectedPayout: number;
+  /** Net of both entry taker fees. Was gross until backlog item 7. */
   lockedProfitUsd: number;
   lockedProfitPct: number;
+  /** The two entry fees this package expects to pay. */
+  feesEstUsd?: number;
+  /** Gap at which this book would exactly break even — rate x [u(1-u)^e + d(1-d)^e]. */
+  breakEvenGap?: number;
+  /** The book gap actually taken, so the margin over break-even is auditable. */
+  gap?: number;
   status: 'PENDING_FILL' | 'LOCKED' | 'SETTLED' | 'ABORTED';
   mode: 'paper' | 'live';
   createdAt: number;

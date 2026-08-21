@@ -5,7 +5,7 @@ import {
   syncPackageSettlements,
 } from '../../src/polymarket/arbEngine.js';
 import { saveAllPackages, loadPackages, getActivePackages, savePackage } from '../../src/polymarket/arbPersistence.js';
-import { takerFeeUsdc, closeProceedsWithFee, FEE_RATES } from '../../src/polymarket/fees.js';
+import { takerFeeUsdc, closeProceedsWithFee, FEE_RATES, arbBreakEvenGap } from '../../src/polymarket/fees.js';
 import { tradeNetPnl, tradeFeesPaid, tradeRealizedPnl, tradeEngine } from '../../src/polymarket/audit.js';
 import { computeRecentExpectancy, evaluateEdgeGate } from '../../src/polymarket/edge.js';
 import { normalizeConfigStore, defaultLiveStrategy } from '../../src/polymarket/modeConfig.js';
@@ -91,10 +91,17 @@ describe('INVARIANT: a full set redeems to exactly $1.00', () => {
   it('gives both legs equal shares, so the pair redeems $1.00/set', async () => {
     // Unequal legs are not a hedge: the excess on one side is a naked
     // directional position wearing an arb label.
+    //
+    // Every book here must clear fee break-even, or the engine correctly
+    // refuses it and there is no package to inspect (item 7). 0.48/0.49 used to
+    // be in this list: gap 3.0% against a 3.50% break-even, i.e. a structural
+    // loser that only opened because the old gate was fee-blind. 0.45/0.48 keeps
+    // the intent — a near-50/50 book, the most expensive end of the p(1−p)
+    // curve — with a gap that actually pays.
     for (const [up, down] of [
       [0.34, 0.62],
       [0.10, 0.85],
-      [0.48, 0.49],
+      [0.45, 0.48],
       [0.71, 0.24],
     ]) {
       saveAllPackages([]);
@@ -654,6 +661,135 @@ describe('INVARIANT: a refused arb leg is never recorded as filled', () => {
       const recompute = Math.round((100 + realized - openCost) * 100) / 100;
       expect(Math.abs(cash.v - recompute)).toBeLessThanOrEqual(0.02);
       saveAllPackages([]);
+    }
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+describe('INVARIANT: an accepted arb package is profitable after fees', () => {
+  // Backlog item 7, promoted from invariants.pending.test.ts once fixed.
+  //
+  // Profit per share IS the gap, because a full set redeems exactly $1.00. Each
+  // leg is a taker buy paying rate x (p(1-p))^e per share, so break-even is a
+  // property of the book:
+  //
+  //   break-even gap = rate x [ (u(1-u))^e + (d(1-d))^e ]
+  //
+  // A flat minArbGap is therefore wrong in both directions. The shipped 0.015
+  // default lost money on any book between roughly $0.12 and $0.88; the
+  // operator's 0.035 stop-gap was right at 50/50 and threw away skewed books
+  // that needed under 2%.
+
+  it('matches the break-even figures verified against a real fee schedule', () => {
+    // These three are the anchor: recomputed from the live CLOB schedule
+    // ({"r":0.07,"e":1}) and recorded in the plan.
+    expect(arbBreakEvenGap(0.50, 0.50, 'crypto')).toBeCloseTo(0.0350, 4);
+    expect(arbBreakEvenGap(0.23, 0.77, 'crypto')).toBeCloseTo(0.0248, 4);
+    expect(arbBreakEvenGap(0.10, 0.90, 'crypto')).toBeCloseTo(0.0126, 4);
+  });
+
+  it('is exactly the two leg fees, so the gate and the ledger cannot disagree', () => {
+    // The strongest form: break-even x shares must equal the fees actually
+    // charged at fill. If these drift apart the gate is pricing a different
+    // trade than the ledger books.
+    //
+    // The books here deliberately sum to UNDER $1.00 — a real, tradable book.
+    // The reference figures above (0.50/0.50, 0.23/0.77, 0.10/0.90) all sum to
+    // exactly 1.00, which is the one case where assuming d = 1 - u happens to be
+    // right, so they cannot catch a symmetry shortcut. 0.34/0.62 can:
+    // curve(0.34) = 0.2244 but curve(0.62) = 0.2356.
+    for (const [u, d] of [[0.34, 0.62], [0.83, 0.15], [0.45, 0.48], [0.10, 0.85]]) {
+      for (const shares of [1, 20.833, 500]) {
+        const be = arbBreakEvenGap(u, d, 'crypto');
+        const legFees = takerFeeUsdc(shares, u, 'crypto') + takerFeeUsdc(shares, d, 'crypto');
+        expect(be * shares, `${u}/${d} x ${shares}`).toBeCloseTo(legFees, 3);
+      }
+    }
+  });
+
+  it('prices each leg at its own price, not the mirror of the other', () => {
+    // Guards the shortcut directly. On a tradable book the two legs sit at
+    // different points on the p(1-p) curve, so doubling one leg is wrong in
+    // whichever direction the book is skewed.
+    const rate = FEE_RATES.crypto;
+    const curve = (p) => p * (1 - p);
+    for (const [u, d] of [[0.34, 0.62], [0.83, 0.15]]) {
+      const doubled = rate * 2 * curve(u);
+      const actual = arbBreakEvenGap(u, d, 'crypto');
+      expect(actual).not.toBeCloseTo(doubled, 4);
+      expect(actual).toBeCloseTo(rate * (curve(u) + curve(d)), 5);
+    }
+  });
+
+  it('is most expensive at 50/50 and cheapest at the extremes', () => {
+    // The shape is what makes a flat threshold wrong. p(1-p) peaks at 0.25.
+    const mid = arbBreakEvenGap(0.5, 0.5, 'crypto');
+    for (const [u, d] of [[0.3, 0.7], [0.15, 0.85], [0.05, 0.95]]) {
+      expect(arbBreakEvenGap(u, d, 'crypto')).toBeLessThan(mid);
+    }
+  });
+
+  it('fails closed on an unpriceable book', () => {
+    // Infinity, not 0 — a caller testing `gap > breakEven` must refuse, never
+    // wave the trade through because a price was missing.
+    for (const [u, d] of [[0, 0.5], [0.5, 0], [1, 0.5], [1.4, 0.5], [NaN, 0.5]]) {
+      expect(arbBreakEvenGap(u, d, 'crypto')).toBe(Infinity);
+    }
+  });
+
+  it('does not open a package whose gap cannot cover both legs\' fees', async () => {
+    // gap 1.6% at a 50/50 book, above the old minArbGap of 1.5% and well below
+    // the 3.5% it actually costs. Measured net before the fix: -$0.38.
+    const up = 0.492;
+    const down = 0.492;
+    expect(1 - up - down).toBeGreaterThan(0.015);            // the old gate let it through
+    expect(1 - up - down).toBeLessThan(arbBreakEvenGap(up, down, 'crypto'));
+    const pkg = await runArb({ depth: { up: { bestAsk: up }, down: { bestAsk: down } }, prices: { up, down } });
+    expect(pkg).toBeNull();
+  });
+
+  it('still takes a skewed book that a flat 3.5% threshold would refuse', async () => {
+    // The other half of the fix. 0.83/0.15 needs only 1.88%, so a 2% gap pays —
+    // yet the operator's blunt 0.035 stop-gap rejected it. minArbGap must be low
+    // enough not to re-impose the flat floor the fee gate replaced.
+    const up = 0.83;
+    const down = 0.15;
+    const gap = 1 - up - down;
+    expect(gap).toBeLessThan(0.035);                          // a flat 3.5% refuses this
+    expect(gap).toBeGreaterThan(arbBreakEvenGap(up, down, 'crypto'));
+    const pkg = await runArb({
+      depth: { up: { bestAsk: up }, down: { bestAsk: down } },
+      prices: { up, down },
+      cfg: cfg({ minArbGap: 0.005, arbMinMarginPct: 0 }),
+    });
+    expect(pkg).not.toBeNull();
+  });
+
+  it('reports locked profit net of fees, not gross', async () => {
+    const up = 0.34;
+    const down = 0.62;
+    const pkg = await runArb({ depth: { up: { bestAsk: up }, down: { bestAsk: down } }, prices: { up, down } });
+    const fees = takerFeeUsdc(pkg.shares, up, 'crypto') + takerFeeUsdc(pkg.shares, down, 'crypto');
+    // lockedProfitUsd is what the UI and session stats report, and what
+    // getArbPackageMetrics falls back to for packages whose trades are gone
+    // (item 24) — so a gross figure there is permanent phantom profit.
+    expect(pkg.lockedProfitUsd).toBeCloseTo(pkg.expectedPayout - pkg.totalCost - fees, 2);
+    expect(pkg.lockedProfitUsd).toBeLessThan(pkg.expectedPayout - pkg.totalCost);
+  });
+
+  it('never accepts a package whose own recorded numbers show a loss', async () => {
+    // The invariant behind all of the above, stated over what the package
+    // itself records: if it opened, its net must be positive.
+    for (const [up, down] of [[0.34, 0.62], [0.10, 0.85], [0.45, 0.48], [0.71, 0.24], [0.83, 0.15]]) {
+      saveAllPackages([]);
+      const pkg = await runArb({
+        depth: { up: { bestAsk: up }, down: { bestAsk: down } },
+        prices: { up, down },
+        cfg: cfg({ minArbGap: 0.005 }),
+      });
+      if (!pkg) continue;   // refused is always an acceptable answer
+      expect(pkg.lockedProfitUsd, `${up}/${down}`).toBeGreaterThan(0);
+      expect(pkg.gap, `${up}/${down}`).toBeGreaterThan(pkg.breakEvenGap);
     }
   });
 });
