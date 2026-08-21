@@ -1,8 +1,11 @@
+import fs from 'fs';
+import path from 'path';
 import { describe, expect, it, beforeEach } from 'vitest';
 import {
   detectAndExecuteArbPackage,
   isComplementaryBinary,
   syncPackageSettlements,
+  reconcilePendingPackages,
 } from '../../src/polymarket/arbEngine.js';
 import { saveAllPackages, loadPackages, getActivePackages, savePackage } from '../../src/polymarket/arbPersistence.js';
 import { takerFeeUsdc, closeProceedsWithFee, FEE_RATES, arbBreakEvenGap } from '../../src/polymarket/fees.js';
@@ -791,5 +794,143 @@ describe('INVARIANT: an accepted arb package is profitable after fees', () => {
       expect(pkg.lockedProfitUsd, `${up}/${down}`).toBeGreaterThan(0);
       expect(pkg.gap, `${up}/${down}`).toBeGreaterThan(pkg.breakEvenGap);
     }
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+describe('INVARIANT: arb capacity drains without anyone watching', () => {
+  // Backlog items 9 and 10, promoted from invariants.pending.test.ts.
+  //
+  // getActivePackages counts LOCKED + PENDING_FILL toward maxArbPackages, so any
+  // package that never reaches a terminal state permanently consumes a slot.
+  // Two ways that happened:
+  //
+  //   10  syncPackageSettlements had exactly one caller — inside getState(). No
+  //       timer calls getState, so with no dashboard open nothing ever settled.
+  //   9   a restart between savePackage(PENDING_FILL) and the promotion after
+  //       Promise.allSettled stranded the package forever, with no boot repair.
+  //
+  // Note the fix is a reconcile step, NOT teaching getActivePackages to ignore
+  // stale packages. That would free the slot while leaving the naked leg in
+  // place — capacity restored, exposure hidden. The earlier version of this test
+  // asserted exactly that weaker property.
+
+  const stuck = (over = {}) => ({
+    packageId: 'pkg-stuck',
+    symbol: 'BTC',
+    slug: 'btc-updown-5m-stuck',
+    windowKey: 'slug-btc-updown-5m-stuck',
+    shares: 10,
+    upCost: 2.5, downCost: 7.2, totalCost: 9.7, expectedPayout: 10,
+    lockedProfitUsd: 0.3, lockedProfitPct: 3,
+    status: 'PENDING_FILL',
+    mode: 'paper',
+    createdAt: Date.now() - 48 * 3600 * 1000,   // two days — long past any dispatch
+    legs: {
+      // Deliberately false: these flags are written *after* dispatch, so on the
+      // interrupted path they lie about fills that really happened.
+      up: { outcome: 'up', shares: 10, entryPrice: 0.25, cost: 2.5, filled: false },
+      down: { outcome: 'down', shares: 10, entryPrice: 0.72, cost: 7.2, filled: false },
+    },
+    ...over,
+  });
+
+  const leg = (outcome, over = {}) => ({
+    id: `pos-${outcome}`, packageId: 'pkg-stuck', outcome, symbol: 'BTC',
+    slug: 'btc-updown-5m-stuck', shares: 10,
+    entryPrice: outcome === 'up' ? 0.25 : 0.72,
+    costBasis: outcome === 'up' ? 2.5 : 7.2,
+    entryFee: 0.1, feesPaid: 0.1, isArbLeg: true, closed: false, mode: 'paper',
+    ...over,
+  });
+
+  const reconcile = (positions = [], trades = [], over = {}) => {
+    const cash = { v: 100 };
+    const saved = [];
+    return reconcilePendingPackages({
+      mode: 'paper',
+      positions,
+      trades,
+      cfg: { simulateClobFees: true, feeCategory: 'crypto' },
+      botState: { config: {}, positions },
+      adjustPaperCash: (d) => { cash.v = Math.round((cash.v + d) * 100) / 100; },
+      saveTrade: (t) => saved.push(t),
+      log: () => {},
+      ...over,
+    }).then((res) => ({ res, cash, saved, positions }));
+  };
+
+  it('frees the slot when neither leg ever filled', async () => {
+    savePackage(stuck() as any);
+    expect(getActivePackages('paper')).toHaveLength(1);
+    const { res } = await reconcile([], []);
+    expect(res.discarded).toBe(1);
+    expect(getActivePackages('paper')).toHaveLength(0);
+    expect(loadPackages()[0].status).toBe('ABORTED');
+  });
+
+  it('promotes to LOCKED when both fills are found, rather than discarding real positions', async () => {
+    // The dangerous direction. `legs.*.filled` is false on both, so trusting the
+    // flags would abort a package that is a genuine, intact hedge.
+    savePackage(stuck() as any);
+    const { res } = await reconcile([leg('up'), leg('down')], []);
+    expect(res.locked).toBe(1);
+    const pkg = loadPackages()[0];
+    expect(pkg.status).toBe('LOCKED');
+    expect(pkg.legs.up.filled).toBe(true);
+    expect(pkg.legs.down.filled).toBe(true);
+    // Still consuming a slot — correctly, it is a live hedge.
+    expect(getActivePackages('paper')).toHaveLength(1);
+  });
+
+  it('unwinds the survivor when only one leg filled, and frees the slot', async () => {
+    savePackage(stuck() as any);
+    const positions = [leg('up')];
+    const { res, saved } = await reconcile(positions, []);
+    expect(res.aborted).toBe(1);
+    expect(loadPackages()[0].status).toBe('ABORTED');
+    expect(getActivePackages('paper')).toHaveLength(0);
+    // The naked leg must be gone, not merely unaccounted for.
+    expect(positions[0].closed).toBe(true);
+    expect(positions[0].exitReason).toBe('arb_rollback');
+    expect(saved).toHaveLength(1);
+  });
+
+  it('derives fills from positions and trades, not from the leg flags', async () => {
+    // A closed leg leaves a trade but no open position. Both count as evidence
+    // the fill happened.
+    savePackage(stuck() as any);
+    const { res } = await reconcile(
+      [],
+      [{ packageId: 'pkg-stuck', outcome: 'up', closed: true, pnl: 0 },
+       { packageId: 'pkg-stuck', outcome: 'down', closed: true, pnl: 0 }],
+    );
+    expect(res.locked).toBe(1);
+  });
+
+  it('never touches a package young enough to still be dispatching', async () => {
+    // The safety interlock. Without an age floor this would abort packages whose
+    // legs are mid-flight — a live CLOB round trip takes seconds.
+    savePackage(stuck({ packageId: 'pkg-fresh', createdAt: Date.now() - 1000 }) as any);
+    const { res } = await reconcile([], []);
+    expect(res.checked).toBe(0);
+    expect(loadPackages()[0].status).toBe('PENDING_FILL');
+    expect(getActivePackages('paper')).toHaveLength(1);
+  });
+
+  it('leaves settlement to the write path, never to a read', async () => {
+    // Item 10's structural half. getState() must not transition package state:
+    // it had the only call to syncPackageSettlements, and nothing calls getState
+    // on a timer, so an unattended bot never settled anything at all.
+    const src = fs.readFileSync(
+      path.resolve(import.meta.dirname, '../../src/polymarket/bot.ts'), 'utf-8',
+    );
+    const getState = src.slice(src.indexOf('export function getState'));
+    const body = getState.slice(0, getState.indexOf('\nexport '));
+    expect(body.length).toBeGreaterThan(500);
+    expect(body).not.toMatch(/syncPackageSettlements\s*\(/);
+    expect(body).not.toMatch(/reconcilePendingPackages\s*\(/);
+    // …and the scan loop must be the thing that does it.
+    expect(src).toMatch(/await arbHousekeeping\('scan'\)/);
   });
 });

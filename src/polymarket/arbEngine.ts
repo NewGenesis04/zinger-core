@@ -352,6 +352,103 @@ async function unwindLeg({ outcome, pkg, market, mode, cfg, botState, log, adjus
 }
 
 /**
+ * Reconcile packages stuck at PENDING_FILL (backlog item 9).
+ *
+ * A package is written PENDING_FILL, both legs are dispatched, and the block
+ * after `Promise.allSettled` promotes it to LOCKED or ABORTED. A process
+ * restart between those two points leaves it PENDING_FILL forever — and
+ * `getActivePackages` counts PENDING_FILL toward `maxArbPackages`
+ * (`arbPersistence.ts`), so the record permanently consumes a slot nothing can
+ * free. Observed in production: `pkg-btc-msyglw8m`, 40.5 hours, one naked UP leg.
+ *
+ * Leg presence is derived from positions and trades rather than from
+ * `legs.*.filled`, on purpose. Those flags are written *after* dispatch, so on
+ * exactly the interrupted path this exists to repair they are still `false`
+ * while the fill is real — trusting them would mean discarding a live position.
+ *
+ * `minAgeMs` is the safety interlock: it must be comfortably longer than a
+ * dispatch, or this could abort a package whose legs are still in flight. A
+ * live CLOB round trip is seconds; the default is two minutes.
+ */
+export async function reconcilePendingPackages({
+  mode = 'paper',
+  positions = [],
+  trades = [],
+  minAgeMs = 120_000,
+  cfg = {},
+  botState = null,
+  log = null,
+  adjustPaperCash = null,
+  saveTrade = null,
+}: any = {}) {
+  const now = Date.now();
+  const stuck = loadPackages().filter((p) => (
+    p.mode === mode
+    && p.status === 'PENDING_FILL'
+    && (now - Number(p.createdAt || 0)) > minAgeMs
+  ));
+  if (!stuck.length) return { checked: 0, locked: 0, aborted: 0, discarded: 0 };
+
+  const present = (pkg, outcome) => (
+    positions.some((p) => p.packageId === pkg.packageId && p.outcome === outcome)
+    || trades.some((t) => t.packageId === pkg.packageId && t.outcome === outcome)
+  );
+
+  const result = { checked: stuck.length, locked: 0, aborted: 0, discarded: 0 };
+
+  for (const pkg of stuck) {
+    const upOk = present(pkg, 'up');
+    const downOk = present(pkg, 'down');
+    const ageH = ((now - Number(pkg.createdAt || 0)) / 3_600_000).toFixed(1);
+
+    if (upOk && downOk) {
+      // Both fills landed; only the bookkeeping was lost. This is a real hedge.
+      pkg.legs.up.filled = true;
+      pkg.legs.down.filled = true;
+      pkg.status = 'LOCKED';
+      savePackage(pkg);
+      result.locked += 1;
+      if (log) log(`🔧 ARB RECONCILE ${pkg.symbol} ${pkg.packageId} → LOCKED · both legs found after ${ageH}h stuck`, 'system', { packageId: pkg.packageId, slug: pkg.slug });
+      continue;
+    }
+
+    if (upOk !== downOk) {
+      // Half a hedge. Unwind the survivor rather than hold a naked leg that
+      // item 8 would later settle at a fabricated $0.50.
+      const filledLeg = upOk ? 'up' : 'down';
+      pkg.status = 'ABORTED';
+      pkg.unwoundAt = now;
+      pkg.abortReason = `Reconciled after ${ageH}h PENDING_FILL: only the ${filledLeg.toUpperCase()} leg filled`;
+      savePackage(pkg);
+      result.aborted += 1;
+      if (log) log(`🔧 ARB RECONCILE ${pkg.symbol} ${pkg.packageId} → ABORTED · naked ${filledLeg.toUpperCase()} leg after ${ageH}h — unwinding`, 'sl', { packageId: pkg.packageId, slug: pkg.slug });
+      // Awaited, not fired and forgotten: the caller needs to know the leg is
+      // actually closed before it reports capacity as freed, and a caller that
+      // cannot observe completion cannot be tested deterministically either.
+      // Caught per package so one bad unwind does not strand the rest.
+      try {
+        await unwindLeg({ outcome: filledLeg, pkg, market: { slug: pkg.slug }, mode, cfg, botState, log, adjustPaperCash, saveTrade });
+      } catch (err) {
+        if (log) log(`⚠️ ARB RECONCILE unwind failed ${pkg.packageId}: ${err?.message}`, 'error');
+      }
+      continue;
+    }
+
+    // Neither leg exists. Nothing was bought, so there is nothing to unwind —
+    // ABORTED rather than deleted, so the attempt stays auditable. Either way
+    // it stops counting against capacity.
+    pkg.status = 'ABORTED';
+    pkg.unwoundAt = now;
+    pkg.abortReason = `Reconciled after ${ageH}h PENDING_FILL: neither leg filled`;
+    savePackage(pkg);
+    result.discarded += 1;
+    if (log) log(`🔧 ARB RECONCILE ${pkg.symbol} ${pkg.packageId} → ABORTED · no legs filled after ${ageH}h · capacity freed`, 'system', { packageId: pkg.packageId, slug: pkg.slug });
+  }
+
+  return result;
+}
+
+/**
  * Scans active packages and transitions settled ones on market window completion.
  */
 export function syncPackageSettlements(trades = [], mode = 'paper') {

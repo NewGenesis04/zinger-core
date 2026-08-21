@@ -52,34 +52,6 @@ beforeEach(() => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-describe('PENDING INVARIANT: every package reaches a terminal state', () => {
-  // Backlog item 9. A package interrupted mid-dispatch (process restart during
-  // Promise.allSettled) stays PENDING_FILL forever. getActivePackages counts
-  // LOCKED + PENDING_FILL (arbPersistence.ts:81), so it permanently consumes a
-  // maxArbPackages slot that nothing can clear. There is no boot reconciliation.
-  //
-  // Confirmed in production 2026-08-20: pkg-btc-msyglw8m, 40.5h old.
-  it.fails('does not let a stale PENDING_FILL package consume capacity forever', () => {
-    savePackage({
-      packageId: 'pkg-stuck',
-      symbol: 'BTC',
-      slug: 'btc-updown-5m-stuck',
-      shares: 10,
-      status: 'PENDING_FILL',
-      mode: 'paper',
-      createdAt: Date.now() - 48 * 3600 * 1000, // two days ago
-      legs: {
-        up: { outcome: 'up', shares: 10, filled: false },
-        down: { outcome: 'down', shares: 10, filled: false },
-      },
-    } as any);
-
-    // Nothing reconciles this on boot, so it still counts against capacity.
-    expect(getActivePackages('paper')).toHaveLength(0);
-  });
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
 describe('PENDING INVARIANT: operator settings are never silently overwritten', () => {
   // Backlog item 19. normalizeConfigStore (modeConfig.ts:213-222) seeds the live
   // profile from `pickStrategy(base)` when migrating a legacy flat config, so

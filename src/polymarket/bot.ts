@@ -38,7 +38,14 @@ import { getMLSignalForBoth, getMLTraceForBoth } from './predict.js';
 import { addMLPrediction, addPriceTrace, getConfidenceBias, getConfidenceBufferStats, getPriceTrace } from './confidence.js';
 import { addSpotTick } from './spotPriceHistory.js';
 import { getModelStates, getModelHealth, onModelChange } from './modelRegistry.js';
-import { detectAndExecuteArbPackage, isComplementaryBinary, syncPackageSettlements, getArbPackageMetrics, loadPackages } from './arbEngine.js';
+import {
+  detectAndExecuteArbPackage,
+  isComplementaryBinary,
+  syncPackageSettlements,
+  reconcilePendingPackages,
+  getArbPackageMetrics,
+  loadPackages,
+} from './arbEngine.js';
 import { persist, persistSync, load, FILES, dataPath } from './persistence.js';
 import { placeOrder, placeMarketSell, syncClobBalance } from './trade.js';
 import { checkReadiness } from './readiness.js';
@@ -469,6 +476,47 @@ function repairPaperOverdraft(reason = 'overdraft repair') {
   reconcilePaperCash(`${reason} post`);
   saveState();
   return botState.config.paperBankroll;
+}
+
+/**
+ * Arb package lifecycle upkeep — the write path that used to hide inside a read.
+ *
+ * Two jobs, both about capacity draining on its own (backlog items 9 and 10):
+ *
+ *   1. settle LOCKED packages whose legs have both closed
+ *   2. reconcile packages stranded at PENDING_FILL by a mid-dispatch restart
+ *
+ * Called from `scan()` housekeeping and once at boot. `getState()` no longer
+ * transitions anything — it only reads. That was the actual defect in item 10:
+ * `syncPackageSettlements` had exactly one caller and it was a read path with
+ * no timer behind it, so an unattended bot never settled a package at all.
+ */
+async function arbHousekeeping(reason = 'scan') {
+  const mode = botState.config.mode || 'paper';
+  try {
+    const settled = syncPackageSettlements(botState.trades, mode);
+
+    const rec = await reconcilePendingPackages({
+      mode,
+      positions: botState.positions,
+      trades: botState.trades,
+      minAgeMs: Number(botState.config.arbPendingReconcileMs ?? 120_000),
+      cfg: botState.config,
+      botState,
+      log,
+      adjustPaperCash,
+      saveTrade,
+    });
+
+    if (settled || rec.locked || rec.aborted || rec.discarded) {
+      saveState();
+      notifyStateChange();
+    }
+    return { settled, ...rec };
+  } catch (err) {
+    log(`⚠️ Arb housekeeping failed (${reason}): ${String(err?.message || err).slice(0, 120)}`, 'error');
+    return null;
+  }
 }
 
 /** Detect real 5m market-window rollover (slug open→end) → book window stats. */
@@ -1589,10 +1637,13 @@ export function getState(opts = {}) {
     },
     audit,
     portfolio,
-    packages: (() => {
-      syncPackageSettlements(botState.trades, mode);
-      return loadPackages().filter((p) => p.mode === mode);
-    })(),
+    // Read-only (backlog item 10). This used to call `syncPackageSettlements`
+    // inline, making a *state transition* a side effect of a *read* — and the
+    // only caller of that transition. Nothing calls getState() on a timer, so
+    // with no dashboard open packages stayed LOCKED forever, capacity never
+    // drained and arb halted once maxArbPackages filled. Settlement now runs
+    // from arbHousekeeping() in the scan loop, where it belongs.
+    packages: loadPackages().filter((p) => p.mode === mode),
     arbMetrics: getArbPackageMetrics(mode, botState.trades),
     // Per-engine capacity, so "why didn't it trade?" is answerable without
     // reading the code (objective 1). The two budgets are independent (D5):
@@ -1967,6 +2018,8 @@ async function scan() {
   try {
     maybeFinalizeCycle();
     prunePendingTrades();
+    // Arb capacity has to drain without anyone watching (items 9 and 10).
+    await arbHousekeeping('scan');
     botState.stats.scansDone = (botState.stats.scansDone || 0) + 1;
     const readiness = await refreshTelemetry();
 
@@ -3415,6 +3468,13 @@ export function startBot() {
   botState.stopRequest = null;
   reconcilePaperCash('bot start');
   repairPaperOverdraft('bot start');
+  // A package stranded PENDING_FILL by a restart is exactly what this catches,
+  // and a restart is precisely when we are here.
+  // startBot is synchronous and nothing downstream here needs the result — the
+  // first scan re-runs this anyway. Surfaced rather than swallowed.
+  void arbHousekeeping('bot start').catch((err) => {
+    log(`⚠️ Arb housekeeping failed at boot: ${String(err?.message || err).slice(0, 120)}`, 'error');
+  });
   const modeTrades = dedupeTrades(botState.trades).filter((trade) => trade.mode === botState.config.mode);
   const startPortfolio = buildPortfolio(botState.readiness, botState.config.mode);
   botState.session = {
