@@ -62,6 +62,7 @@ import {
   tradeEngine,
 } from './audit.js';
 import { createPaperCashLedger } from './ledger/cash.js';
+import { record as recordAttribution, writerSummary, recentChanges } from './config/attribution.js';
 import {
   countOpen,
   sideBalance,
@@ -196,21 +197,64 @@ function syncConfigFromStore() {
   botState.config = resolveActiveConfig(botState.configStore);
 }
 
-export function saveConfig(cfg) {
+/**
+ * The single config writer. Every change funnels through here (D3).
+ *
+ * `origin` records who is writing: `{ tier, source, reason }`. Attribution is
+ * derived by diffing the store before and after rather than from the patch, so
+ * the two guards below — which mutate the store in place — are attributed to
+ * themselves rather than to whoever happened to call in. Those are the writes
+ * most worth having a name on.
+ *
+ * Defaulting an untagged caller to `system/unattributed` is deliberate: it is
+ * visible in `writerSummary()` rather than silently mislabelled as the operator.
+ */
+export function saveConfig(cfg, origin = { tier: 'system', source: 'unattributed' }) {
   const patch = cfg || {};
-  let store = applyConfigPatch(botState.configStore || loadConfigStore(), patch);
+  const before = botState.configStore || loadConfigStore();
+  let store = applyConfigPatch(before, patch);
+  const now = Date.now();
+
+  // Attribute the caller's own change first, before any guard runs.
+  store = { ...store, attribution: recordAttribution(before, store, origin, now) };
+
+  // A real snapshot, not an alias. The guard below mutates
+  // `store.profiles[mode]` IN PLACE, and a spread copy of `store` shares that
+  // same profiles object — so diffing against it would see nothing and the
+  // guard's correction would be recorded as the caller's own value. Measured:
+  // the guard set clobArbEnabled true while attribution said the operator set
+  // it false.
+  const beforeGuards = {
+    ...store,
+    profiles: {
+      paper: { ...store.profiles.paper },
+      live: { ...store.profiles.live },
+    },
+  };
 
   // Invariant: forceArbOnly mutes directional trading and relies entirely on
   // the arb engine — if clobArbEnabled is off too, the bot locks into a dead
   // state (no directional, no arb) that can persist indefinitely. Authoritative
   // guard here since every config write (UI, governor, session restore) funnels
   // through this function.
+  let guardFired = false;
   for (const modeKey of ['paper', 'live']) {
     const strat = store.profiles[modeKey];
     if (strat?.forceArbOnly === true && strat?.clobArbEnabled === false) {
       strat.clobArbEnabled = true;
+      guardFired = true;
       log(`⚠️ Config guard: forceArbOnly requires clobArbEnabled — auto-enabled CLOB arb on the ${modeKey} profile (was about to trade nothing).`, 'system');
     }
+  }
+  if (guardFired) {
+    store = {
+      ...store,
+      attribution: recordAttribution(beforeGuards, store, {
+        tier: 'guardrail',
+        source: 'forceArbOnly-guard',
+        reason: 'forceArbOnly requires clobArbEnabled',
+      }, now),
+    };
   }
 
   // Switching to live: evaluate gate against PAPER expectancy only (isolation)
@@ -218,8 +262,17 @@ export function saveConfig(cfg) {
     const liveFlat = resolveActiveConfig({ ...store, mode: 'live' });
     const gate = evaluateEdgeGate(botState.trades, liveFlat);
     if (!gate.liveAllowed) {
+      const beforeLock = store;
       store = { ...store, mode: 'paper' };
       log(`🔒 LIVE blocked — ${gate.reason} (paper WR ${(gate.wr * 100).toFixed(1)}% · E $${gate.expectancy})`, 'system', { edgeGate: gate });
+      store = {
+        ...store,
+        attribution: recordAttribution(beforeLock, store, {
+          tier: 'guardrail',
+          source: 'edge-gate',
+          reason: gate.reason,
+        }, now),
+      };
     }
   }
 
@@ -232,6 +285,7 @@ export function saveConfig(cfg) {
     paperBankroll: store.paperBankroll,
     paperInitialDeposit: store.paperInitialDeposit,
     profiles: store.profiles,
+    attribution: store.attribution,
   });
   notifyStateChange();
 }
@@ -318,7 +372,7 @@ const paperCash = createPaperCashLedger({
   readBooks: () => ({ trades: botState.trades, positions: botState.positions }),
   writeBalance: (next) => {
     botState.config.paperBankroll = next;
-    saveConfig({ paperBankroll: next });
+    saveConfig({ paperBankroll: next }, { tier: 'system', source: 'cash-ledger' });
   },
   isPaper: () => botState.config.mode === 'paper',
   log: (msg, level) => log(msg, level),
@@ -1625,6 +1679,22 @@ export function getState(opts = {}) {
         },
       };
     })(),
+    // Who last changed each setting, and what changed recently (D3).
+    //
+    // Read-only. The counts are the useful part: they say how much of the
+    // active profile the operator actually chose, versus how much the governor
+    // and optimizer wrote. Before this existed the answer was unknowable — the
+    // stored profile mixed overlays from regimes that were never both active.
+    settingWriters: (() => {
+      const summary = writerSummary(botState.configStore, mode);
+      return {
+        ...summary,
+        note: summary.total
+          ? 'Counts settings on this profile by who set them. "unattributed" means it was already there before changes were tracked.'
+          : 'Nothing recorded yet — this fills in as settings change.',
+      };
+    })(),
+    settingChanges: recentChanges(botState.configStore, { limit: 20 }),
   };
   const narrative = buildSystemNarrative(stateCore);
   const liveScoreCards = buildLiveScoreCards(stateCore);
@@ -1711,6 +1781,13 @@ export function getState(opts = {}) {
     signals: botState.signals,
     stats: isolatedStats,
     audit,
+    // These three live on `stateCore` because the narrative and score-card
+    // builders read it — but `stateCore` is an ARGUMENT to those builders, never
+    // spread into this return. Adding a field there does not expose it, which is
+    // how `slots` shipped invisible in the D5 work. See backlog item 31.
+    slots: stateCore.slots,
+    settingWriters: stateCore.settingWriters,
+    settingChanges: stateCore.settingChanges,
     telemetry: {
       uptime: botState.running ? Math.floor((Date.now() - botState._startTime) / 1000) : 0,
       uptimeMs: botState.running ? Date.now() - botState._startTime : 0,
@@ -1829,7 +1906,7 @@ export async function optimizeNow({ apply = true, useLlm = true } = {}) {
   const state = getState();
   return runOptimizer({
     state,
-    saveConfig,
+    saveConfig: (patch) => saveConfig(patch, { tier: 'automation', source: 'optimizer' }),
     log,
     apply,
     useLlm: useLlm && botState.config.llmOptimize !== false,
@@ -1842,7 +1919,7 @@ export async function governorNow({ useLlm = true } = {}) {
     signals: botState.signals,
     portfolio: buildPortfolio(botState.readiness, botState.config.mode || 'paper'),
     trades: botState.trades,
-    saveConfig,
+    saveConfig: (patch) => saveConfig(patch, { tier: 'automation', source: 'governor' }),
     log,
     useLlm: useLlm && botState.config.llmOptimize !== false,
   });
@@ -1851,7 +1928,7 @@ export async function governorNow({ useLlm = true } = {}) {
 export async function applyLlmPrimitives(actions) {
   const { runPrimitives } = await import('../ai/primitives.js');
   return runPrimitives(actions, {
-    saveConfig,
+    saveConfig: (patch) => saveConfig(patch, { tier: 'automation', source: 'llm-primitives' }),
     startBot,
     stopBot,
     optimizeNow,
@@ -3414,10 +3491,10 @@ export function startBot() {
   // Enforce paper lock before enabling
   const gate = evaluateEdgeGate(botState.trades, botState.config);
   if (botState.config.mode === 'live' && !gate.liveAllowed) {
-    saveConfig({ mode: 'paper', enabled: true });
+    saveConfig({ mode: 'paper', enabled: true }, { tier: 'operator', source: 'bot-start' });
     log(`🔒 LIVE → PAPER on start — ${gate.reason}`, 'system', { edgeGate: gate });
   } else {
-    saveConfig({ enabled: true });
+    saveConfig({ enabled: true }, { tier: 'operator', source: 'bot-start' });
   }
   botState.running = true;
   botState._startTime = Date.now();
@@ -3578,7 +3655,7 @@ export function stopBot(options = {}) {
     };
   }
   botState.running = false;
-  saveConfig({ enabled: false });
+  saveConfig({ enabled: false }, { tier: 'operator', source: 'bot-stop' });
   if (botState.interval) { clearInterval(botState.interval); botState.interval = null; }
   const session = completeSession(options?.reason || (immediate ? 'immediate' : 'stopped'));
   botState.stopRequest = null;
@@ -3613,7 +3690,7 @@ export function restoreConfigSession(id) {
   });
   botState.configStore = normalizeConfigStore(row.configStore, flatDefaults());
   syncConfigFromStore();
-  saveConfig({});
+  saveConfig({}, { tier: 'system', source: 'persist-touch' });
   log(`↩️ CONFIG RESTORED · ${row.label} · ${row.mode}`, 'system', { configSessionId: id });
   return { ok: true, restored: row, config: botState.config };
 }
@@ -3648,7 +3725,8 @@ export function resetPaperData({ initialDeposit = 100 } = {}) {
   persistSync(FILES.POSITIONS, botState.positions);
   persistSync(FILES.ACTIONS, botState.actions);
   resetGovernorPeak('paper');
-  saveConfig({ mode: 'paper', enabled: false, paperBankroll: amount, paperInitialDeposit: amount });
+  saveConfig({ mode: 'paper', enabled: false, paperBankroll: amount, paperInitialDeposit: amount },
+    { tier: 'operator', source: 'reset-paper' });
   refreshKellyHistory();
   log(`♻️ PAPER DATA RESET · $${amount.toFixed(2)} initial · removed ${removed.trades} trades`, 'system', removed);
   notifyStateChange();
@@ -3718,7 +3796,7 @@ export function resetLiveData({ baselineUsd = null } = {}) {
     ?? 0,
   );
   const baseline = saveBaseline(cash, 'Live account normalized — clean slate');
-  saveConfig({ mode: 'live', enabled: false });
+  saveConfig({ mode: 'live', enabled: false }, { tier: 'operator', source: 'reset-live' });
   refreshKellyHistory();
   log(
     `♻️ LIVE DATA RESET · baseline $${Number(baseline.balanceUsd).toFixed(2)} · removed ${removed.trades} trades (${removed.phantomTrades} phantom)`,

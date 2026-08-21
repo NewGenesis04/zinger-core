@@ -5,6 +5,7 @@
  * Everything else lives under profiles.paper / profiles.live.
  */
 
+import { normalizeAttribution } from './config/attribution.js';
 export const SHARED_KEYS = new Set([
   'mode',
   'enabled',
@@ -236,6 +237,8 @@ export function normalizeConfigStore(raw, defaultsFlat = {}) {
     paperBankroll: Number(base.paperBankroll ?? base.paperInitialDeposit ?? 100),
     paperInitialDeposit: Number(base.paperInitialDeposit ?? 100),
     profiles: { paper, live },
+    // Carried through load, or this record resets on every restart (D3 · C).
+    attribution: normalizeAttribution(raw?.attribution),
   };
 }
 
@@ -262,6 +265,8 @@ export function applyConfigPatch(store, patch = {}, opts = {}) {
     enabled: !!store.enabled,
     paperBankroll: store.paperBankroll,
     paperInitialDeposit: store.paperInitialDeposit,
+    // Preserved, never written here — saveConfig stamps it from the diff.
+    attribution: store.attribution,
     profiles: {
       paper: { ...(store.profiles?.paper || defaultPaperStrategy()) },
       live: { ...(store.profiles?.live || defaultLiveStrategy()) },
