@@ -908,7 +908,25 @@ Fix: apply the $0.50 shortcut only when both legs of the same `packageId` are
 present and settling together; otherwise resolve the leg against the real binary
 outcome, or exit at market.
 
-### 9. PENDING_FILL packages are never reconciled
+### 9. PENDING_FILL packages are never reconciled ✅ FIXED
+
+*Fixed 2026-08-20 (`23ebc41`), together with item 10 — either alone still leaks
+a slot.* `reconcilePendingPackages` runs from the scan loop and at boot.
+
+Fills are derived from positions and trades, **not** from `legs.*.filled`. Those
+flags are written *after* dispatch, so on exactly the interrupted path this
+repairs they still read `false` while the fill is real — trusting them would
+abort an intact hedge and discard live positions. A 120s age interlock keeps it
+away from packages still dispatching.
+
+**The pending invariant did not flip, and was right not to.** It asserted that
+`getActivePackages` alone excludes stale packages — which frees the slot while
+leaving the naked leg in place. Capacity restored, exposure hidden. Rewritten to
+assert the real property.
+
+---
+
+*Original write-up:*
 
 Observed 2026-08-18: `pkg-btc-msyglw8m` sat at `PENDING_FILL` with both legs
 recorded `filled: false`, while the UP leg existed as a live position and no
@@ -926,7 +944,18 @@ Fix: on boot, reconcile every `PENDING_FILL` package against positions/trades �
 promote to `LOCKED` when both legs are present, `ABORT` + unwind when partial,
 discard when neither filled.
 
-### 10. Package settlement only runs when someone is watching
+### 10. Package settlement only runs when someone is watching ✅ FIXED
+
+*Fixed 2026-08-20 (`23ebc41`).* Settlement moved off the read path into
+`arbHousekeeping()`, called from the scan loop and once at boot. `getState()` no
+longer transitions anything, and a source-level invariant asserts it.
+
+This is why `maxArbPackages` was raised to 40 as a workaround — capacity that
+cannot drain looks like capacity that is too small.
+
+---
+
+*Original write-up:*
 
 `syncPackageSettlements` is the only thing that moves a package `LOCKED →
 SETTLED`, and it is called from exactly one place: inside `getState()`
@@ -1599,9 +1628,13 @@ Written so a fresh session can continue without re-deriving any of the above.
 
 ### Where things stand
 
-**Slices 0 and 1 are complete and committed, plus items 27 and 7 out of
-slice 3** — branch `refactor/slice-0-safety-net`, 12 commits off `main`.
-`npm run ci` is green: 91 unit + 4 perf, 1 todo.
+**Slices 0 and 1 are complete, plus the behavioural half of slice 3** — items
+7, 9, 10, 25 and 27 are fixed. Branch `refactor/slice-0-safety-net`, 18 commits
+off `main` (clean fast-forward — `main` has not moved). `npm run ci` is green:
+96 unit + 4 perf, 1 todo.
+
+*The branch name is now wrong* — it carries slices 0 and 1 plus five arb fixes.
+Worth landing on `main` rather than growing further.
 
 | Slice-1 step | State |
 |---|---|
@@ -1690,24 +1723,25 @@ The remaining live arb defects, in the order they cost the most:
 
 | Item | What it does now | Why it matters |
 |---|---|---|
-| **10** | packages settle only while a dashboard is open | capacity never drains, so arb halts once the cap fills |
-| **9** | no boot reconciliation of `PENDING_FILL` | one stuck package holds a slot forever |
 | **8** | a naked leg settles at a fabricated $0.50 | item 27 removed the main *source* of naked legs; this is the valuation that made them profitable on paper |
 | **24** | `resetPaperData` orphans packages from trades | any `arbMetrics` figure spanning a reset is unreliable |
 | **11** | orphan settle assumes every window is 5m | a 15m directional position sells ~10 min early |
 
-**Item 10 is the one to take next.** With 7 and 27 fixed, no remaining defect
-loses money — they misreport it or leak capacity. Item 10 is the capacity leak
-and the only one that stops the bot trading outright: settlement runs solely as
-a side effect of `getState()`, so with no dashboard open packages never leave
-`LOCKED` and arb halts once `maxArbPackages` fills. Item 9 is its natural
-companion (a stuck `PENDING_FILL` holds a slot nothing can clear), and both are
-prerequisites for arb concurrency meaning anything.
+**Every behavioural arb defect is now closed.** Items 7, 9, 10, 25 and 27 are
+fixed; what remains misreports or is structural:
 
-Item 8 dropped in urgency: item 27 removed the mechanism that *manufactured*
-naked legs, so it is now a valuation cleanup rather than an active corruption —
-though it still needs `positions/settle.ts` to be testable, which is why its
-invariant remains an `it.todo`.
+| Item | Nature |
+|---|---|
+| 8 | valuation — a naked leg settles at $0.50. Item 27 removed the mechanism that *manufactured* naked legs and 9 unwinds the stranded ones, so this is cleanup now. Still needs `positions/settle.ts` to be testable, which is why its invariant is an `it.todo`. |
+| 11 | orphan settle assumes every window is 5m, so a 15m *directional* position sells ~10 min early. Arb legs are unaffected. |
+| 24 | `resetPaperData` orphans packages from trades. Item 7 blunted the damage — the `lockedProfitUsd` fallback is net now — but the mechanism stands. |
+| 26 | entry-gate thresholds ignore every writer. Needs the D3 resolver. |
+| 19, 28 | live caps and auto-approve. Real, but inert until the mode switch, and D11 does not exist yet. |
+
+**So slice 2 is next** — the shared layer. That is where 26 lands, along with the
+two remaining cash writers from item 23, `portfolioView()`, and items 3/4/5.
+Items 8 and 11 belong to slice 3 with the D4 settlement work, which is what makes
+them expressible as fixture tests at all.
 
 Then slice 2. Three things are queued for it specifically:
 
