@@ -1470,6 +1470,79 @@ fallback, and have the resolver report which tier supplied each threshold. Note
 the reversal is a behaviour change on a live gate, so it belongs with the config
 resolver in slice 2 rather than as a one-line flip now.
 
+**✅ FIXED 2026-08-21 (slice 2).** New `config/resolver.ts` holds the D3 tier
+ordering; `resolveEntryWindows` resolves through it.
+
+One correction to the diagnosis above. The item says the floor in force is
+"whatever `trainFundHeuristics.ts:70` derived from win rate". It is not — there
+is no trained policy at all. `loadFundHeuristics()` returns a store whose
+`durationPolicies` is **null**, so `merged` is `{...DURATION_ENTRY_DEFAULTS[dur]}`
+and the winning value was a *hardcoded constant*, not a learned one. Measured
+before the fix, with the operator's real paper profile (`minConfidence: 0.5`):
+
+```
+signal 36%  eligible=false  "confidence 36% < 38% (prior)"
+signal 42%  eligible=TRUE   "signal UP 42%"     <- operator floor was 50%
+signal 49%  eligible=TRUE   "signal UP 49%"     <- operator floor was 50%
+```
+
+After:
+
+```
+signal 42%  eligible=false  "confidence 42% < 50% (cfg.minConfidence)"
+signal 49%  eligible=false  "confidence 49% < 50% (cfg.minConfidence)"
+```
+
+The reason string now names the winning tier, which is the D3 attribution gate
+landing where an operator will actually see it.
+
+Two supporting changes:
+
+- `heuristicForTrade` gained `trained` / `trainedStratum` — the **un-merged**
+  policy. Additive; no existing field changed. Without it a caller cannot tell a
+  learned value from a prior, and that conflation *was* the bug.
+- `resolveEntryWindows` returns `resolved.<field>` with `{ value, tier, source,
+  overrode }` per threshold.
+
+Scope held deliberately: only the precedence changed. The duration scoping of
+each key is untouched — see item 30.
+
+### 30. The bare entry-window keys apply to 5m only
+
+Found 2026-08-21 while fixing item 26, and deliberately **not** fixed with it.
+
+`resolveEntryWindows` honours the generic `cfg.maxEntryRemainingSec` and
+`cfg.minRemainingSec` only when the duration is 5m — originally
+`dur === '5m' ? cfg.maxEntryRemainingSec : null` (`fundHeuristics.ts:139,145`),
+preserved through the item 26 rewrite. `cfg.minConfidence` has no such guard and
+applies to every duration. The asymmetry is undocumented.
+
+So on a 15m market the operator's entry-timing settings do nothing, and the only
+way to reach them is the suffixed form (`maxEntryRemainingSec_15m`), which is
+**not in `STRATEGY_KEYS`** (`modeConfig.ts:25`). It is still writable — the
+`applyConfigPatch` unknown-key branch stashes it on the active profile
+(`modeConfig.ts:285-287`) — but nothing surfaces it, so in practice 15m entry
+timing is unconfigurable.
+
+Why not fixed inline: the stored `maxEntryRemainingSec` is **270**, a 5m-shaped
+number (270 of a 300s window). Applying it to 15m would cut that entry window
+from 800s to 270s and throttle 15m entries. That is a trading change, not a
+precedence fix, and it needs a decision rather than a patch.
+
+Two clean options:
+
+- **Per-duration keys, surfaced.** Add the four suffixed keys per field to
+  `STRATEGY_KEYS` and the UI, and drop the bare keys for timing. Explicit, more
+  fields to manage.
+- **Fractional keys.** Express the window as a fraction of the duration
+  (`entryWindowFrac: 0.9`), so one operator number scales across 5m/15m/4h. Fewer
+  knobs, and it matches how the priors were actually derived — 270/300 = 0.90,
+  800/900 = 0.89, 1600/1800 = 0.89, 3200/3600 = 0.89. The priors are the *same
+  fraction* at every duration, which is strong evidence this is the right shape.
+
+Recommend the second. Either way it wants the same treatment as item 26: measure
+the entry-rate change on paper before adopting it.
+
 ### 27. A refused arb leg is recorded as filled, so the rollback never runs ✅ FIXED
 
 *Fixed 2026-08-20 (`d075393`), promoted out of slice 3 because it was writing
