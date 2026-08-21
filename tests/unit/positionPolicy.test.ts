@@ -271,16 +271,16 @@ describe('INVARIANT: shared position code holds zero strategy conditionals (D4)'
     expect(code).not.toMatch(/===\s*'arb'/);
   });
 
-  it('leaves bot.ts no mid-window exit conditional of its own', () => {
+  it('leaves bot.ts zero strategy conditionals of its own (D4)', () => {
     const code = read('bot.ts').replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
     // The five spellings that used to gate exits, drawdown, trim and repair.
     expect(code).not.toMatch(/pos\.packageId \|\| pos\.isArbLeg/);
     expect(code).not.toMatch(/op\.packageId \|\| op\.isArbLeg/);
     expect(code).not.toMatch(/!p\.packageId && !p\.isArbLeg/);
-    // Item 8's settle branch is the one remaining conditional, scheduled for
-    // slice 3. If this count changes, a new one was added.
+    // Item 8's settle branch was the final remaining conditional in bot.ts.
+    // Now resolved through positions/settle.ts with zero strategy conditionals.
     const remaining = code.match(/\b(?:pos|p|op)\.isArbLeg\b/g) || [];
-    expect(remaining).toHaveLength(1);
+    expect(remaining).toHaveLength(0);
   });
 
   it('routes capacity through the policy, not an inline ternary', () => {

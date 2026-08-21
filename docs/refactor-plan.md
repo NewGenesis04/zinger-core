@@ -884,7 +884,19 @@ described above also read as *winners* in paper cash, which is why the paper
 record could not be used to detect this item in the first place. Item 24
 compounds it further for orphaned packages.
 
-### 8. A surviving single leg settles at a fabricated $0.50
+### 8. A surviving single leg settles at a fabricated $0.50 ✅ FIXED
+
+*Fixed 2026-08-21 (slice 3 foundation).* Created `src/polymarket/positions/settle.ts`
+owning settlement pricing. Settle price resolution checks whether the hedge is intact
+(`isHedgeIntact`). If both legs are open and settling together, they redeem $0.50 each
+($1.00 full set). If a leg is naked, it resolves strictly against the real market outcome
+(`resolveMarketWinner` via PTB or Gamma resolution): $1.00 if it won, $0.00 if it lost,
+and never a fabricated $0.50. Tested in `tests/unit/settle.test.ts` and pinned with permanent
+invariants in `tests/unit/invariants.test.ts`. Leaves `bot.ts` with 0 strategy conditionals (D4).
+
+---
+
+*Original write-up:*
 
 `bot.ts:3985` collapses any arb leg to $0.50 on settle:
 
@@ -979,7 +991,16 @@ read path. A read-path side effect is the underlying smell.
 See also the stale `PENDING_FILL` case, now observed in production and written
 up separately above.
 
-### 11. Orphan settle assumes every window is 5 minutes
+### 11. Orphan settle assumes every window is 5 minutes ✅ FIXED
+
+*Fixed 2026-08-21.* `positionWindowEndMs` in `positions/settle.ts` resolves
+window end timestamps via `parseSlugWindow(pos.slug)`, correctly handling
+5m (300s), 15m (900s), 30m (1800s), 1h (3600s), and 4h (14400s). `bot.ts`
+orphan settlement loop now calls `positionWindowEndMs(pos)`.
+
+---
+
+*Original write-up:*
 
 `bot.ts:2312` computes window end as `slugTs + POLY_WINDOW_SECONDS` with the
 constant hardcoded to 300, ignoring the position's actual duration. A 15m

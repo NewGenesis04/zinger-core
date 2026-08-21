@@ -13,6 +13,7 @@ import { tradeNetPnl, tradeFeesPaid, tradeRealizedPnl, tradeEngine } from '../..
 import { computeRecentExpectancy, evaluateEdgeGate } from '../../src/polymarket/edge.js';
 import { normalizeConfigStore, defaultLiveStrategy } from '../../src/polymarket/modeConfig.js';
 import { booksCash, createPaperCashLedger, roundCash } from '../../src/polymarket/ledger/cash.js';
+import { resolveSettlementPrice } from '../../src/polymarket/positions/settle.js';
 
 /**
  * Slice-0 invariants — the ones that hold today.
@@ -1216,4 +1217,66 @@ describe('INVARIANT: arb engine never imports bot.js dynamically (Item 29)', () 
     expect(src).not.toMatch(/import\s*\(\s*['"]\.\/bot\.js['"]\s*\)/);
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+describe('INVARIANT: settlement valuation resolves naked legs vs real outcome (Item 8)', () => {
+  const upLeg = {
+    id: 'pos-up-1',
+    packageId: 'pkg-arb-test',
+    outcome: 'up',
+    isArbLeg: true,
+    entryPrice: 0.23,
+    currentPrice: 0.25,
+    closed: false,
+  };
+  const downLeg = {
+    id: 'pos-down-1',
+    packageId: 'pkg-arb-test',
+    outcome: 'down',
+    isArbLeg: true,
+    entryPrice: 0.74,
+    currentPrice: 0.72,
+    closed: false,
+  };
+
+  it('settles intact pairs at exactly $0.50 per leg ($1.00 full set)', () => {
+    const upRes = resolveSettlementPrice({
+      pos: upLeg,
+      openPositions: [upLeg, downLeg],
+      market: { winner: 'down' },
+    });
+    expect(upRes.price).toBe(0.50);
+    expect(upRes.isPairSettled).toBe(true);
+
+    const downRes = resolveSettlementPrice({
+      pos: downLeg,
+      openPositions: [upLeg, downLeg],
+      market: { winner: 'down' },
+    });
+    expect(downRes.price).toBe(0.50);
+    expect(downRes.isPairSettled).toBe(true);
+  });
+
+  it('settles a naked arb leg against real market outcome, never fabricated $0.50', () => {
+    // Backlog item 8: a single surviving arb leg must not receive a free $0.50.
+    // When market resolved DOWN, the naked UP leg settles at $0.00 (loss).
+    const lossRes = resolveSettlementPrice({
+      pos: upLeg,
+      openPositions: [upLeg], // no sibling
+      market: { winner: 'down' },
+    });
+    expect(lossRes.price).toBe(0.00);
+    expect(lossRes.isPairSettled).toBe(false);
+
+    // When market resolved UP, the naked UP leg settles at $1.00 (win).
+    const winRes = resolveSettlementPrice({
+      pos: upLeg,
+      openPositions: [upLeg], // no sibling
+      market: { winner: 'up' },
+    });
+    expect(winRes.price).toBe(1.00);
+    expect(winRes.isPairSettled).toBe(false);
+  });
+});
+
 

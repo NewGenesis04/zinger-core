@@ -90,18 +90,6 @@ describe('PENDING INVARIANT: operator settings are never silently overwritten', 
   });
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-describe('PENDING INVARIANT: settlement valuation depends on the sibling leg', () => {
-  // Backlog item 8. `bot.ts` collapses any arb leg to $0.50 on settle, testing
-  // isArbLeg on the position and never whether the sibling still exists. A leg
-  // left alone books shares x (0.50 - entry) regardless of the real outcome —
-  // observed as a fabricated +$2.99 on pkg-btc-msyglw8m, which is still stuck
-  // in production as of 2026-08-20.
-  //
-  // executeSell is not exported; slice 3 moves settlement valuation to
-  // `positions/settle.ts` behind the D4 policy interface, which is what makes
-  // this expressible as a fixture test.
-  it.todo('settles a naked arb leg against the real outcome, not $0.50 — needs positions/settle.ts (slice 3)');
-});
+
 
 

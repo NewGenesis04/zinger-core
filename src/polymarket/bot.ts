@@ -71,6 +71,7 @@ import {
   portfolioView as buildPortfolioView,
 } from './positions/manager.js';
 import { holdsToSettlement, capacityFor } from './positions/policy.js';
+import { resolveSettlementPrice, positionWindowEndMs } from './positions/settle.js';
 import { evaluateEdgeGate, passesEdgeFilter } from './edge.js';
 import { buildDecision, resolveOrderSize, sideBalanceBonus } from './engines/directional.js';
 import { recordTradeSample } from './heuristics/tradeCollector.js';
@@ -2123,10 +2124,7 @@ async function scan() {
       const nowMs = Date.now();
       for (const pos of [...botState.positions]) {
         if (pos.closed || pos.mode !== 'paper') continue;
-        const slugTs = Number(String(pos.slug || '').split('-').pop());
-        const windowEndMs = Number.isFinite(slugTs) && slugTs > 1e9
-          ? (slugTs + POLY_WINDOW_SECONDS) * 1000
-          : null;
+        const windowEndMs = positionWindowEndMs(pos);
         if (windowEndMs == null || nowMs < windowEndMs + 5000) continue;
         try {
           const result = await executeSell(pos, 'settle');
@@ -3811,8 +3809,17 @@ async function executeSell(pos, reason = 'manual') {
   if (!pos || pos.closed) return { ok: false, error: 'Position not found or already closed' };
 
   let price = pos.currentPrice || pos.entryPrice;
-  if (reason === 'settle' && pos.mode === 'paper' && pos.isArbLeg) {
-    price = 0.50; // Guaranteed $1.00 payout distributed evenly across the 2 hedge legs
+  if (reason === 'settle' && pos.mode === 'paper') {
+    const market = (botState.markets || []).find((m) => m.slug === pos.slug || m.conditionId === pos.conditionId);
+    const ptb = market?.priceToBeatMeta;
+    const res = resolveSettlementPrice({
+      pos,
+      openPositions: botState.positions,
+      market,
+      ptb,
+      finalPrice: pos.currentPrice,
+    });
+    price = res.price;
   }
 
   markPosition(pos, price);
