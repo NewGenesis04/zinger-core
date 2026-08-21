@@ -1693,52 +1693,13 @@ does, that is a ramp decision and belongs behind the confidence-driven sizing of
 D11, not a default. Until then treat `autoApproveLive` as the single most
 dangerous field in the config.
 
-### 29. The arb rollback's cash fallback silently credits nothing
+### 29. The arb rollback's cash fallback silently credits nothing ✅ FIXED
 
-Found 2026-08-21 while giving paper cash one owner (slice 2, D5).
+*Fixed 2026-08-21.* The dead dynamic import fallback in `unwindLeg` was deleted.
+`adjustPaperCash` is invoked directly when injected as a function dependency.
+An invariant in `tests/unit/invariants.test.ts` asserts that `arbEngine.ts` contains
+zero dynamic imports of `bot.js`.
 
-`unwindLeg` refunds the premium when a package is rolled back. If
-`adjustPaperCash` was not injected it falls back to a dynamic import
-(`arbEngine.ts:332-338`):
-
-```js
-const mod = (await import('./bot.js').catch(() => null)) as unknown as {
-  adjustPaperCash?: (amount: number, note: string) => void;
-} | null;
-if (mod?.adjustPaperCash) mod.adjustPaperCash(refund, `ROLLBACK …`);
-```
-
-**`bot.ts` does not export `adjustPaperCash`.** It is a plain
-`function adjustPaperCash` with no `export` keyword; the module's only
-cash-related export is `resetPaperData`, confirmed by enumerating the live
-module:
-
-```
-$ npx tsx -e "import('./src/polymarket/bot.js').then(m =>
-    console.log(Object.keys(m).filter(k => /cash|Cash|paper|Paper/.test(k))))"
-[ 'resetPaperData' ]
-```
-
-So `mod?.adjustPaperCash` is `undefined`, the `if` fails, and the branch is a
-**silent no-op** — the unwind marks the position closed, books the fee loss, and
-never returns the premium to cash. The optional-chaining and the `.catch(() =>
-null)` mean nothing throws and nothing logs.
-
-Not currently reachable: both production call sites inject the function
-(`bot.ts:487` in `arbHousekeeping`, `bot.ts:2304` in the scan path). But it is
-*armed* — `reconcilePendingPackages` declares `adjustPaperCash = null` as its
-default (`arbEngine.ts:381`) and forwards it to `unwindLeg` (`arbEngine.ts:430`),
-so any future caller that omits the dep loses real premium with no error. A test
-double that omits it would also pass while silently skipping the refund.
-
-This is precisely the failure mode D5's single-owner rule exists to prevent: a
-second, broken path to the same piece of state, guarded by a truthiness check
-that reads as defensive and is in fact load-bearing-and-wrong.
-
-Fix is a deletion, not a repair — delete the fallback and let the dep be
-required. Deferred rather than done inline because it changes behaviour on an
-error path in the arb engine. Recorded as a pending invariant in
-`invariants.pending.test.ts`.
 
 ---
 

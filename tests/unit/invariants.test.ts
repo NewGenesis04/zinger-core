@@ -1200,3 +1200,20 @@ describe('INVARIANT: bot.ts holds no cash logic of its own', () => {
     expect(assignments).toHaveLength(1);
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+describe('INVARIANT: arb engine never imports bot.js dynamically (Item 29)', () => {
+  const src = fs.readFileSync(
+    path.resolve(__dirname, '../../src/polymarket/arbEngine.ts'),
+    'utf8',
+  );
+
+  it('contains no dynamic imports of bot.js', () => {
+    // Backlog item 29. unwindLeg fell back to dynamic import of bot.ts for adjustPaperCash,
+    // which was never exported and thus became a silent no-op.
+    // Clean boundaries (D5, D7, D10) require that arbEngine receives dependencies directly
+    // and never reaches back into bot.ts.
+    expect(src).not.toMatch(/import\s*\(\s*['"]\.\/bot\.js['"]\s*\)/);
+  });
+});
+

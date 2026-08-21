@@ -325,17 +325,9 @@ async function unwindLeg({ outcome, pkg, market, mode, cfg, botState, log, adjus
   // Sold back at the price it was bought at, so the only loss is the two fees.
   pos.pnl = Math.round(-(entryFee + exitFee) * 100) / 100;
 
-  if (mode === 'paper') {
+  if (mode === 'paper' && typeof adjustPaperCash === 'function') {
     const refund = Math.round((pack.premium - exitFee) * 100) / 100;
-    if (adjustPaperCash) {
-      adjustPaperCash(refund, `ROLLBACK ${pos.symbol} ${outcome.toUpperCase()}`);
-    } else {
-      // Fallback if not injected directly (typed loosely — dynamic import to avoid a cycle)
-      const mod = (await import('./bot.js').catch(() => null)) as unknown as {
-        adjustPaperCash?: (amount: number, note: string) => void;
-      } | null;
-      if (mod?.adjustPaperCash) mod.adjustPaperCash(refund, `ROLLBACK ${pos.symbol} ${outcome.toUpperCase()}`);
-    }
+    adjustPaperCash(refund, `ROLLBACK ${pos.symbol} ${outcome.toUpperCase()}`);
   }
 
   if (saveTrade) {
