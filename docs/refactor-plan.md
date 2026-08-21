@@ -1396,7 +1396,43 @@ fallback, and have the resolver report which tier supplied each threshold. Note
 the reversal is a behaviour change on a live gate, so it belongs with the config
 resolver in slice 2 rather than as a one-line flip now.
 
-### 27. A refused arb leg is recorded as filled, so the rollback never runs
+### 27. A refused arb leg is recorded as filled, so the rollback never runs ✅ FIXED
+
+*Fixed 2026-08-20 (`d075393`), promoted out of slice 3 because it was writing
+false history on every refusal rather than lying dormant.* `executeArbLeg` now
+reads `res?.ok === true`.
+
+Fixing the coercion made `unwindLeg` reachable **for the first time**, so it was
+corrected in the same commit — routing traffic into a never-exercised path is
+the `cccce43` failure mode. Two defects were waiting there:
+
+- It **refunded the entry fee**, modelling the round trip as free. A rollback is
+  a taker buy plus a taker sell. (`arb_rollback` is correctly absent from
+  `FEE_FREE_EXIT_REASONS` — unlike settlement, which genuinely is free.)
+- It **closed the position without recording a trade**, so the close was
+  invisible to history. `saveTrade` was already destructured in the module
+  signature and never called: the author's intent, never wired.
+
+Those two are one change. The cash reconciler derives realized P/L from
+`feesPaid` (item 23), so recording the trade while still refunding the fee would
+put the ledger and the recompute exactly one fee apart. Verified reconciling on
+all four dispatch paths.
+
+**The green suite was complicit.** Several arb tests stubbed `executeTrade` as
+`async () => true` — a bare boolean the real `executePendingTrade` never
+returns. Under the truthiness bug those stubs behaved identically to a real
+fill, so the defect was invisible. One test asserted
+`expect(positions[0].pnl).toBe(0)` on a rollback, freezing the fee-blind refund
+as correct. Both are the characterization-test failure mode this document opens
+with, found only because the *invariant* suite disagreed with them.
+
+Three invariants promoted from `invariants.pending.test.ts`. The `it.fails()`
+mechanism worked exactly as designed: the file went red with "expected to fail
+but passed" the moment the defect died.
+
+---
+
+*Original write-up:*
 
 Found 2026-08-20 while decoupling the slot budgets (D5). **This is the most
 consequential item on the list** — it manufactures the artifacts items 8, 9 and
@@ -1469,9 +1505,9 @@ Written so a fresh session can continue without re-deriving any of the above.
 
 ### Where things stand
 
-**Slices 0 and 1 are complete and committed** — branch
-`refactor/slice-0-safety-net`, 10 commits off `main`. `npm run ci` is green:
-82 unit + 4 perf, 1 todo.
+**Slices 0 and 1 are complete and committed, plus item 27 out of slice 3** —
+branch `refactor/slice-0-safety-net`, 11 commits off `main`. `npm run ci` is
+green: 84 unit + 4 perf, 1 todo.
 
 | Slice-1 step | State |
 |---|---|
@@ -1502,10 +1538,6 @@ Written so a fresh session can continue without re-deriving any of the above.
   `session_perf` is already intact (200 = 200), so this is cleanup of 13 stale
   JSON files, not recovery.
 - **Items 24 and 25** are filed, not fixed. Both are slice 3.
-- **Item 27** is filed, not fixed, and is the sharpest open defect: a refused
-  arb leg is recorded as filled, so the rollback never runs. It writes false
-  history on every refusal and blocks going live. Consider promoting it ahead of
-  the rest of slice 3.
 - **Item 26** is filed, not fixed — the entry-gate thresholds ignore operator,
   governor and optimizer alike. Slice 2, with the D3 config resolver, because
   reversing the precedence changes a live gate.
@@ -1552,33 +1584,27 @@ Written so a fresh session can continue without re-deriving any of the above.
 
 ### Suggested next step — an open question, not a task
 
-**Slice 1 is done.** The next scheduled work is slice 2 (shared layer). But
-slice 1 turned up item 27, and it is worth deciding explicitly whether to take
-it out of order rather than defaulting to the plan.
+**Slice 1 is done, and item 27 was promoted out of slice 3 and fixed** — it was
+writing false history on every refusal, not lying dormant, so leaving it to sit
+while the paper run generated evidence would have poisoned the evidence.
 
-The case for promoting it: it is not a latent defect. Every refused arb leg —
-capacity, cash, or a live order failure — is recorded as a fill *right now*,
-writing packages that never existed into the record the whole plan depends on
-for evidence (D6: "the bot must keep paper trading… it is the only regression
-detector"). It also blocks D11 dimension 1 outright, since in live mode the
-one-leg case is unhedged money believed hedged. And it is a small fix: return
-`res?.ok === true`, with three pending invariants already in place to catch it.
+The remaining live arb defects, in the order they cost the most:
 
-The case for leaving it in slice 3: D6 sequences arb last deliberately, so the
-only working strategy and only data generator stays untouched longest. Its
-frequency has already dropped sharply now that the D5 split removed the
-`'max open positions'` refusal that was firing it.
+| Item | What it does now | Why it matters |
+|---|---|---|
+| **7** | takes arb below the fee break-even | the strategy loses money on purpose; `minArbGap` is a flat threshold where break-even is `2 × rate × p(1−p)` — 3.5% at 50/50, 1.26% at 0.10/0.90 |
+| **10** | packages settle only while a dashboard is open | capacity never drains, so arb halts once the cap fills |
+| **9** | no boot reconciliation of `PENDING_FILL` | one stuck package holds a slot forever |
+| **8** | a naked leg settles at a fabricated $0.50 | item 27 removed the main *source* of naked legs; this is the valuation that made them profitable on paper |
+| **24** | `resetPaperData` orphans packages from trades | any `arbMetrics` figure spanning a reset is unreliable |
+| **11** | orphan settle assumes every window is 5m | a 15m directional position sells ~10 min early |
 
-**Two decisions the operator should make, independent of the above:**
-
-1. **`maxArbPackages: 40` on the VPS is now load-bearing.** It was raised as an
-   item 10 workaround while `maxOpenPositions: 4` silently capped arb at two
-   packages. With the budgets decoupled, 40 means 40 — up to 80 open legs,
-   bounded thereafter only by paper cash. That is probably not the intended
-   risk limit; pick a deliberate number.
-2. **Item 10 is still unfixed**, so packages only settle while a dashboard is
-   open. Higher arb concurrency plus a capacity that does not drain is the
-   combination that produced the original jam.
+**Item 7 is the one to take next.** It is the only remaining defect that loses
+real money by design rather than misreporting it, and the fee model it needs is
+already exact and verified (`fees.ts:80-88`, confirmed live against
+`{"r":0.07,"e":1,"to":true}`). Items 8 and 9 are cheaper but now less urgent:
+27 removed the mechanism that manufactured naked legs, so 8 is largely a
+valuation cleanup, and 9's live instance is a single stuck package.
 
 Then slice 2. Three things are queued for it specifically:
 
