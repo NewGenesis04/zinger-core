@@ -58,10 +58,10 @@ import {
   saveBaseline,
   normalizeTrade,
   tradeRealizedPnl,
-  tradeNetPnl,
   tradeCostBasis,
   tradeEngine,
 } from './audit.js';
+import { createPaperCashLedger } from './ledger/cash.js';
 import { evaluateEdgeGate, passesEdgeFilter } from './edge.js';
 import { buildDecision, resolveOrderSize, sideBalanceBonus } from './engines/directional.js';
 import { recordTradeSample } from './heuristics/tradeCollector.js';
@@ -293,59 +293,39 @@ function saveTrade(trade) {
 }
 
 /**
- * Rebuild paper spendable cash from initial + closed PnL − open cost (idempotent).
+ * Paper cash has one owner: `ledger/cash.ts` (D5).
  *
- * The identity this must satisfy (backlog item 23):
+ * This binding is the only place that couples the ledger to `botState`. The
+ * arithmetic and the write-decision both live in the module, which is the point
+ * — item 23 collapsed the formula but left two functions deciding *when* to
+ * write, and reconcile-overwrites-increment is precisely how the fee-refund bug
+ * stayed invisible.
  *
- *   cash = initial
- *        + Σ net realized P/L over closed trades      (gross − entry fee − exit fee)
- *        − Σ (cost basis + entry fee) over open positions
- *
- * Both fee terms used to be missing, so this function silently refunded every
- * fee the incremental ledger (`adjustPaperCash`) had correctly charged — and
- * because it recomputes from scratch and overwrites, it always won. Measured on
- * production before the fix: it would have moved cash $100.70 → $102.66, a
- * phantom gain exactly equal to fees paid.
- *
- * Realized P/L is recomputed from primitives via `tradeNetPnl` rather than read
- * from `trade.pnl`, because records written before this fix carry a *gross*
- * `pnl` and nothing marks them as such. Recomputing makes the ledger correct
- * for existing history with no migration.
+ * The three wrappers below exist so ~20 existing call sites keep working. They
+ * hold no logic. Do not add any: put it in the ledger.
  */
+const paperCash = createPaperCashLedger({
+  readBalance: () => botState.config.paperBankroll,
+  readInitial: () => botState.config.paperInitialDeposit ?? 100,
+  readBooks: () => ({ trades: botState.trades, positions: botState.positions }),
+  writeBalance: (next) => {
+    botState.config.paperBankroll = next;
+    saveConfig({ paperBankroll: next });
+  },
+  isPaper: () => botState.config.mode === 'paper',
+  log: (msg, level) => log(msg, level),
+});
+
 function paperBooksCash() {
-  const initial = Number(botState.config.paperInitialDeposit ?? 100);
-  const paperTrades = dedupeTrades(botState.trades).filter((t) => t.mode === 'paper');
-  const realized = paperTrades.reduce((s, t) => s + tradeNetPnl(t), 0);
-  const openCost = botState.positions
-    .filter((p) => !p.closed && p.mode === 'paper')
-    // The entry fee left the account with the premium, so it is part of what an
-    // open position has tied up.
-    .reduce((s, p) => s + Number(p.costBasis || p.size || 0) + Number(p.entryFee || 0), 0);
-  return Math.round((initial + realized - openCost) * 100) / 100;
+  return paperCash.books();
 }
 
 function reconcilePaperCash(reason = 'reconcile') {
-  if (botState.config.mode !== 'paper') return null;
-  const next = paperBooksCash();
-  const prev = Number(botState.config.paperBankroll ?? initial);
-  if (Math.abs(prev - next) < 0.01) return prev;
-  botState.config.paperBankroll = next;
-  saveConfig({ paperBankroll: next });
-  log(`💵 PAPER CASH reconcile $${prev.toFixed(2)} → $${next.toFixed(2)} · ${reason}`, 'system');
-  return next;
+  return paperCash.reconcile(reason);
 }
 
-/** Paper cash ledger — spendable bankroll in config.paperBankroll */
 function adjustPaperCash(delta, reason = '') {
-  if (botState.config.mode !== 'paper') return null;
-  const current = Number(botState.config.paperBankroll ?? botState.config.paperInitialDeposit ?? 100);
-  const next = Math.round((current + Number(delta || 0)) * 100) / 100;
-  botState.config.paperBankroll = next;
-  saveConfig({ paperBankroll: next });
-  if (reason) {
-    log(`💵 PAPER CASH ${delta >= 0 ? '+' : ''}${Number(delta).toFixed(2)} → $${next.toFixed(2)} · ${reason}`, 'system');
-  }
-  return next;
+  return paperCash.adjust(delta, reason);
 }
 
 /**

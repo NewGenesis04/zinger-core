@@ -1,3 +1,5 @@
+import fs from 'fs';
+import path from 'path';
 import { describe, expect, it, beforeEach } from 'vitest';
 import { detectAndExecuteArbPackage } from '../../src/polymarket/arbEngine.js';
 import { saveAllPackages, savePackage, getActivePackages } from '../../src/polymarket/arbPersistence.js';
@@ -100,4 +102,54 @@ describe('PENDING INVARIANT: settlement valuation depends on the sibling leg', (
   // `positions/settle.ts` behind the D4 policy interface, which is what makes
   // this expressible as a fixture test.
   it.todo('settles a naked arb leg against the real outcome, not $0.50 — needs positions/settle.ts (slice 3)');
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+describe('PENDING INVARIANT: a rolled-back leg always returns its premium to cash', () => {
+  // Backlog item 29. `unwindLeg` falls back to a dynamic import of bot.ts when
+  // `adjustPaperCash` is not injected (arbEngine.ts:332-338) — but bot.ts never
+  // exports it, so `mod?.adjustPaperCash` is undefined and the branch is a
+  // silent no-op. The position closes, the fee loss is booked, and the premium
+  // is never returned.
+  //
+  // Both production callers currently inject the dep, so this is unreachable
+  // today. It is armed, not live: reconcilePendingPackages defaults it to null
+  // (arbEngine.ts:381) and forwards it to unwindLeg (arbEngine.ts:430).
+  //
+  // The fix is to delete the fallback and require the dep.
+  it.fails('refunds the premium even when the cash writer is not injected', async () => {
+    const pkg = await detectAndExecuteArbPackage({
+      market: market(),
+      depth: { up: { bestAsk: 0.34 }, down: { bestAsk: 0.62 } },
+      prices: { up: 0.34, down: 0.62 },
+      cfg: cfg(),
+      mode: 'paper',
+      log: () => {},
+      // up fills, down refuses — forces the rollback path
+      executeTrade: async (t: any) => ({ ok: t.outcome === 'up' }),
+      botState: { config: {}, positions: [] },
+      saveTrade: () => {},
+      // adjustPaperCash deliberately NOT injected — the fallback should cover it
+    });
+
+    expect(pkg?.status).toBe('ABORTED');
+
+    // bot.ts exports no cash writer, so the fallback credited nothing. There is
+    // no observable refund to assert against — which is the defect: a caller
+    // cannot tell a completed refund from a skipped one.
+    //
+    // Checked statically rather than by importing bot.js: importing it costs ~2s
+    // and runs the sqlite legacy-JSON migration as a side effect, neither of
+    // which belongs in a unit suite. The fact asserted is identical — the
+    // fallback resolves `mod.adjustPaperCash` off this module's exports.
+    const botSrc = fs.readFileSync(
+      path.resolve(__dirname, '../../src/polymarket/bot.ts'),
+      'utf8',
+    );
+    expect(
+      /export\s+(async\s+)?function\s+adjustPaperCash\b/.test(botSrc)
+        || /export\s*\{[^}]*\badjustPaperCash\b/.test(botSrc),
+      "unwindLeg's fallback reads adjustPaperCash off bot.js — it is not exported",
+    ).toBe(true);
+  });
 });

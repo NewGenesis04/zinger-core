@@ -12,6 +12,7 @@ import { takerFeeUsdc, closeProceedsWithFee, FEE_RATES, arbBreakEvenGap } from '
 import { tradeNetPnl, tradeFeesPaid, tradeRealizedPnl, tradeEngine } from '../../src/polymarket/audit.js';
 import { computeRecentExpectancy, evaluateEdgeGate } from '../../src/polymarket/edge.js';
 import { normalizeConfigStore, defaultLiveStrategy } from '../../src/polymarket/modeConfig.js';
+import { booksCash, createPaperCashLedger, roundCash } from '../../src/polymarket/ledger/cash.js';
 
 /**
  * Slice-0 invariants — the ones that hold today.
@@ -294,9 +295,9 @@ describe('INVARIANT: cash reconciles to trades + fees + open cost', () => {
   // The recompute had no fee term and always overwrote, so it refunded every
   // fee. On production it would have moved cash $100.70 → $102.66.
   //
-  // The invariant is that the two agree. Tested over the primitives both are
-  // built from, since reconcilePaperCash is still an unexported internal of
-  // bot.ts (slice 2 moves it to ledger/cash.ts).
+  // The invariant is that the two agree. This block tests the primitives both
+  // are built from; the block below tests the real `ledger/cash.ts` writers now
+  // that slice 2 has moved them out of bot.ts.
 
   const trade = (over: any = {}) => ({
     mode: 'paper',
@@ -932,5 +933,204 @@ describe('INVARIANT: arb capacity drains without anyone watching', () => {
     expect(body).not.toMatch(/reconcilePendingPackages\s*\(/);
     // …and the scan loop must be the thing that does it.
     expect(src).toMatch(/await arbHousekeeping\('scan'\)/);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+describe('INVARIANT: paper cash has exactly one writer (D5)', () => {
+  // Slice 2, item 23's second half. The formula was already collapsed; what
+  // remained was two functions deciding WHEN to write. `reconcile` recomputes
+  // from scratch and overwrites, so whenever it disagreed with the incremental
+  // ledger it won silently — which is how the fee-refund bug stayed invisible
+  // ($100.70 → $102.66 on production, a phantom gain equal to fees paid).
+  //
+  // Unlike the block above, these bind to the real `ledger/cash.ts`, not to a
+  // re-implementation of it in the test.
+
+  /** A ledger over a mutable fake store, recording every write. */
+  const harness = (over: any = {}) => {
+    const store: any = {
+      paperBankroll: 100,
+      paperInitialDeposit: 100,
+      mode: 'paper',
+      trades: [],
+      positions: [],
+      ...over,
+    };
+    const writes: number[] = [];
+    const logs: string[] = [];
+    const ledger = createPaperCashLedger({
+      readBalance: () => store.paperBankroll,
+      readInitial: () => store.paperInitialDeposit,
+      readBooks: () => ({ trades: store.trades, positions: store.positions }),
+      writeBalance: (n: number) => { store.paperBankroll = n; writes.push(n); },
+      isPaper: () => store.mode === 'paper',
+      log: (m: string) => logs.push(m),
+    });
+    return { store, writes, logs, ledger };
+  };
+
+  const closedTrade = (id: string, over: any = {}) => ({
+    id,
+    mode: 'paper',
+    closed: true,
+    entryPrice: 0.4,
+    exitPrice: 0.55,
+    shares: 10,
+    entryFee: 0.168,
+    exitFee: 0.1485,
+    feesPaid: 0.3165,
+    ...over,
+  });
+
+  it('never refunds a fee the incremental ledger charged', () => {
+    // The actual regression, end to end. Buy 10 @ 0.40 paying a 0.168 entry
+    // fee, then reconcile. If the recompute omits the fee term it hands the
+    // 0.168 back, and cash lands at 96.00 instead of 95.83.
+    const h = harness();
+    h.ledger.adjust(-(4.0 + 0.168), 'BUY');
+    expect(h.ledger.balance()).toBeCloseTo(95.83, 2);
+
+    h.store.positions = [{ mode: 'paper', closed: false, costBasis: 4.0, entryFee: 0.168 }];
+    h.ledger.reconcile('after buy');
+
+    expect(h.ledger.balance()).toBeCloseTo(95.83, 2);
+    expect(h.ledger.balance()).not.toBeCloseTo(96.0, 2);
+  });
+
+  it('leaves cash untouched when reconciling a consistent book', () => {
+    // The strongest form: after a full round trip booked incrementally, the
+    // recompute must agree to the cent — so reconcile writes nothing at all.
+    const h = harness();
+    const t = closedTrade('t1');
+
+    h.ledger.adjust(-(t.shares * t.entryPrice + t.entryFee), 'BUY');
+    h.ledger.adjust(t.shares * t.exitPrice - t.exitFee, 'SELL');
+    const afterIncremental = h.ledger.balance();
+    const writesBefore = h.writes.length;
+
+    h.store.trades = [t];
+    h.ledger.reconcile('round trip');
+
+    expect(h.ledger.balance()).toBeCloseTo(afterIncremental, 2);
+    expect(h.writes.length, 'a consistent book must not trigger a write').toBe(writesBefore);
+  });
+
+  it('agrees with the incremental ledger over a mixed book', () => {
+    const closed = [
+      closedTrade('a'),
+      closedTrade('b', { entryPrice: 0.62, exitPrice: 0.5, shares: 10.4, entryFee: 0.175, exitFee: 0, feesPaid: 0.175 }),
+      closedTrade('c', { entryPrice: 0.2, exitPrice: 0.5, shares: 10.2, entryFee: 0.114, exitFee: 0, feesPaid: 0.114 }),
+    ];
+    const open = [{ mode: 'paper', closed: false, costBasis: 4.2, entryFee: 0.17 }];
+
+    const h = harness();
+    for (const t of closed) {
+      h.ledger.adjust(-(t.shares * t.entryPrice + t.entryFee), 'BUY');
+      h.ledger.adjust(t.shares * t.exitPrice - Number(t.exitFee || 0), 'SELL');
+    }
+    for (const p of open) h.ledger.adjust(-(p.costBasis + p.entryFee), 'BUY');
+
+    h.store.trades = closed;
+    h.store.positions = open;
+
+    // Within a cent: the incremental path rounds at each step, the recompute
+    // once at the end. Anything larger is a missing term, not rounding.
+    expect(Math.abs(h.ledger.books() - h.ledger.balance())).toBeLessThanOrEqual(0.01);
+  });
+
+  it('counts an open position as its premium AND its entry fee', () => {
+    // The fee left the account with the premium. Treating it as a cost still to
+    // come overstates spendable cash by the fee on every open position at once.
+    const withFee = booksCash({
+      trades: [],
+      positions: [{ mode: 'paper', closed: false, costBasis: 4.0, entryFee: 0.168 }],
+      initialDeposit: 100,
+    });
+    expect(withFee).toBeCloseTo(95.83, 2);
+  });
+
+  it('ignores positions and trades belonging to the other mode', () => {
+    // Mixing modes silently merges two accounts. The filter lives in booksCash
+    // rather than at the call site precisely so no caller can forget it.
+    const mixed = booksCash({
+      trades: [closedTrade('live-1', { mode: 'live' })],
+      positions: [{ mode: 'live', closed: false, costBasis: 50, entryFee: 1 }],
+      initialDeposit: 100,
+      mode: 'paper',
+    });
+    expect(mixed).toBe(100);
+  });
+
+  it('writes nothing at all outside paper mode', () => {
+    // Live cash is on-chain; a paper ledger writing to it would be fiction.
+    const h = harness({ mode: 'live' });
+    expect(h.ledger.adjust(-10, 'BUY')).toBeNull();
+    expect(h.ledger.reconcile('live')).toBeNull();
+    expect(h.writes).toHaveLength(0);
+    expect(h.store.paperBankroll).toBe(100);
+  });
+
+  it('survives a nullish balance instead of throwing', () => {
+    // The old reconcile read `paperBankroll ?? initial` where `initial` was a
+    // free variable declared inside a different function (bot.ts:316 vs :330).
+    // `??` short-circuits and resolveActiveConfig always seeds the field, so it
+    // never fired — a ReferenceError one nullish balance from killing startBot.
+    const h = harness({ paperBankroll: undefined });
+    expect(() => h.ledger.balance()).not.toThrow();
+    expect(h.ledger.balance()).toBe(100);
+    expect(() => h.ledger.reconcile('cold start')).not.toThrow();
+  });
+
+  it('does not rewrite config for sub-cent drift', () => {
+    // Without the epsilon guard every reconcile writes and logs, which turns
+    // the one message that would matter into noise nobody reads.
+    const h = harness();
+    h.store.positions = [{ mode: 'paper', closed: false, costBasis: 0.004, entryFee: 0 }];
+    h.ledger.reconcile('noise');
+    expect(h.writes).toHaveLength(0);
+    expect(h.logs).toHaveLength(0);
+  });
+
+  it('routes every mutation through the single write path', () => {
+    // Structural. If a future caller finds another way to move cash, the two
+    // sides of this diverge and D5's one-pool-one-owner is gone.
+    const h = harness();
+    h.ledger.adjust(-5, 'BUY');
+    h.store.positions = [{ mode: 'paper', closed: false, costBasis: 20, entryFee: 0 }];
+    h.ledger.reconcile('drift');
+    expect(h.writes).toEqual([95, 80]);
+    expect(h.store.paperBankroll).toBe(80);
+  });
+
+  it('keeps balances at cent precision', () => {
+    // Fees carry 5dp, balances do not. Letting fee precision leak into the
+    // balance accumulates a tail that shows up as permanent phantom drift.
+    expect(roundCash(95.8319999)).toBe(95.83);
+    const h = harness();
+    h.ledger.adjust(-0.168, 'fee only');
+    expect(h.ledger.balance()).toBe(99.83);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+describe('INVARIANT: bot.ts holds no cash logic of its own', () => {
+  const src = fs.readFileSync(
+    path.resolve(__dirname, '../../src/polymarket/bot.ts'),
+    'utf8',
+  );
+
+  it('delegates to the ledger instead of recomputing cash', () => {
+    // Three copies of this formula existed (bot.ts:315, :327, and the repair
+    // loop at :424). The whole point of ledger/cash.ts is that there is now
+    // one. A fourth copy in bot.ts would silently win again.
+    expect(src).toMatch(/createPaperCashLedger\(/);
+    expect(src).not.toMatch(/paperInitialDeposit \?\? 100\);[\s\S]{0,400}?reduce/);
+  });
+
+  it('never assigns paperBankroll outside the ledger binding', () => {
+    // One writer means one assignment site — inside writeBalance.
+    const assignments = src.match(/botState\.config\.paperBankroll\s*=/g) || [];
+    expect(assignments).toHaveLength(1);
   });
 });
