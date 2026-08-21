@@ -1542,6 +1542,55 @@ result. Guard it with the three pending invariants already written
 promoted: unlike items 7–11 this one is silently writing false history on every
 refusal, so it may deserve to jump the queue.
 
+### 28. Item 19's "remaining guard" does not exist — live trades auto-approve
+
+Found 2026-08-20 while confirming which safeguards bind in paper and which are
+notional.
+
+Item 19 concludes: *"The sole remaining guard is `autoApproveLive: false` +
+`announceBeforeTrade: true`, i.e. a manual approval prompt, not a limit."*
+
+There is no prompt. `defaultLiveStrategy()` sets **`autoApproveLive: true`**
+(`modeConfig.ts:158`), inverting the paper default of `false`
+(`modeConfig.ts:92`). The approval branch is:
+
+```js
+const autoApproved = (cfg.mode === 'paper' && cfg.autoApprovePaper)
+  || (cfg.mode === 'live' && cfg.autoApproveLive);
+const shouldAnnounce = cfg.announceBeforeTrade !== false && !autoApproved;
+```
+
+so `announceBeforeTrade: true` is dead weight in live — `autoApproved` short-
+circuits it and the order is dispatched in the same pass. Verified across every
+path that produces a live profile:
+
+| Live profile from | `autoApproveLive` | Prompts? |
+|---|---|---|
+| `defaultLiveStrategy()` | `true` | **no — fires immediately** |
+| legacy flat migration (item 19's path) | `true` | **no** |
+| a store that already has `profiles` | `true` | **no** |
+
+Note the pair is also inverted the other way: live sets
+`autoApprovePaper: false` while paper sets it `true`. The two flags read as
+copy-paste transposed.
+
+**Why this matters more than item 19 alone.** Item 19 establishes that migration
+widens every live size cap to paper values — `maxPositionCap` 100 against a
+default of 1. Its stated mitigation was that a human still has to approve each
+trade. Combined with this item, the real posture on a first switch to live is
+**inflated caps with no approval step**: the bot would dispatch at 100× the
+intended position cap, unattended, on the first eligible signal.
+
+It also means item 19's audit was optimistic in a way an audit should never be —
+it verified the caps and *assumed* the guard.
+
+Fix: this is D11 dimension 4 (blast radius asserted against
+`defaultLiveStrategy()`), and the assertion must cover the approval flags, not
+just the numeric caps. Decide deliberately whether live auto-approves; if it
+does, that is a ramp decision and belongs behind the confidence-driven sizing of
+D11, not a default. Until then treat `autoApproveLive` as the single most
+dangerous field in the config.
+
 ---
 
 ## Handoff — state as of 2026-08-20
@@ -1583,6 +1632,10 @@ slice 3** — branch `refactor/slice-0-safety-net`, 12 commits off `main`.
   `session_perf` is already intact (200 = 200), so this is cleanup of 13 stale
   JSON files, not recovery.
 - **Items 24 and 25** are filed, not fixed. Both are slice 3.
+- **Item 28** is filed, not fixed, and corrects item 19: live trades
+  **auto-approve** (`autoApproveLive: true` in every live profile), so item 19's
+  stated "manual approval prompt" guard does not exist. Inflated caps plus no
+  approval step is the real first-switch posture.
 - **Item 26** is filed, not fixed — the entry-gate thresholds ignore operator,
   governor and optimizer alike. Slice 2, with the D3 config resolver, because
   reversing the precedence changes a live gate.
