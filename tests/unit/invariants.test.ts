@@ -769,6 +769,72 @@ describe('INVARIANT: an accepted arb package is profitable after fees', () => {
     expect(pkg).not.toBeNull();
   });
 
+  it('refuses a losing book at ANY minArbGap, in paper and live', async () => {
+    // The guarantee the operator asked for (2026-08-21): minArbGap stays as a
+    // param, but the code must prove break-even before accepting a trade —
+    // "especially live, paper too".
+    //
+    // So the two checks are AND, not OR, and the fee gate is first and
+    // unconditional. Driving minArbGap and arbMinMarginPct to zero must not open
+    // a package that cannot cover its own fees. Nothing here is mode-dependent,
+    // which is the point — the gate sits above the paper/live bankroll split.
+    const losing = [
+      [0.492, 0.492],   // gap 1.6% vs 3.50% break-even
+      [0.47, 0.51],     // gap 2.0% vs 3.49%
+      [0.30, 0.68],     // gap 2.0% vs 2.94%
+      [0.12, 0.87],     // gap 1.0% vs 1.30%
+    ];
+    for (const [up, down] of losing) {
+      const gap = 1 - up - down;
+      const be = arbBreakEvenGap(up, down, 'crypto');
+      expect(gap, `${up}/${down} must be a loser for this test to mean anything`).toBeLessThan(be);
+
+      for (const minArbGap of [0, 0.001, 0.005, 0.015]) {
+        for (const arbMinMarginPct of [0, 0.005]) {
+          for (const mode of ['paper', 'live']) {
+            saveAllPackages([]); // capacity is per-mode and persists across runs
+            const pkg = await runArb({
+              depth: { up: { bestAsk: up }, down: { bestAsk: down } },
+              prices: { up, down },
+              cfg: cfg({ minArbGap, arbMinMarginPct, mode }),
+              mode,
+              readiness: { spendableBalance: 100 },
+            });
+            expect(
+              pkg,
+              `${mode} opened a losing package at ${up}/${down} with minArbGap ${minArbGap} margin ${arbMinMarginPct}`,
+            ).toBeNull();
+          }
+        }
+      }
+    }
+  });
+
+  it('keeps minArbGap working as an operator floor above break-even', async () => {
+    // The other direction: the param must still do something, or removing the
+    // governor's access to it was pointless. 0.83/0.15 needs 1.88% and offers
+    // 2.0% — profitable — so only the operator's floor can refuse it.
+    const [up, down] = [0.83, 0.15];
+    const gap = 1 - up - down;
+    expect(gap).toBeGreaterThan(arbBreakEvenGap(up, down, 'crypto'));
+
+    saveAllPackages([]);
+    const refused = await runArb({
+      depth: { up: { bestAsk: up }, down: { bestAsk: down } },
+      prices: { up, down },
+      cfg: cfg({ minArbGap: 0.03, arbMinMarginPct: 0 }),
+    });
+    expect(refused, 'a floor above the gap must refuse a profitable book').toBeNull();
+
+    saveAllPackages([]);
+    const taken = await runArb({
+      depth: { up: { bestAsk: up }, down: { bestAsk: down } },
+      prices: { up, down },
+      cfg: cfg({ minArbGap: 0.005, arbMinMarginPct: 0 }),
+    });
+    expect(taken, 'a floor below the gap must allow it').not.toBeNull();
+  });
+
   it('reports locked profit net of fees, not gross', async () => {
     const up = 0.34;
     const down = 0.62;
