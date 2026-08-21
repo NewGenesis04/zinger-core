@@ -64,7 +64,6 @@ export const REGIME_PROFILES = {
     minConfidence: 0.5,
     kellyFraction: 0.1,
     certaintyMaxPct: 0.18,
-    minArbGap: 0.012,
     adaptiveSl: false,
     holdToSettleFavorites: false,
   },
@@ -74,6 +73,37 @@ export const REGIME_LIST = Object.keys(REGIME_PROFILES);
 
 // Keys the governor must never relax while live — the edge-gate owns these.
 const LIVE_PROTECTED = new Set(['arbOnlyUntilEdge', 'requireEdgeForLive', 'forceArbOnly']);
+
+/**
+ * Arb thresholds and sizing. The governor may not write these — ever, in any
+ * mode (operator decision, 2026-08-21).
+ *
+ * The regime detector reads ADX and ATR on BTC/ETH spot. That tells it something
+ * about *directional* conditions. It says nothing about whether a Polymarket
+ * order book is offering a mispriced complementary pair, which is the only thing
+ * an arb threshold should respond to. The `arb-only` profile was setting
+ * `minArbGap: 0.012` on that basis — an arb dial moved by a directional signal,
+ * with no mechanism connecting the two.
+ *
+ * Since item 7 the real gate is fee-aware (`arbBreakEvenGap` + `arbMinMarginPct`)
+ * and `minArbGap` is only an absolute floor beneath it, so the blast radius was
+ * small. The reason to remove it is that there was never an argument for it.
+ *
+ * Deliberately NOT forbidden: `clobArbEnabled` and `arbOnlyUntilEdge`. Those are
+ * "should we be doing arb at all right now", which is exactly the regime call the
+ * governor exists to make — turning a strategy on is not the same as tuning its
+ * risk. The line here is on/off versus how-much.
+ *
+ * Enforced in `applyProfile` rather than by the key's absence from the overlays,
+ * so re-adding one to a profile cannot quietly re-enable it.
+ */
+export const GOVERNOR_FORBIDDEN_KEYS = Object.freeze(new Set([
+  'minArbGap',
+  'arbMinMarginPct',
+  'maxArbPackages',
+  'arbBankrollFrac',
+  'arbMaxUsd',
+]));
 
 const DEFAULTS = {
   cooldownMs: 240_000,      // min gap between switches
@@ -194,6 +224,8 @@ function applyProfile(name, { saveConfig, config }) {
   const overlay = REGIME_PROFILES[name];
   if (!overlay || typeof saveConfig !== 'function') return false;
   const patch = { ...overlay };
+  // The arb engine's thresholds are not the governor's to set, in any mode.
+  for (const k of GOVERNOR_FORBIDDEN_KEYS) delete patch[k];
   // Live safety: never let a profile loosen the edge-gate lock.
   if ((config.mode || 'paper') === 'live') {
     for (const k of LIVE_PROTECTED) {
