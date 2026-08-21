@@ -7,6 +7,7 @@
  * and whole-env management (heat / concurrent books / exit tighten).
  */
 import { load, dataPath } from '../persistence.js';
+import { resolveNumber } from '../config/resolver.js';
 
 const FILE = dataPath('fund_heuristics.json');
 let _cache = null;
@@ -120,33 +121,86 @@ export function heuristicForTrade({ duration = '5m', confidence, entryPrice, sym
     suggested: stratum?.suggested || durationPolicy?.suggested || null,
     exitMix: store?.exitMix || null,
     source: stratum?.n >= 8 ? 'stratum' : durationPolicy ? 'duration' : 'prior',
+    // The *un-merged* trained policy, so a caller can tell a learned value from
+    // a hardcoded prior. Everything above reads `merged`, which folds
+    // DURATION_ENTRY_DEFAULTS in and makes the two indistinguishable — that
+    // conflation is what let a prior outrank explicit operator config (item 26).
+    // Additive: no existing field changes.
+    trained: durationPolicy || null,
+    trainedStratum: stratum?.n >= 8 ? stratum : null,
   };
 }
 
 /**
- * Resolve entry timing + confidence floor for a market duration.
- * Prefer trained policy; fall back to duration priors (so 15m/30m/1h enter).
+ * Resolve entry timing + confidence floor for a market duration (D3, item 26).
+ *
+ * Precedence is **operator > automation > default**:
+ *
+ *   operator     cfg.<field>_<duration>, then cfg.<field>
+ *   automation   the trained policy — a stratum with n >= 8, else the
+ *                duration policy, both read UN-merged
+ *   default      DURATION_ENTRY_DEFAULTS, the shipped prior
+ *
+ * It used to be the exact inverse. The old chain put `heur.<field>` first, and
+ * `heuristicForTrade` merges `DURATION_ENTRY_DEFAULTS` into its result before
+ * returning (line 97), so `heur.<field>` was never nullish and every `?? cfg…`
+ * fallback below it was dead code. Measured on the real store, where no trained
+ * policy exists at all:
+ *
+ *   operator set minConfidence 0.5  ->  gate ran at 0.38, the 5m prior
+ *   a 42% and a 49% signal both passed a floor the operator put at 50%
+ *
+ * So this was not "trained policy beats config" — it was "a hardcoded constant
+ * beats config", in the looser direction, on the live paper profile.
+ *
+ * **Only the precedence changes.** The duration scoping of each key is exactly
+ * as before: the two timing keys honour the generic `cfg.<field>` on 5m only,
+ * `minConfidence` honours it on every duration. That asymmetry looks like a bug
+ * and may well be one, but widening it is a trading change, not a precedence
+ * fix — the stored `maxEntryRemainingSec` is 270, a 5m-shaped number, and
+ * applying it to 15m would cut that window from 800s to 270s and throttle 15m
+ * entries. Filed as item 30 instead of changed here.
+ *
+ * `source` reports which tier won, per field, so "why is this threshold 0.38?"
+ * is answerable from the return value.
  */
 export function resolveEntryWindows(duration, cfg = {}) {
   const heur = heuristicForTrade({ duration });
   const dur = normalizeDuration(duration);
   const prior = DURATION_ENTRY_DEFAULTS[dur];
+
+  // Omitting `genericAllDurations` reproduces the original 5m-only scoping of
+  // the bare key: `dur === '5m' ? cfg[field] : null`.
+  const pick = (field, { genericAllDurations = false } = {}) => resolveNumber([
+    { tier: 'operator', value: cfg[`${field}_${dur}`], source: `cfg.${field}_${dur}` },
+    ...(genericAllDurations || dur === '5m'
+      ? [{ tier: 'operator', value: cfg[field], source: `cfg.${field}` }]
+      : []),
+    { tier: 'automation', value: heur.trainedStratum?.[field], source: 'stratum' },
+    { tier: 'automation', value: heur.trained?.[field], source: 'durationPolicy' },
+    { tier: 'default', value: prior[field], source: 'prior' },
+  ], prior[field]);
+
+  const maxEntry = pick('maxEntryRemainingSec');
+  const minRemaining = pick('minRemainingSec');
+  // Generic key applied to every duration before this change; kept that way.
+  const minConfidence = pick('minConfidence', { genericAllDurations: true });
+
   return {
     duration: dur,
-    maxEntryRemainingSec: Number(
-      heur.maxEntryRemainingSec
-        ?? cfg[`maxEntryRemainingSec_${dur}`]
-        ?? (dur === '5m' ? cfg.maxEntryRemainingSec : null)
-        ?? prior.maxEntryRemainingSec,
-    ),
-    minRemainingSec: Number(
-      heur.minRemainingSec
-        ?? cfg[`minRemainingSec_${dur}`]
-        ?? (dur === '5m' ? cfg.minRemainingSec : null)
-        ?? prior.minRemainingSec,
-    ),
-    minConfidence: Number(heur.minConfidence ?? cfg.minConfidence ?? prior.minConfidence),
-    source: heur.source,
+    maxEntryRemainingSec: maxEntry.value,
+    minRemainingSec: minRemaining.value,
+    minConfidence: minConfidence.value,
+    // Kept for the log lines that print it. Now the *winning tier* for the
+    // confidence floor rather than a whole-object label, since that is the
+    // field the gate message quotes (engines/directional.ts:412).
+    source: minConfidence.source || heur.source,
+    // Per-field attribution — the D3 "every value is attributed" gate.
+    resolved: {
+      maxEntryRemainingSec: maxEntry,
+      minRemainingSec: minRemaining,
+      minConfidence,
+    },
   };
 }
 
