@@ -755,7 +755,52 @@ sample fills up with arb noise and can unlock directional trading (or live, via
 run of arb legs can equally suppress a genuine directional edge. The gate should
 either exclude arb legs or score them in a separate bucket.
 
-### 7. The arb gap check is fee-blind — it takes losing trades on purpose
+### 7. The arb gap check is fee-blind — it takes losing trades on purpose ✅ FIXED
+
+*Fixed 2026-08-20 (`ccfa54e`).* The gate is now
+`gap > rate × [(u(1−u))^e + (d(1−d))^e] + margin`, evaluated per leg at its own
+price, and `lockedProfitUsd` is reported net.
+
+**Correction to the table below: the 09:57 break-even cell said 1.35%; it is
+1.88%.** Five of the six rows match the implemented formula to the basis point,
+and that row's own fee ($0.193) and net (+$0.01) figures are consistent with
+1.88% rather than 1.35% — so it was a bad cell, not a bad model. The conclusion
+is unchanged and if anything stronger: 1.88% is still far under the 3.5% a
+50/50 book needs, and a flat 0.035 still refuses a 2.0% gap that pays.
+
+`minArbGap` keeps its exact meaning and default — it is now purely an absolute
+floor ("how big a dislocation is worth the trouble"), while the fee gate owns
+"can this trade make money at all" and cannot be disabled. No existing config
+value is reinterpreted. New `arbMinMarginPct` is the required profit above
+break-even: paper 0.005, live 0.010, because a quoted ask is not a fill price.
+
+*Operator note:* a stored `minArbGap` of 0.035 will now be the binding
+constraint on skewed books, re-imposing the flat floor the fee gate replaced.
+Lowering it to the 0.015 default (or below) is safe — losses are no longer this
+field's responsibility.
+
+Two things the mutation pass turned up, neither visible to a green suite:
+
+- The reference books used to state break-even — 0.50/0.50, 0.23/0.77,
+  0.10/0.90 — **all sum to exactly $1.00**, which is the single case where
+  assuming `d = 1 − u` is correct. A symmetry shortcut passed every one of them.
+  A tradable book sums to *under* $1.00 by definition, so the binding invariant
+  is now "break-even × shares equals the two leg fees actually charged" — the
+  gate cannot price a different trade than the ledger books.
+- Break-even is a **rate, not a money amount**. Rounding it to the protocol's
+  5dp USDC precision puts error into the rate itself, which then scales with
+  share count.
+
+The gate deliberately does **not** call `resolveClobFeeParams`: that is a
+4s-timeout fetch, the gate runs per market per scan, and window tokens rotate
+every 5 minutes. A network call in the arb path is the exact shape of the
+2026-08-12 outage. `peekClobFeeParams` reads the cache without fetching and the
+fill path warms it; the category fallback is numerically identical on these
+markets anyway (`{"r":0.07,"e":1}` = `FEE_RATES.crypto`, exponent 1).
+
+---
+
+*Original write-up:*
 
 `arbEngine.ts:52-53` compares the raw book gap against `minArbGap` with no fee
 term at all:
@@ -781,7 +826,7 @@ far less to trade than a 50/50 one. Recomputed exactly (2026-08-20):
 | 06:20 | 0.200/0.780 | 2.0% | +$0.204 | $0.237 | **−$0.03** | 2.32% |
 | 06:25 | 0.360/0.600 | 4.0% | +$0.417 | $0.343 | +$0.07 | 3.29% |
 | 09:30 | 0.360/0.530 | 11.0% | +$1.236 | $0.377 | +$0.86 | 3.36% |
-| 09:57 | 0.830/0.150 | 2.0% | +$0.206 | $0.193 | +$0.01 | **1.35%** |
+| 09:57 | 0.830/0.150 | 2.0% | +$0.206 | $0.193 | +$0.01 | **1.88%** |
 
 Computed fees total **$1.815** against **$1.81** measured from the trade log —
 the model in `fees.ts` is exact.
@@ -791,7 +836,7 @@ and essentially all the profit came from one dislocated book.
 
 **The operator's stop-gap `minArbGap: 0.035` is not harmful — it is blunt.** On
 this sample it takes only the two clear winners and nets $0.93, marginally better
-than taking all six. Its cost is structural: the 09:57 book needed just **1.35%**
+than taking all six. Its cost is structural: the 09:57 book needed just **1.88%**
 to profit and is rejected along with every other skewed book. A flat threshold
 prices every market as if it were 50/50.
 
@@ -1505,9 +1550,9 @@ Written so a fresh session can continue without re-deriving any of the above.
 
 ### Where things stand
 
-**Slices 0 and 1 are complete and committed, plus item 27 out of slice 3** —
-branch `refactor/slice-0-safety-net`, 11 commits off `main`. `npm run ci` is
-green: 84 unit + 4 perf, 1 todo.
+**Slices 0 and 1 are complete and committed, plus items 27 and 7 out of
+slice 3** — branch `refactor/slice-0-safety-net`, 12 commits off `main`.
+`npm run ci` is green: 91 unit + 4 perf, 1 todo.
 
 | Slice-1 step | State |
 |---|---|
@@ -1592,19 +1637,24 @@ The remaining live arb defects, in the order they cost the most:
 
 | Item | What it does now | Why it matters |
 |---|---|---|
-| **7** | takes arb below the fee break-even | the strategy loses money on purpose; `minArbGap` is a flat threshold where break-even is `2 × rate × p(1−p)` — 3.5% at 50/50, 1.26% at 0.10/0.90 |
 | **10** | packages settle only while a dashboard is open | capacity never drains, so arb halts once the cap fills |
 | **9** | no boot reconciliation of `PENDING_FILL` | one stuck package holds a slot forever |
 | **8** | a naked leg settles at a fabricated $0.50 | item 27 removed the main *source* of naked legs; this is the valuation that made them profitable on paper |
 | **24** | `resetPaperData` orphans packages from trades | any `arbMetrics` figure spanning a reset is unreliable |
 | **11** | orphan settle assumes every window is 5m | a 15m directional position sells ~10 min early |
 
-**Item 7 is the one to take next.** It is the only remaining defect that loses
-real money by design rather than misreporting it, and the fee model it needs is
-already exact and verified (`fees.ts:80-88`, confirmed live against
-`{"r":0.07,"e":1,"to":true}`). Items 8 and 9 are cheaper but now less urgent:
-27 removed the mechanism that manufactured naked legs, so 8 is largely a
-valuation cleanup, and 9's live instance is a single stuck package.
+**Item 10 is the one to take next.** With 7 and 27 fixed, no remaining defect
+loses money — they misreport it or leak capacity. Item 10 is the capacity leak
+and the only one that stops the bot trading outright: settlement runs solely as
+a side effect of `getState()`, so with no dashboard open packages never leave
+`LOCKED` and arb halts once `maxArbPackages` fills. Item 9 is its natural
+companion (a stuck `PENDING_FILL` holds a slot nothing can clear), and both are
+prerequisites for arb concurrency meaning anything.
+
+Item 8 dropped in urgency: item 27 removed the mechanism that *manufactured*
+naked legs, so it is now a valuation cleanup rather than an active corruption —
+though it still needs `positions/settle.ts` to be testable, which is why its
+invariant remains an `it.todo`.
 
 Then slice 2. Three things are queued for it specifically:
 
