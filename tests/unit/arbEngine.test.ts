@@ -33,7 +33,9 @@ describe('Atomic Arb Engine', () => {
       mode: 'paper',
     };
 
-    const mockExecuteTrade = async () => true;
+    // executePendingTrade returns { ok, ... } on every path, never a bare boolean
+    // (backlog item 27 — coercing it with !! is what recorded refusals as fills).
+    const mockExecuteTrade = async () => ({ ok: true });
 
     const pkg = await detectAndExecuteArbPackage({
       market,
@@ -71,7 +73,7 @@ describe('Atomic Arb Engine', () => {
       cfg,
       mode: 'paper',
       log: () => {},
-      executeTrade: async () => true,
+      executeTrade: async () => ({ ok: true }),
       adjustPaperCash: () => {},
       saveTrade: () => {},
       botState: { config: {}, positions: [] },
@@ -98,7 +100,7 @@ describe('Atomic Arb Engine', () => {
 
     const pkg = await detectAndExecuteArbPackage({
       market, depth, prices: { up: 0.34, down: 0.62 }, cfg, mode: 'paper',
-      log: () => {}, executeTrade: async () => true, adjustPaperCash: () => {}, saveTrade: () => {},
+      log: () => {}, executeTrade: async () => ({ ok: true }), adjustPaperCash: () => {}, saveTrade: () => {},
       botState: { config: {}, positions: [] },
     });
 
@@ -117,7 +119,7 @@ describe('Atomic Arb Engine', () => {
 
     const pkg = await detectAndExecuteArbPackage({
       market, depth, prices: { up: 0.34, down: 0.62 }, cfg, mode: 'paper',
-      log: () => {}, executeTrade: async () => true, adjustPaperCash: () => {}, saveTrade: () => {},
+      log: () => {}, executeTrade: async () => ({ ok: true }), adjustPaperCash: () => {}, saveTrade: () => {},
       botState: { config: {}, positions: [] },
     });
 
@@ -134,7 +136,7 @@ describe('Atomic Arb Engine', () => {
     // Package 1 fills successfully
     const pkg1 = await detectAndExecuteArbPackage({
       market: market1, depth, prices: { up: 0.34, down: 0.62 }, cfg, mode: 'paper',
-      log: () => {}, executeTrade: async () => true, adjustPaperCash: () => {}, saveTrade: () => {},
+      log: () => {}, executeTrade: async () => ({ ok: true }), adjustPaperCash: () => {}, saveTrade: () => {},
       botState: { config: {}, positions: [] },
     });
     expect(pkg1?.status).toBe('LOCKED');
@@ -142,7 +144,7 @@ describe('Atomic Arb Engine', () => {
     // Package 2 should be blocked because maxArbPackages is 1
     const pkg2 = await detectAndExecuteArbPackage({
       market: market2, depth, prices: { up: 0.34, down: 0.62 }, cfg, mode: 'paper',
-      log: () => {}, executeTrade: async () => true, adjustPaperCash: () => {}, saveTrade: () => {},
+      log: () => {}, executeTrade: async () => ({ ok: true }), adjustPaperCash: () => {}, saveTrade: () => {},
       botState: { config: {}, positions: [] },
     });
     expect(pkg2).toBeNull();

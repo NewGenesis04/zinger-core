@@ -1,4 +1,5 @@
 import { savePackage, loadPackages, getActivePackages } from './arbPersistence.js';
+import { closeProceedsWithFee } from './fees.js';
 import type { ArbPackage } from './arbPersistence.js';
 
 export type { ArbPackage };
@@ -156,9 +157,9 @@ export async function detectAndExecuteArbPackage({
     pkg.abortReason = `Leg execution mismatch: UP=${upSuccess ? 'OK' : 'FAIL'}, DOWN=${downSuccess ? 'OK' : 'FAIL'}`;
 
     if (upSuccess && !downSuccess) {
-      await unwindLeg({ outcome: 'up', pkg, market, mode, botState, log, adjustPaperCash });
+      await unwindLeg({ outcome: 'up', pkg, market, mode, cfg, botState, log, adjustPaperCash, saveTrade });
     } else if (downSuccess && !upSuccess) {
-      await unwindLeg({ outcome: 'down', pkg, market, mode, botState, log, adjustPaperCash });
+      await unwindLeg({ outcome: 'down', pkg, market, mode, cfg, botState, log, adjustPaperCash, saveTrade });
     }
 
     savePackage(pkg);
@@ -208,20 +209,63 @@ async function executeArbLeg({ outcome, price, cost, shares, pkg, market, execut
     plan,
   };
 
-  return !!(await executeTrade(pending));
+  // Backlog item 27. This used to be `!!(await executeTrade(pending))`, and
+  // every return path of executePendingTrade is an *object* — a refusal
+  // (`{ ok: false, error: 'max open positions' }`) is as truthy as a fill
+  // (`{ ok: true, position }`). So the boolean carried no information: a
+  // declined leg was recorded as filled, the package locked with both legs
+  // marked `filled: true`, and the rollback below was unreachable for anything
+  // short of a thrown exception.
+  //
+  // Read `ok` explicitly. A refusal is not a result.
+  const res = await executeTrade(pending);
+  return res?.ok === true;
 }
 
-async function unwindLeg({ outcome, pkg, market, mode, botState, log, adjustPaperCash }) {
+/**
+ * Sell a filled leg straight back out when its sibling did not fill.
+ *
+ * Reachable for the first time as of the item 27 fix — before that only a
+ * *thrown* executeTrade reached it, so every ordinary refusal left the leg
+ * naked. Two things were wrong with it in consequence, both fixed here because
+ * shipping traffic into an unexercised path is how the `cccce43` class of bug
+ * happens:
+ *
+ *   1. It refunded the entry fee, modelling the round trip as free. A rollback
+ *      is a taker buy followed by a taker sell — it costs both fees.
+ *   2. It closed the position without recording a trade, so the close was
+ *      invisible to history. `saveTrade` was already destructured in this
+ *      module's signature and never called.
+ *
+ * The two are coupled: the cash reconciler derives realized P/L from
+ * `feesPaid` (item 23), so recording a trade while still refunding the fee
+ * would make the ledger and the recompute disagree by exactly that fee. They
+ * have to change together, and the invariant that catches it is
+ * "cash reconciles to trades + fees + open cost".
+ */
+async function unwindLeg({ outcome, pkg, market, mode, cfg, botState, log, adjustPaperCash, saveTrade }) {
   const pos = botState.positions.find((p) => p.packageId === pkg.packageId && p.outcome === outcome && !p.closed);
   if (!pos) return;
 
+  const shares = Number(pos.shares || 0);
+  const price = Number(pos.entryPrice || 0);
+  const feeOn = cfg?.simulateClobFees !== false;
+  // 'arb_rollback' is deliberately not in FEE_FREE_EXIT_REASONS — unwinding is
+  // a real mid-window sell, unlike settlement/redemption which is fee-free.
+  const pack = closeProceedsWithFee(shares, price, cfg?.feeCategory || 'crypto', 'arb_rollback');
+  const exitFee = feeOn ? pack.fee : 0;
+  const entryFee = Number(pos.entryFee || 0);
+
   pos.closed = true;
-  pos.exitPrice = pos.entryPrice;
+  pos.exitPrice = price;
   pos.exitReason = 'arb_rollback';
-  pos.pnl = 0;
+  pos.exitFee = exitFee;
+  pos.feesPaid = Math.round((entryFee + exitFee) * 1e5) / 1e5;
+  // Sold back at the price it was bought at, so the only loss is the two fees.
+  pos.pnl = Math.round(-(entryFee + exitFee) * 100) / 100;
 
   if (mode === 'paper') {
-    const refund = Math.round((Number(pos.costBasis || (pos.shares * pos.entryPrice)) + Number(pos.entryFee || 0)) * 100) / 100;
+    const refund = Math.round((pack.premium - exitFee) * 100) / 100;
     if (adjustPaperCash) {
       adjustPaperCash(refund, `ROLLBACK ${pos.symbol} ${outcome.toUpperCase()}`);
     } else {
@@ -233,8 +277,16 @@ async function unwindLeg({ outcome, pkg, market, mode, botState, log, adjustPape
     }
   }
 
+  if (saveTrade) {
+    saveTrade({ ...pos, timestamp: Date.now() });
+  }
+
   if (log) {
-    log(`🔄 ROLLBACK UNWIND ${pos.symbol} ${outcome.toUpperCase()} · refunded $${pos.costBasis}`, 'system', { packageId: pkg.packageId });
+    log(
+      `🔄 ROLLBACK UNWIND ${pos.symbol} ${outcome.toUpperCase()} · returned $${pack.premium.toFixed(2)} − fee $${exitFee.toFixed(4)} · cost $${(entryFee + exitFee).toFixed(4)}`,
+      'system',
+      { packageId: pkg.packageId, slug: market?.slug, outcome, entryFee, exitFee, pnl: pos.pnl },
+    );
   }
 }
 

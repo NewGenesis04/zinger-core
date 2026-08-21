@@ -58,7 +58,9 @@ const runArb = (over = {}) =>
     cfg: cfg(),
     mode: 'paper',
     log: () => {},
-    executeTrade: async () => true,
+    // executePendingTrade returns { ok, ... } on every path — never a bare
+    // boolean. Stubbing a boolean is what let the item 27 truthiness bug hide.
+    executeTrade: async () => ({ ok: true }),
     botState: { config: {}, positions: [] },
     ...over,
   });
@@ -164,11 +166,11 @@ describe('INVARIANT: arb legs are paired or unwound — never left naked', () =>
   it('aborts the package when one leg fails', async () => {
     let calls = 0;
     const pkg = await runArb({
-      // first leg fills, second fails
-      executeTrade: async () => ++calls === 1,
+      // first leg fills, second is refused
+      executeTrade: async () => (++calls === 1 ? { ok: true } : { ok: false, error: 'refused' }),
     });
     expect(pkg.status).toBe('ABORTED');
-    expect(pkg.abortReason).toMatch(/FAIL/);
+    expect(pkg.abortReason).toMatch(/UP=OK, DOWN=FAIL/);
   });
 
   it('unwinds the filled leg rather than leaving it naked', async () => {
@@ -199,7 +201,7 @@ describe('INVARIANT: arb legs are paired or unwound — never left naked', () =>
             closed: false,
           });
         }
-        return ok;
+        return ok ? { ok: true } : { ok: false, error: 'refused' };
       },
       botState,
     });
@@ -208,8 +210,14 @@ describe('INVARIANT: arb legs are paired or unwound — never left naked', () =>
     // the filled leg must be closed out, not left holding exposure
     expect(positions[0].closed).toBe(true);
     expect(positions[0].exitReason).toBe('arb_rollback');
-    expect(positions[0].pnl).toBe(0);
-    // and the cash must come back
+    // `pnl` used to be asserted as exactly 0 — a characterization assertion
+    // that froze the fee-blind refund as correct. A rollback is a taker buy
+    // followed by a taker sell, so it costs both fees and can never be free.
+    expect(positions[0].pnl).toBeLessThan(0);
+    expect(positions[0].pnl).toBeCloseTo(
+      -(Number(positions[0].entryFee || 0) + Number(positions[0].exitFee || 0)), 2,
+    );
+    // and the premium must come back
     expect(refunds).toHaveLength(1);
     expect(refunds[0]).toBeGreaterThan(0);
   });
@@ -530,5 +538,122 @@ describe('INVARIANT: engine slot budgets are independent (D5)', () => {
     expect(trimCandidates).toHaveLength(1);
     expect(trimCandidates[0].entryTime).toBe(3);
     expect(trimCandidates.some((p) => p.isArbLeg || p.packageId)).toBe(false);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+describe('INVARIANT: a refused arb leg is never recorded as filled', () => {
+  // Backlog item 27, promoted from invariants.pending.test.ts once fixed.
+  //
+  // `executeArbLeg` used to coerce executePendingTrade's return with `!!`, and
+  // every return path of that function is an object — a refusal
+  // (`{ ok: false, error: 'max open positions' }`) is exactly as truthy as a
+  // fill. The boolean carried no information, so the rollback handler was
+  // unreachable for anything short of a thrown exception, and a refused leg was
+  // written into history as filled.
+  //
+  // Two artifacts it produced, both now impossible:
+  //   both refused  -> a LOCKED package with zero positions, reporting profit
+  //                    on a trade that never happened
+  //   one refused   -> a naked leg held in the belief that it was hedged
+
+  const REFUSED = { ok: false, error: 'max open positions' };
+
+  // Mirrors executePendingTrade's paper branch closely enough to test the
+  // contract: a fill creates a position and debits premium + entry fee.
+  const harness = (accept) => {
+    const positions = [];
+    const trades = [];
+    const cash = { v: 100 };
+    let n = 0;
+    const adjustPaperCash = (d) => { cash.v = Math.round((cash.v + d) * 100) / 100; };
+    const executeTrade = async (pending) => {
+      n += 1;
+      if (!accept(n)) return REFUSED;
+      const { shares, entryPrice: px, packageId } = pending.plan;
+      const premium = Math.round(shares * px * 100) / 100;
+      const entryFee = takerFeeUsdc(shares, px, 'crypto');
+      adjustPaperCash(-Math.round((premium + entryFee) * 100) / 100);
+      positions.push({
+        id: pending.id, symbol: pending.symbol, slug: pending.slug, outcome: pending.outcome,
+        shares, entryPrice: px, costBasis: premium, entryFee, feesPaid: entryFee,
+        packageId, isArbLeg: true, closed: false, mode: 'paper',
+      });
+      return { ok: true, position: {} };
+    };
+    return { positions, trades, cash, adjustPaperCash, executeTrade };
+  };
+
+  const runWith = async (accept) => {
+    const h = harness(accept);
+    const pkg = await detectAndExecuteArbPackage({
+      market: market(),
+      depth: { up: { bestAsk: 0.34 }, down: { bestAsk: 0.62 } },
+      prices: { up: 0.34, down: 0.62 },
+      cfg: cfg({ simulateClobFees: true, feeCategory: 'crypto' }),
+      mode: 'paper',
+      log: () => {},
+      executeTrade: h.executeTrade,
+      adjustPaperCash: h.adjustPaperCash,
+      saveTrade: (t) => h.trades.push(t),
+      botState: { config: {}, positions: h.positions },
+    });
+    return { pkg, ...h };
+  };
+
+  it('does not lock a package when both legs were refused', async () => {
+    const { pkg, positions, cash } = await runWith(() => false);
+    expect(pkg.status).not.toBe('LOCKED');
+    expect(pkg.legs.up.filled).toBe(false);
+    expect(pkg.legs.down.filled).toBe(false);
+    // Nothing bought means nothing spent.
+    expect(positions.filter((p) => !p.closed)).toHaveLength(0);
+    expect(cash.v).toBe(100);
+  });
+
+  it('aborts and unwinds when only one leg was accepted', async () => {
+    for (const [label, accept] of [['up fills', (n) => n === 1], ['down fills', (n) => n === 2]]) {
+      const { pkg, positions } = await runWith(accept);
+      expect(pkg.status, label).toBe('ABORTED');
+      expect(pkg.abortReason, label).toMatch(/mismatch/i);
+      // The whole point: never leave a pair half-open.
+      expect(positions.filter((p) => !p.closed), label).toHaveLength(0);
+      saveAllPackages([]);
+    }
+  });
+
+  it('records the rollback as a trade, so the close is not invisible', async () => {
+    const { trades, positions } = await runWith((n) => n === 1);
+    expect(trades).toHaveLength(1);
+    expect(trades[0].exitReason).toBe('arb_rollback');
+    expect(positions[0].closed).toBe(true);
+  });
+
+  it('charges both taker fees on a rollback — a round trip is not free', async () => {
+    // The refund used to return the entry fee too, modelling the unwind as
+    // costless. Buying and selling back are two taker trades.
+    const { trades } = await runWith((n) => n === 1);
+    const t = trades[0];
+    expect(t.entryFee).toBeGreaterThan(0);
+    expect(t.exitFee).toBeGreaterThan(0);
+    expect(tradeFeesPaid(t)).toBeCloseTo(Number(t.entryFee) + Number(t.exitFee), 5);
+    // Sold back at the entry price, so the fees are the entire loss.
+    expect(tradeNetPnl(t)).toBeCloseTo(-(Number(t.entryFee) + Number(t.exitFee)), 2);
+  });
+
+  it('cash still reconciles after a rollback', async () => {
+    // The coupling that makes the two fixes one change: the reconciler derives
+    // realized P/L from feesPaid, so recording the trade while refunding the
+    // fee would put the ledger and the recompute exactly one fee apart.
+    for (const accept of [() => true, () => false, (n) => n === 1, (n) => n === 2]) {
+      const { positions, trades, cash } = await runWith(accept);
+      const realized = trades.reduce((s, t) => s + tradeNetPnl(t), 0);
+      const openCost = positions
+        .filter((p) => !p.closed)
+        .reduce((s, p) => s + Number(p.costBasis || 0) + Number(p.entryFee || 0), 0);
+      const recompute = Math.round((100 + realized - openCost) * 100) / 100;
+      expect(Math.abs(cash.v - recompute)).toBeLessThanOrEqual(0.02);
+      saveAllPackages([]);
+    }
   });
 });
