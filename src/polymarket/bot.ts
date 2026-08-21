@@ -62,6 +62,14 @@ import {
   tradeEngine,
 } from './audit.js';
 import { createPaperCashLedger } from './ledger/cash.js';
+import {
+  countOpen,
+  sideBalance,
+  isSlugOccupied,
+  exitManagedPositions,
+  portfolioView as buildPortfolioView,
+} from './positions/manager.js';
+import { holdsToSettlement, capacityFor } from './positions/policy.js';
 import { evaluateEdgeGate, passesEdgeFilter } from './edge.js';
 import { buildDecision, resolveOrderSize, sideBalanceBonus } from './engines/directional.js';
 import { recordTradeSample } from './heuristics/tradeCollector.js';
@@ -329,49 +337,21 @@ function adjustPaperCash(delta, reason = '') {
 }
 
 /**
- * Open position count, optionally for one engine (D5).
- *
- * `engine` omitted counts every open position — correct for reporting, wrong for
- * a capacity gate. The two engines' slot counts are independent by decision:
- *
- *   directional   maxOpenPositions   risk dial: slots x size x SL%
- *   arb           maxArbPackages     2 positions per package, hold-to-settle
- *
- * They were cross-wired. `maxOpenPositions` counted arb legs too, so a hedged
- * pair consumed two directional slots and the two settings contradicted each
- * other outright — the VPS runs maxArbPackages 40 (authorising 80 legs) against
- * maxOpenPositions 4. Arb was therefore capped at two packages regardless of
- * its own setting, and the boot-time trim closed arb legs to get under a limit
- * that was never meant to govern them.
+ * Position queries live in `positions/manager.ts` (D4). These wrappers bind the
+ * pure functions there to `botState` and hold no logic of their own — the
+ * strategy conditionals they used to carry are now the policy predicate in
+ * `positions/policy.ts`. Do not add logic here.
  */
 function countOpenPositions(mode = botState.config.mode, engine = null) {
-  return botState.positions.filter((p) => (
-    !p.closed
-    && (!mode || p.mode === mode)
-    && (!engine || tradeEngine(p) === engine)
-  )).length;
+  return countOpen(botState.positions, { mode, engine });
 }
 
-/** Recent closed/open outcome mix — used to break chronic UP-only bias */
 function sideBalanceStats(cfg) {
-  const mode = cfg.mode || 'paper';
-  const recent = dedupeTrades(botState.trades)
-    .filter((t) => t.mode === mode)
-    .slice(0, 50);
-  const open = botState.positions.filter((p) => !p.closed && p.mode === mode);
-  let up = 0;
-  let down = 0;
-  for (const t of recent) {
-    if (t.outcome === 'up') up += 1;
-    else if (t.outcome === 'down') down += 1;
-  }
-  for (const p of open) {
-    if (p.outcome === 'up') up += 2;
-    else if (p.outcome === 'down') down += 2;
-  }
-  const total = up + down;
-  const upShare = total > 0 ? up / total : 0.5;
-  return { up, down, total, upShare };
+  return sideBalance({
+    positions: botState.positions,
+    trades: botState.trades,
+    mode: cfg.mode || 'paper',
+  });
 }
 
 function detectClobArb(depth, prices, cfg, market) {
@@ -405,7 +385,7 @@ function repairPaperOverdraft(reason = 'overdraft repair') {
   while (paperBooksCash() < -0.01 && guard < 120) {
     guard += 1;
     const open = botState.positions
-      .filter((p) => !p.closed && p.mode === 'paper' && !p.packageId && !p.isArbLeg)
+      .filter((p) => !p.closed && p.mode === 'paper' && !holdsToSettlement(p))
       .sort((a, b) => (a.entryTime || 0) - (b.entryTime || 0));
     if (!open.length) break;
     const pos = open[0];
@@ -432,13 +412,17 @@ function repairPaperOverdraft(reason = 'overdraft repair') {
   // maxOpenPositions is the directional risk dial (D5); arb capacity is
   // maxArbPackages, and arb legs are hold-to-settle with no stop, so trimming
   // them serves nothing.
+  //
+  // The loop condition and the selection must read the SAME set, or a position
+  // counted but not selectable spins the loop to its guard. Both go through
+  // exitManagedPositions.
   const maxOpen = Number(botState.config.maxOpenPositions ?? 6);
   let trim = 0;
-  while (countOpenPositions('paper', 'directional') > maxOpen && trim < 80) {
-    trim += 1;
-    const open = botState.positions
-      .filter((p) => !p.closed && p.mode === 'paper' && tradeEngine(p) === 'directional')
+  while (trim < 80) {
+    const open = exitManagedPositions(botState.positions, { mode: 'paper' })
       .sort((a, b) => (a.entryTime || 0) - (b.entryTime || 0));
+    if (open.length <= maxOpen) break;
+    trim += 1;
     if (!open.length) break;
     const pos = open[0];
     const price = Number(pos.currentPrice || pos.entryPrice || 0);
@@ -643,32 +627,26 @@ function getChartSeries(slug) {
 }
 
 function hasOpenOnSlug(slug) {
-  const cfg = botState.config;
-  if (cfg.maxConcurrentPerSlug === 0) return true;
-  const maxConcurrent = cfg.maxConcurrentPerSlug || 1;
-  const openCount = botState.positions.filter((p) => !p.closed && p.slug === slug).length;
-  if (openCount >= maxConcurrent) return true;
-  const pendingCount = botState.pendingTrades.filter((p) => p.slug === slug && p.status === 'pending').length;
-  if (openCount + pendingCount >= maxConcurrent) return true;
-  return botState._buyLocks.has(slug);
+  return isSlugOccupied({
+    positions: botState.positions,
+    pendingTrades: botState.pendingTrades,
+    buyLocks: botState._buyLocks,
+    slug,
+    cfg: botState.config,
+  });
 }
 
-/**
- * The slice of portfolio state the directional engine's gate depends on.
- *
- * The engine is a pure function (`engines/directional.ts`) and deliberately
- * cannot see `botState`. This is the one place that translates: three reads,
- * gathered here, at the call site that owns the state.
- *
- * Slice 2 note — when the D4 position manager lands it becomes the owner of
- * these three facts and this function moves there. It is a seam, not a home.
- */
+/** Binds the D4 manager's portfolio view to botState. No logic here. */
 function portfolioView(slug, cfg) {
-  return {
-    hasOpenOnSlug: hasOpenOnSlug(slug),
-    sideBalance: sideBalanceStats(cfg),
+  return buildPortfolioView({
+    slug,
+    cfg,
+    positions: botState.positions,
+    trades: botState.trades,
+    pendingTrades: botState.pendingTrades,
+    buyLocks: botState._buyLocks,
     dataAssurance: botState._dataAssurance || null,
-  };
+  });
 }
 
 function prunePendingTrades() {
@@ -798,10 +776,8 @@ async function executePendingTrade(pending) {
   // legs used to be charged against maxOpenPositions, which is the directional
   // risk dial — so a hedged pair ate two directional slots, and arb's effective
   // capacity was maxOpenPositions/2 no matter what maxArbPackages said.
-  const engine = tradeEngine(plan);
-  const budget = engine === 'arb'
-    ? { max: Number(cfg.maxArbPackages ?? 4) * 2, label: `max arb legs (${Number(cfg.maxArbPackages ?? 4)} packages)` }
-    : { max: Number(cfg.maxOpenPositions ?? 6), label: `max open directional positions (${Number(cfg.maxOpenPositions ?? 6)})` };
+  const budget = capacityFor(plan, cfg);
+  const engine = budget.engine;
   if (countOpenPositions(cfg.mode, engine) >= budget.max) {
     pending.status = 'skipped';
     botState._buyLocks.delete(pending.slug);
@@ -1913,7 +1889,7 @@ async function scanOpenExitsFast() {
     const prices = await getPricesForMarket(market).catch(() => ({}));
     const depth = await getDepthForMarket(market).catch(() => null);
     for (const pos of positions) {
-      if (pos.closed || pos.packageId || pos.isArbLeg) continue;
+      if (pos.closed || holdsToSettlement(pos)) continue;
       const mark = exitMarkPrice(pos.outcome, prices, depth);
       if (!mark) continue;
       markPosition(pos, mark);
@@ -2389,7 +2365,7 @@ async function scan() {
         // counting arb legs here meant a single hedged pair on a 5m market
         // exhausted that duration's directional budget outright.
         const env = manageEnvironment({
-          opens: botState.positions.filter((p) => tradeEngine(p) === 'directional'),
+          opens: exitManagedPositions(botState.positions),
           mode: cfg.mode,
           maxOpenPositions: Number(cfg.maxOpenPositions ?? 6),
           cash: readiness?.spendableBalance ?? cfg.paperBankroll,
@@ -2485,7 +2461,7 @@ async function scan() {
             for (const op of modePositions) {
               // Arb legs are hedged to $1.00 at settlement — force-closing mid-window
               // forfeits the locked edge and books the spread. Keep them immune.
-              if (op.packageId || op.isArbLeg) continue;
+              if (holdsToSettlement(op)) continue;
               if (op.mode === 'live' && op.tokenId && op.shares > 0) {
                 try {
                   const sellRes = await placeMarketSell({
@@ -2773,7 +2749,7 @@ async function scan() {
         }
 
         // Package legs are immune from mid-window exits — hold strictly to settlement
-        if (pos.packageId || pos.isArbLeg) {
+        if (holdsToSettlement(pos)) {
           continue;
         }
 
