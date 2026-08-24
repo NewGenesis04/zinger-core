@@ -116,3 +116,61 @@ export function resolveNumber(candidates = [], fallback = undefined) {
   }
   return { ...hit, value: n, coerceFailed: false };
 }
+
+/**
+ * Single unified resolver for directional vs pure arb permissions (D3 & Item 3).
+ * Explicit precedence: Operator > Guardrail > Automation.
+ */
+export function resolveTradingPermissions({
+  cfg = {},
+  edgeState = {},
+  governorDecision = {},
+}) {
+  // 1. Operator Tier (Highest Authority)
+  if (cfg.forceArbOnly === true) {
+    return {
+      directionalAllowed: false,
+      arbOnly: true,
+      tier: 'operator',
+      reason: 'operator: forceArbOnly active',
+    };
+  }
+
+  // 2. Guardrail Tier (Drawdown breaker or Live capital protection)
+  if (governorDecision?.drawdownBreakerActive === true) {
+    return {
+      directionalAllowed: false,
+      arbOnly: true,
+      tier: 'guardrail',
+      reason: `guardrail: ${governorDecision.reason || 'drawdown breaker active'}`,
+    };
+  }
+
+  if (cfg.mode === 'live' && cfg.requireEdgeForLive !== false && !edgeState?.edgeOk) {
+    return {
+      directionalAllowed: false,
+      arbOnly: true,
+      tier: 'guardrail',
+      reason: `guardrail: live directional locked (${edgeState?.reason || 'unproven edge'})`,
+    };
+  }
+
+  // 3. Automation Tier (Paper edge gate requirements)
+  if (cfg.arbOnlyUntilEdge !== false && !edgeState?.edgeOk) {
+    return {
+      directionalAllowed: false,
+      arbOnly: true,
+      tier: 'automation',
+      reason: `automation: ${edgeState?.reason || 'need proven paper edge'}`,
+    };
+  }
+
+  // 4. Unlocked (Directional & Arb active)
+  return {
+    directionalAllowed: true,
+    arbOnly: false,
+    tier: 'automation',
+    reason: 'edge ok — directional + arb active',
+  };
+}
+

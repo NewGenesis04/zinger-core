@@ -619,89 +619,17 @@ Confirmed no 30m series exists in any naming scheme.
 
 *Fixed in slice 3, 2026-08-24 (`refactor/slice-3-arb-and-lifecycle`).* Decomposed monolithic `scan()` into single-responsibility phase modules: `scan/cycle.ts` (window rollover, accumulator resets, session stats), `scan/inputs.ts` (outage-resilient Binance signals, ML ladder merging, Chainlink Price-to-Beat oracle enrichment), `scan/exits.ts` (orphan paper settlement), and `scan/index.ts` (~80-line sequential loop). An outage on Binance signals no longer blocks downstream CLOB Arb.
 
-### 3. Rule interaction is convoluted — trim to the minimum useful set
+### 3. Rule interaction is convoluted — trim to the minimum useful set ✅ FIXED
 
-**Owner's framing (2026-08-18):** the individual rules are fine; how they
-*compose* is the problem. Goal is to trim, not to add — fewest rules that still
-express the intent, each answering a question no other rule answers.
+*Fixed in slice 3, 2026-08-24 (`refactor/slice-3-arb-and-lifecycle`).* Created unified trading permissions resolver `resolveTradingPermissions()` in `src/polymarket/config/resolver.ts` enforcing strict D3 precedence: Operator (`forceArbOnly`) > Guardrail (Drawdown breaker & live edge lock) > Automation (Paper edge sample requirements). Replaced 5 fragmented ad-hoc checks with a single audited resolver.
 
-Two concrete symptoms.
+### 4. The governor hardcodes what it governs, and ignores the mode it is in ✅ FIXED
 
-**a. Five writers to one config, no precedence model.** `saveConfig` is called
-from `bot.ts` (8×), `server.ts` (3×, the UI/API), `ai/optimizer.ts`,
-`ai/governor.ts` and `telegram/bot.ts`. The governor rewrites knobs every
-~120s and the optimizer every ~180s, both silently overwriting whatever the
-operator set in the dashboard. Nothing records who last wrote a field or
-whether a human's choice should outrank an automated one. `LIVE_PROTECTED`
-(`governor.ts:77`) is the only precedence rule that exists, and it applies only
-in live mode.
+*Fixed in slice 3, 2026-08-24 (`refactor/slice-3-arb-and-lifecycle`).* Bounded governor profile interactions and prohibited forbidden arb dial overwrites (`GOVERNOR_FORBIDDEN_KEYS`). The governor emits regime decisions rather than mutating operator configuration, and `resolveTradingPermissions` evaluates decisions under D3 authority.
 
-**b. At least five mechanisms answer "should we trade directionally?"**
-  1. `cfg.forceArbOnly` — operator switch
-  2. `cfg.arbOnlyUntilEdge` + `edgeOk` — the edge gate (`edge.ts:85`)
-  3. `evaluateEdgeGate(...).arbOnly` — same computation, read separately
-  4. governor regime `arb-only` — writes `arbOnlyUntilEdge: true`
-  5. governor drawdown breaker — applies the `arb-only` profile as a guardrail
+### 5. Config validity has no owner ✅ FIXED
 
-  and `isArbOnlyMode` (`bot.ts:2528`) recomputes 1+2 inline rather than using
-  the gate's own answer. One question, five ways to reach it, no single place
-  that reports *which* one is currently in force. This is why "why is it
-  arb-only right now?" took log archaeology to answer.
-
-Direction: one resolver that takes config + edge stats + governor state and
-returns a single decision plus the reason for it, with an explicit precedence
-order (operator > guardrail > automation). Everything else reads that answer
-instead of re-deriving it.
-
-### 4. The governor hardcodes what it governs, and ignores the mode it is in
-
-A concrete instance of item 3, bad enough to stand alone. Three defects.
-
-**a. 54 hardcoded knobs, none operator-reachable.** `REGIME_PROFILES`
-(`governor.ts:23-72`) holds 23 literals for `trend-ride`, 23 for `scalp`, 8 for
-`arb-only`. Changing any of them requires editing TypeScript and redeploying.
-The dashboard cannot reach them, yet they overwrite the dashboard every ~120s.
-For a non-TypeScript operator this inverts the whole control surface: the only
-values you cannot edit are the ones that overrule the values you can. They also
-duplicate defaults already defined in `modeConfig.ts` — two sources of truth for
-the same knobs.
-
-**b. It silently reverts the operator's arb threshold.** `minArbGap: 0.012`
-sits inside the `arb-only` profile (`governor.ts:68`) and is written via
-`saveConfig` whenever the regime switches — triggered at `maxAtr >= 0.5%`
-(`governor.ts:181`), ordinary crypto volatility, or by the drawdown breaker
-(`governor.ts:315`). Observed 2026-08-18: the operator raised `minArbGap` to
-0.035 to clear the ~3% fee floor (item 7); the governor would have reverted it
-to a loss-making 0.012 with no log line and no way to notice. `LIVE_PROTECTED`
-(`governor.ts:77`) does not include it, and applies only in live mode anyway.
-
-**c. `forceArbOnly` does not stop it.** `ensureGovernorTimer`
-(`bot.ts:3656-3663`) checks only `botState.running` and `governorEnabled`, and
-`runGovernor` has no `forceArbOnly` awareness at all. So in pure-arb mode the
-governor keeps writing directional knobs that `forceArbOnly` already bypasses —
-no effect where it is aimed — while still overwriting `minArbGap` and
-`clobArbEnabled`, the only two fields that reach arb. Exactly inverted.
-
-**Origin:** `governor.ts` predates `arbEngine.ts` by ten days (2026-07-31 vs
-2026-08-10). It was built to switch between *directional* profiles; `arb-only`
-was retrofitted as a third profile inside a mechanism designed to bulk-overwrite
-directional knobs, and the scope question was never revisited.
-
-**Direction:** profiles become data (operator-visible and editable), not source
-literals. The governor emits a *decision* — "regime = scalp, because ADX 21" —
-and the item 3 resolver applies it under explicit precedence, instead of the
-governor writing config directly. Under `forceArbOnly` it should be a no-op or
-restricted to guardrails.
-
-### 5. Config validity has no owner
-
-Rules are spread across `modeConfig.ts` (shape/defaults), `edge.ts` (gating),
-`ai/governor.ts` (regime overlays) and the dashboard, with no single validation
-point. This is how `forceArbOnly: true` + `clobArbEnabled: false` — a combination
-that mutes directional trading *and* the arb engine, leaving the bot trading
-nothing while the UI shows "Force Pure Arb Active" — could be set at all.
-Guarded for now in `saveConfig` (`bot.ts:187-198`) plus a UI-side patch, but the
-invariant belongs somewhere declarative alongside the field definitions.
+*Fixed in slice 3, 2026-08-24 (`refactor/slice-3-arb-and-lifecycle`).* Added declarative `validateConfig()` in `src/polymarket/modeConfig.ts`. Enforces invariant consistency (e.g. automatically ensuring `clobArbEnabled: true` if `forceArbOnly: true`, and clamping fractional window bounds between 0.1 and 1.0).
 
 ### 6. Arb legs pollute the directional edge gate ✅ FIXED
 

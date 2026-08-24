@@ -105,6 +105,7 @@ import {
   collectSignals,
   enrichMarketsWithOracle,
 } from './scan/inputs.js';
+import { resolveTradingPermissions } from './config/resolver.js';
 import {
   emitEvent,
   queryEvents as queryTelemetryEvents,
@@ -2218,7 +2219,12 @@ async function scan() {
       }
 
       const edgeGateNow = evaluateEdgeGate(botState.trades, cfg);
-      const isArbOnlyMode = cfg.forceArbOnly === true || (cfg.arbOnlyUntilEdge !== false && !edgeGateNow.edgeOk);
+      const tradingPerms = resolveTradingPermissions({
+        cfg,
+        edgeState: edgeGateNow,
+        governorDecision: getGovernorStatus(),
+      });
+      const isArbOnlyMode = tradingPerms.arbOnly;
 
       // Atomic Arb Engine Execution: Execute ArbPackage and bypass directional evaluation when arb-only mode or gap is active
       if (cfg.clobArbEnabled !== false && (isArbOnlyMode || arb)) {

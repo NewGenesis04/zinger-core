@@ -311,3 +311,23 @@ export function profilesSummary(store) {
     live: pickStrategy(store?.profiles?.live || {}),
   };
 }
+
+/**
+ * Declarative validation of strategy configurations (Item 5).
+ * Enforces valid combinations and bounds dangerous settings.
+ */
+export function validateConfig(cfg = {}) {
+  const next = { ...cfg };
+  // Can't force pure arb while turning off the arb engine
+  if (next.forceArbOnly === true && next.clobArbEnabled === false) {
+    next.clobArbEnabled = true;
+  }
+  if (typeof next.entryWindowFrac === 'number') {
+    next.entryWindowFrac = Math.max(0.1, Math.min(1.0, next.entryWindowFrac));
+  }
+  if (typeof next.minArbGap === 'number') {
+    next.minArbGap = Math.max(0.005, next.minArbGap);
+  }
+  return next;
+}
+
