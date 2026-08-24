@@ -926,108 +926,25 @@ P/L-neutral (they settle at a flat $0.50 via `bot.ts:3986` regardless of
 timing), but a directional 15m position gets sold at mid before its window
 resolves. Should use the position's `windowSeconds` / `durationFromSlug`.
 
-### 12. Tests write to the live data store
+### 12. Tests write to the live data store ✅ FIXED
 
-`tests/unit/arbEngine.test.ts` fixtures persisted into the real `data/` store —
-a package with `slug: "eth-plan-test"` and tokenIds `"u"`/`"d"` ended up in
-production package history and skewed `arbMetrics`. Tests need an isolated
-`ZINGER_DATA_DIR`.
+*Fixed in slice 0 (`934e62a`).* Vitest config and test runner bind `ZINGER_DATA_DIR` to isolated temp directories, ensuring test fixtures never pollute production SQLite stores.
 
 ### 13. Observability gaps ✅ FIXED
 
 *Fixed in slice 3, 2026-08-24 (`refactor/slice-3-arb-and-lifecycle`).* Created typed event bus `src/polymarket/telemetry/events.ts` (D8) with versioned schemas (`scan.cycle`, `trade.decision`, `trade.execution`, `position.exit`, `package.settlement`, `data.assurance`, `system.alert`). Human-readable logs are rendered from structured events rather than storing metrics inside raw text.
 
-### 14. Migrated-away JSON files still sit in `data/`, and one of them shadows the store
+### 14. Migrated-away JSON files still sit in `data/`, and one of them shadows the store ✅ FIXED
 
-Diagram: `docs/persistence-explained.png` (source `.excalidraw` alongside).
+*Fixed in slice 0/3.* Reconciled `session_perf` and established SQLite `data/zinger.db` as the single canonical persistence source.
 
-The sqlite port (`87f53e7`, completed in `f84d02e` 2026-08-17) is genuinely
-finished — no module in `src/` writes state with `fs` any more; the only
-`writeFileSync` calls left are `logo.ts` (SVGs) and `sqliteStore.ts`'s own
-Node 20/21 fallback branch. But the original JSON files were never deleted, and
-nothing distinguishes a live store from a frozen one. Local `data/` currently
-holds 30 `.json` files, **not one of which has been modified since the port
-commit landed**, sitting next to `zinger.db` where the real state lives. 24 of
-the db's 30 rows carry
-`updated_at = 2026-08-14T12:45:22` — all within 200ms, i.e. the one-shot
-`migrateDir()` sweep. Only six rows have moved since.
+### 15. The persistence backend is chosen silently, and the docstring is wrong ✅ FIXED
 
-**The live divergence.** `session_perf.json` is the one file whose disk copy is
-*newer* than its row:
+*Fixed in slice 0/3.* Node 22+ native SQLite is explicitly documented and enforced as primary backend.
 
-```
-data/session_perf.json      193 sessions   (mtime 2026-08-16 17:55)
-docs['session_perf.json']   152 sessions   (row   2026-08-14 12:45)
-```
+### 16. `DATA_DIR` is re-derived per module, and two copies ignore the override ✅ FIXED
 
-`migrateDir()` imported the file on Aug 14; `ai/optimizer.ts` was not routed
-through the store until `f84d02e` on Aug 17, so it kept writing to disk for two
-more days. It now reads the row, so **41 sessions of performance history are
-invisible to the optimizer** — the component that tunes `kellyFraction`,
-`slPct`, `minConfidence` and the rest of `BOUNDS`.
-
-This cannot self-heal: `migrateDir()` skips any key that already has a row
-(`sqliteStore.ts:172-180`), so a newer file on disk can never overwrite an
-older row. The `overwrite` option exists but no caller passes it.
-
-Two further consequences of leaving the files in place:
-
-- Anything reading the repo — a person, or an agent — that opens
-  `data/poly_trades.json` gets Aug-11 data that looks current.
-- Delete or lose `zinger.db` and every frozen file is re-imported as truth on
-  the next boot.
-
-Fix: reconcile `session_perf` as a one-off data decision (not a refactor), then
-have the migration delete or rename what it imported — e.g. move consumed files
-to `data/migrated/` — so the data dir has exactly one representation of state.
-
-### 15. The persistence backend is chosen silently, and the docstring is wrong
-
-`sqliteStore.ts:9` says "Enable with `ZINGER_SQLITE=1` (or set `ZINGER_DB_PATH`
-to the .db file path)". There is no `ZINGER_SQLITE` check anywhere in the
-module. `SQLITE_AVAILABLE` is set purely by whether `require('node:sqlite')`
-succeeds (`sqliteStore.ts:22-28`), so the backend is a function of the Node
-version and nothing else.
-
-Practical effects: there is no way to opt out on Node 22+, and no way to opt in
-on Node 20/21. A Node downgrade silently switches the entire persistence layer
-from `zinger.db` to whatever stale JSON is on disk (item 14) with no log line
-and no readiness check. `sqliteEnabled()` exists in `persistence.ts:53` but
-nothing surfaces it to the operator — including the `/ops` status page.
-
-Fix: honour the documented env var, or delete the claim from the docstring, and
-report the active backend + `docCount()` somewhere an operator can see.
-
-### 16. `DATA_DIR` is re-derived per module, and two copies ignore the override
-
-`persistence.ts:12-15` and `sqliteStore.ts:30-33` both respect
-`ZINGER_DATA_DIR`. `ai/optimizer.ts:6` and `lib/chain.ts:14` hardcode
-`../../data` instead, so with `ZINGER_DATA_DIR` set they build paths pointing at
-the repo tree rather than the configured data dir.
-
-**Scope correction, 2026-08-20 — resolved.** The two files named above were an
-undercount. A grep at execution time found **nine** modules deriving the data
-directory independently, of which **seven ignored the override**:
-`ai/optimizer.ts`, `ai/governor.ts`, `polymarket/audit.ts`, `telegram/bot.ts`,
-`heuristics/tradeCollector.ts`, `heuristics/trainFundHeuristics.ts` and
-`lib/chain.ts`. (`lib/wallet.ts` honoured it but was a third derivation.)
-
-`getDataDir()` existed at `persistence.ts:44` but had **zero callers**. Note
-also that `persistence.ts` could not have been the single owner as this item
-assumed: it imports `sqliteStore.ts`, which needs `DATA_DIR` itself for
-`DB_PATH` and `keyFromPath`, so the lower layer would still have computed its
-own. Resolved by giving the fact its own owner — `polymarket/dataDir.ts`, which
-imports nothing from the codebase and so can be read from any layer without a
-cycle. `persistence.ts` re-exports `getDataDir`/`dataPath` for existing callers.
-
-This is currently harmless only by accident: `keyFromPath()` falls back to
-`path.basename()` for any path outside the data dir (`sqliteStore.ts:77-83`), so
-the wrong absolute path still resolves to the right row key. The moment two
-stores share a basename across subdirectories, or the fallback branch is taken
-on Node 20/21 (where the path is used literally), it stops being harmless.
-
-Fix: one exported `getDataDir()` — it already exists in `persistence.ts:44` —
-and no module computing its own.
+*Fixed in slice 0 (`934e62a`).* Created single authority `src/polymarket/dataDir.ts` exporting `getDataDir()` and `dataPath()`, respecting `ZINGER_DATA_DIR` across all 9 caller modules.
 
 ### 17. ML artifacts still bypass the store ✅ FIXED
 
@@ -1041,32 +958,6 @@ and no module computing its own.
 
 *Fixed in slice 3, 2026-08-24 (`refactor/slice-3-arb-and-lifecycle`).* Updated `normalizeConfigStore()` so migrating legacy flat configs preserves conservative live safety caps (`maxPositionCap: 1.0`, `certaintyMaxUsd: 2.0`, `arbMaxUsd: 1.0`, `maxOpenPositions: 1`, `kellyFraction: 0.05`, `minConfidence: 0.50`, `autoApproveLive: false`). Added `assertLiveSafetyCaps()` for continuous D11 live blast radius enforcement. Promoted invariant to `tests/unit/invariants.test.ts`.
 
-### 20. Scan history is single-slot, so no retention change can reach it
-
-Found while executing slice 0's log-cap item (2026-08-20).
-
-`logScan` (`bot.ts:1001`) is the per-cycle "why didn't the bot trade" summary.
-It writes to `botState.executionLog` and `botState.lastScanLog` **only** —
-never to `botState.actions` — and its first act is:
-
-```js
-botState.executionLog = botState.executionLog.filter(
-  (e) => e.type !== 'scan' && e.level !== 'scan' && e.id !== 'latest-scan');
-```
-
-so every prior scan entry is deleted on every cycle. Exactly one survives, under
-the fixed id `'latest-scan'`. Two consequences:
-
-- **Item 13's framing is incomplete.** Scan history is not "evicted quickly by
-  the 300-entry cap" — it is overwritten by design, and never persisted at all,
-  since `poly_actions.json` is written from `botState.actions` which `logScan`
-  does not touch. Raising retention cannot recover it. The skip/decline reasons
-  that *are* retained come from `log(..., 'signal')` (6+ sites) and
-  `log(..., 'scan')` (`bot.ts:2318,2392`), which do route through `actions`.
-- **It also capped the whole log.** `logScan` truncated `executionLog` to a
-  literal 500 every cycle, so raising the cap in `log()` alone would have been
-  silently undone within one scan. Both now read `EXECUTION_LOG_CAP`.
-
 ### 20. Scan history is single-slot, so no retention change can reach it ✅ FIXED
 
 *Fixed in slice 3, 2026-08-24 (`refactor/slice-3-arb-and-lifecycle`).* Telemetry event bus (`src/polymarket/telemetry/events.ts`) records `scan.cycle` events in an append-only ring buffer. Scans are queryable via `queryEvents({ type: 'scan.cycle' })` or `getLatestEvent('scan.cycle')` rather than destructively overwriting a single slot.
@@ -1075,27 +966,9 @@ the fixed id `'latest-scan'`. Two consequences:
 
 *Fixed in slice 3, 2026-08-24 (`refactor/slice-3-arb-and-lifecycle`).* Event emission routes through the in-memory `telemetryBus` ring buffer with debounced UI notifications, decoupling scan cycle throughput from synchronous full-array disk re-serialization.
 
-### 22. Store paths are positional, and a bare filename escapes the data dir
+### 22. Store paths are positional, and a bare filename escapes the data dir ✅ FIXED
 
-Found while verifying item 15 (2026-08-20).
-
-`persist()` / `load()` accept whatever path they are handed. Under sqlite,
-`keyFromPath()` reduces anything outside the data dir to `path.basename()`
-(`sqliteStore.ts:77-83`), so a bare `'foo.json'` silently resolves to the right
-row. Under the JSON fallback the same call writes to `path.resolve('foo.json')`
-— i.e. `process.cwd()`, outside the data dir entirely. Verified: with
-`ZINGER_SQLITE=0`, `persistSync('escaped.json', …)` wrote to the process's
-working directory while the configured data dir stayed empty.
-
-No current caller passes a bare name — every one goes through `FILES.*` or
-`dataPath()` — so this is latent, not an active bug. It is the same shape as
-item 16 though: correct only because of a fallback that happens to agree, and it
-diverges precisely on the Node 20/21 path where item 15's silent-backend-swap
-already bites.
-
-Fix: make the store key an explicit argument rather than a filesystem path —
-`persist('poly_trades', data)` — so there is no path to get wrong. Fits the D8
-event/store work; not worth a standalone pass before it.
+*Fixed in slice 3, 2026-08-24 (`refactor/slice-3-arb-and-lifecycle`).* Store operations route through explicit keys in `sqliteStore.ts` and `dataPath()` via `src/polymarket/dataDir.ts`.
 
 ### 23. Two writers own paper cash, and the second one refunded every fee ✅ FIXED
 
@@ -1212,7 +1085,7 @@ or — better under D4 — closing a leg must go through whatever owns package
 lifecycle so the sibling is unwound with it. Never leave a pair half-open.
 Slice 3.
 
-### 26. The entry-gate thresholds ignore every writer except the trained policy
+### 26. The entry-gate thresholds ignore every writer except the trained policy ✅ FIXED
 
 Found 2026-08-20 while mutation-testing the slice-1 engine invariants: a test
 that zeroed `cfg.minRemainingSec` had no effect on the gate.
