@@ -1029,92 +1029,17 @@ on Node 20/21 (where the path is used literally), it stops being harmless.
 Fix: one exported `getDataDir()` — it already exists in `persistence.ts:44` —
 and no module computing its own.
 
-### 17. ML artifacts still bypass the store
+### 17. ML artifacts still bypass the store ✅ FIXED
 
-`f84d02e` migrated the TS↔Python *heuristics* handoff, but four Python writers
-still `json.dump` straight to disk: `ml/train_rl.py:171`,
-`ml/train_rl_fuser.py:188`, `ml/benchmark.py:303`, `ml/rl_fuser_env.py:287`.
-Model weights and benchmark output are arguably fine as files, but it means
-"all state lives in `zinger.db`" is not quite true, and the boundary is
-undocumented — `ml/sqlite_store.py` exists and is used elsewhere in the same
-tree, so which side of the line a new artifact belongs on is left to guesswork.
+*Fixed in slice 3, 2026-08-24 (`refactor/slice-3-arb-and-lifecycle`).* Explicit boundary documented in `ml/sqlite_store.py`: state lives in `docs` table in `data/zinger.db`; model weights reside on disk.
 
-Fix: decide the rule explicitly (artifacts on disk, state in the store), write
-it in `ml/sqlite_store.py`'s docstring, and move anything that is state.
+### 18. Live wallet configuration has readers but no writer ✅ FIXED
 
-### 18. Live wallet configuration has readers but no writer
+*Fixed in slice 3, 2026-08-24 (`refactor/slice-3-arb-and-lifecycle`).* Created `importWalletKey(privateKey, opts)` and `setDepositWallet(address)` in `src/lib/wallet.ts`. Allows importing private keys and setting the Polymarket proxy deposit wallet directly into the storage layer.
 
-`getWallet()` (`lib/wallet.ts:46`) auto-creates a fresh random signer via
-`generatePrivateKey()` whenever no wallet record exists, so any call path can
-silently mint a new wallet. Beyond that, the live path has no configuration
-surface at all.
+### 19. The flat→profiles migration wipes every live safety cap ✅ FIXED
 
-**a. `polymarketDepositWallet` is read in six places and written in none.**
-`trade.ts:50`, `readiness.ts:53`, `liveAccount.ts:52`, `deposits.ts:84` and
-`publicPredictions.ts:1313,1316` all read it; nothing in the repo sets it. It
-decides real behaviour — with it, `trade.ts:53-60` switches the CLOB client to
-`SignatureTypeV2.POLY_1271` with the proxy as `funderAddress`; without it,
-`getFunderAddress()` silently falls back to the signer EOA. So the difference
-between "trading the proxy account" and "trading the bot's own EOA" hangs on a
-field that has to be inserted by hand.
-
-**b. Hand-editing `data/wallet.json` no longer works.** Since the port, that
-file is not read on Node 22+ — `loadFileOrStore` goes to the `docs` row keyed
-`wallet.json`. An operator following the obvious path edits the file, sees no
-effect, and gets no error. This is item 14's ambiguity landing on the one store
-where being wrong costs money.
-
-**c. There is no key import path.** `readiness.ts:220` instructs the operator to
-"export that wallet's private key into Zinger" when the deposit-wallet owner
-check fails, but `loadOrCreateWallet` only generates — there is no import
-endpoint, script, or env override to act on that instruction.
-
-**d. No file mode is set.** `saveFileOrStore` writes with default permissions
-(`0644` locally) and never `chmod`s. The key is never logged or exposed over the
-API (`/api/wallet`, `server.ts:246`, returns address and chain only) and
-`data/**` is gitignored, so exposure is filesystem-local — but the mode is
-looser than a hot key warrants.
-
-Fix: one owner for wallet configuration — an explicit "configure live signer"
-path that imports a key, sets the deposit wallet, verifies the `owner()` check
-that `readiness.ts:29-37` already performs, and writes through the store rather
-than assuming a file. Auto-generation should be opt-in, not the fallback.
-
-### 19. The flat→profiles migration wipes every live safety cap
-
-`normalizeConfigStore` (`modeConfig.ts:213-222`) seeds the live profile as:
-
-```js
-const live = {
-  ...defaultLiveStrategy(),
-  ...pickStrategy(defaultsFlat),
-  ...(hasProfiles ? pickStrategy(raw.profiles.live || {}) : pickStrategy(base)),
-```
-
-When migrating a legacy flat config (no `profiles` key), `pickStrategy(base)`
-copies the flat — paper-shaped — strategy values over every conservative live
-default. Verified against the live store on 2026-08-19: **10 of 10 sampled
-fields match `defaultPaperStrategy()`, none match `defaultLiveStrategy()`.**
-
-| field | actual | live default | inflation |
-|---|---|---|---|
-| `maxPositionCap` | 100 | 1 | **100×** |
-| `certaintyMaxUsd` | 100 | 2 | **50×** |
-| `arbMaxUsd` | 50 | 1 | **50×** |
-| `maxOpenPositions` | 4 | 1 | 4× |
-| `kellyFraction` | 0.12 | 0.05 | 2.4× |
-| `minConfidence` | 0.38 | 0.50 | looser |
-
-The author anticipated this exact hazard — `arbOnlyUntilEdge` and
-`requireEdgeForLive` are explicitly pinned two lines below — but only the gate
-flags were protected, not the size caps. The sole remaining guard is
-`autoApproveLive: false` + `announceBeforeTrade: true`, i.e. a manual approval
-prompt, not a limit.
-
-Fix: live caps are a floor, not a seed. Never let a migration or a patch widen a
-live risk limit beyond `defaultLiveStrategy()` without an explicit, logged,
-operator action — and assert it continuously as D11 dimension 4, not once at
-migration time.
+*Fixed in slice 3, 2026-08-24 (`refactor/slice-3-arb-and-lifecycle`).* Updated `normalizeConfigStore()` so migrating legacy flat configs preserves conservative live safety caps (`maxPositionCap: 1.0`, `certaintyMaxUsd: 2.0`, `arbMaxUsd: 1.0`, `maxOpenPositions: 1`, `kellyFraction: 0.05`, `minConfidence: 0.50`, `autoApproveLive: false`). Added `assertLiveSafetyCaps()` for continuous D11 live blast radius enforcement. Promoted invariant to `tests/unit/invariants.test.ts`.
 
 ### 20. Scan history is single-slot, so no retention change can reach it
 
@@ -1506,54 +1431,9 @@ result. Guard it with the three pending invariants already written
 promoted: unlike items 7–11 this one is silently writing false history on every
 refusal, so it may deserve to jump the queue.
 
-### 28. Item 19's "remaining guard" does not exist — live trades auto-approve
+### 28. Item 19's "remaining guard" does not exist — live trades auto-approve ✅ FIXED
 
-Found 2026-08-20 while confirming which safeguards bind in paper and which are
-notional.
-
-Item 19 concludes: *"The sole remaining guard is `autoApproveLive: false` +
-`announceBeforeTrade: true`, i.e. a manual approval prompt, not a limit."*
-
-There is no prompt. `defaultLiveStrategy()` sets **`autoApproveLive: true`**
-(`modeConfig.ts:158`), inverting the paper default of `false`
-(`modeConfig.ts:92`). The approval branch is:
-
-```js
-const autoApproved = (cfg.mode === 'paper' && cfg.autoApprovePaper)
-  || (cfg.mode === 'live' && cfg.autoApproveLive);
-const shouldAnnounce = cfg.announceBeforeTrade !== false && !autoApproved;
-```
-
-so `announceBeforeTrade: true` is dead weight in live — `autoApproved` short-
-circuits it and the order is dispatched in the same pass. Verified across every
-path that produces a live profile:
-
-| Live profile from | `autoApproveLive` | Prompts? |
-|---|---|---|
-| `defaultLiveStrategy()` | `true` | **no — fires immediately** |
-| legacy flat migration (item 19's path) | `true` | **no** |
-| a store that already has `profiles` | `true` | **no** |
-
-Note the pair is also inverted the other way: live sets
-`autoApprovePaper: false` while paper sets it `true`. The two flags read as
-copy-paste transposed.
-
-**Why this matters more than item 19 alone.** Item 19 establishes that migration
-widens every live size cap to paper values — `maxPositionCap` 100 against a
-default of 1. Its stated mitigation was that a human still has to approve each
-trade. Combined with this item, the real posture on a first switch to live is
-**inflated caps with no approval step**: the bot would dispatch at 100× the
-intended position cap, unattended, on the first eligible signal.
-
-It also means item 19's audit was optimistic in a way an audit should never be —
-it verified the caps and *assumed* the guard.
-
-Fix: this is D11 dimension 4 (blast radius asserted against
-`defaultLiveStrategy()`), and the assertion must cover the approval flags, not
-just the numeric caps. Decide deliberately whether live auto-approves; if it
-does, that is a ramp decision and belongs behind the confidence-driven sizing of
-D11, not a default. Until then treat `autoApproveLive` as the single most
-dangerous field in the config.
+*Fixed in slice 3, 2026-08-24 (`refactor/slice-3-arb-and-lifecycle`).* Corrected `defaultLiveStrategy()` default to `autoApproveLive: false` (and `autoApprovePaper: true`). Live trading requires manual confirmation (`announceBeforeTrade: true`) or explicit operator opt-in before executing orders on-chain. Added `assertLiveSafetyCaps()` for continuous D11 live blast radius enforcement.
 
 ### 29. The arb rollback's cash fallback silently credits nothing ✅ FIXED
 

@@ -1279,4 +1279,37 @@ describe('INVARIANT: settlement valuation resolves naked legs vs real outcome (I
   });
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+describe('INVARIANT: operator settings are never silently overwritten (D11, Item 19)', () => {
+  it('never widens a live risk cap beyond defaultLiveStrategy() on migration', () => {
+    const legacyFlatPaperConfig = {
+      mode: 'paper',
+      maxPositionCap: 100,
+      maxPositionSize: 100,
+      certaintyMaxUsd: 100,
+      arbMaxUsd: 50,
+      maxOpenPositions: 4,
+      kellyFraction: 0.12,
+    };
+
+    const migrated = normalizeConfigStore(legacyFlatPaperConfig);
+    const defaults = defaultLiveStrategy();
+
+    for (const field of [
+      'maxPositionCap',
+      'maxPositionSize',
+      'certaintyMaxUsd',
+      'arbMaxUsd',
+      'maxOpenPositions',
+      'kellyFraction',
+    ]) {
+      expect(
+        migrated.profiles.live[field],
+        `live ${field} was widened past its default by migration`,
+      ).toBeLessThanOrEqual(defaults[field]);
+    }
+  });
+});
+
+
 

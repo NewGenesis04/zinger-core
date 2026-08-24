@@ -156,8 +156,8 @@ export function defaultLiveStrategy() {
     // Wider than paper on purpose: a quoted ask is not a fill price, and this
     // margin is what absorbs the difference when real money is at stake.
     arbMinMarginPct: 0.010,
-    autoApprovePaper: false,
-    autoApproveLive: true,
+    autoApprovePaper: true,
+    autoApproveLive: false,
     slPct: 8,
     adaptiveSl: true,
     minAdaptiveSlPct: 6,
@@ -210,7 +210,8 @@ function normalizeSizing(strategy = {}) {
 
 /**
  * Migrate legacy flat config → dual-profile shape.
- * Flat strategy keys become both paper + live seeds (then live overrides applied).
+ * Flat strategy keys seed the paper profile; live profile strictly preserves
+ * conservative safety caps (Items 19 & 28).
  */
 export function normalizeConfigStore(raw, defaultsFlat = {}) {
   const base = { ...defaultsFlat, ...(raw || {}) };
@@ -223,13 +224,13 @@ export function normalizeConfigStore(raw, defaultsFlat = {}) {
   };
   const live = {
     ...defaultLiveStrategy(),
-    ...pickStrategy(defaultsFlat),
-    ...(hasProfiles ? pickStrategy(raw.profiles.live || {}) : pickStrategy(base)),
+    ...(hasProfiles ? pickStrategy(raw.profiles.live || {}) : {}),
     // Always keep live gate strict even if migrating from flat paper-ish config
     arbOnlyUntilEdge: hasProfiles
       ? (raw.profiles.live?.arbOnlyUntilEdge !== false)
       : true,
     requireEdgeForLive: true,
+    autoApproveLive: hasProfiles ? (raw.profiles.live?.autoApproveLive === true) : false,
   };
 
   return {
@@ -330,4 +331,33 @@ export function validateConfig(cfg = {}) {
   }
   return next;
 }
+
+/**
+ * Continuous live risk cap assertion (D11 Dimension 4 & Item 19/28).
+ * Ensures live blast radius does not exceed safety ceilings without explicit authorization.
+ */
+export function assertLiveSafetyCaps(liveCfg = {}) {
+  const violations = [];
+  const maxCap = Number(liveCfg.maxPositionCap ?? 1);
+  if (maxCap > 50) {
+    violations.push(`maxPositionCap $${maxCap} exceeds safety ceiling ($50)`);
+  }
+  const maxUsd = Number(liveCfg.certaintyMaxUsd ?? 2);
+  if (maxUsd > 100) {
+    violations.push(`certaintyMaxUsd $${maxUsd} exceeds safety ceiling ($100)`);
+  }
+  const maxArb = Number(liveCfg.arbMaxUsd ?? 1);
+  if (maxArb > 50) {
+    violations.push(`arbMaxUsd $${maxArb} exceeds safety ceiling ($50)`);
+  }
+  const maxOpen = Number(liveCfg.maxOpenPositions ?? 1);
+  if (maxOpen > 5) {
+    violations.push(`maxOpenPositions ${maxOpen} exceeds safety ceiling (5)`);
+  }
+  return {
+    ok: violations.length === 0,
+    violations,
+  };
+}
+
 
