@@ -631,6 +631,27 @@ export async function createApp() {
     }
   });
 
+  /**
+   * Structured Telemetry Event Bus Endpoint (D8 / Item 13/20).
+   * Exposes versioned telemetry events to external systems, audit tools, and dashboards.
+   */
+  app.get('/api/poly/events', (req, res) => {
+    try {
+      const { type, symbol, slug, since, limit, level } = req.query;
+      const events = poly.queryTelemetryEvents({
+        type: type ? (String(type).includes(',') ? String(type).split(',') : String(type)) : undefined,
+        symbol: symbol ? String(symbol) : undefined,
+        slug: slug ? String(slug) : undefined,
+        since: since ? Number(since) : undefined,
+        limit: limit ? Math.min(1000, Number(limit)) : 100,
+        level: level ? String(level) : undefined,
+      });
+      res.json({ ok: true, count: events.length, events });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
   app.post('/api/poly/notifications/read', (req, res) => {
     try {
       res.json(poly.markNotificationsRead());
