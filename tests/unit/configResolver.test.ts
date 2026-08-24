@@ -182,6 +182,29 @@ describe('INVARIANT: an explicit entry threshold beats the prior (item 26)', () 
     expect(resolveEntryWindows('15m', { minConfidence: 0.6 }).minConfidence).toBe(0.6);
   });
 
+  it('scales entry timing across 5m, 15m, 4h when entryWindowFrac is provided (item 30)', () => {
+    const r5m = resolveEntryWindows('5m', { entryWindowFrac: 0.90 });
+    expect(r5m.maxEntryRemainingSec).toBe(270); // 300 * 0.90
+    expect(r5m.resolved.maxEntryRemainingSec.source).toContain('entryWindowFrac');
+
+    const r15m = resolveEntryWindows('15m', { entryWindowFrac: 0.90 });
+    expect(r15m.maxEntryRemainingSec).toBe(810); // 900 * 0.90
+    expect(r15m.resolved.maxEntryRemainingSec.source).toContain('entryWindowFrac');
+
+    const r4h = resolveEntryWindows('4h', { entryWindowFrac: 0.90 });
+    expect(r4h.maxEntryRemainingSec).toBe(12960); // 14400 * 0.90
+    expect(r4h.resolved.maxEntryRemainingSec.source).toContain('entryWindowFrac');
+  });
+
+  it('lets explicit per-duration seconds override entryWindowFrac', () => {
+    const r = resolveEntryWindows('15m', {
+      entryWindowFrac: 0.90,
+      maxEntryRemainingSec_15m: 650,
+    });
+    expect(r.maxEntryRemainingSec).toBe(650);
+    expect(r.resolved.maxEntryRemainingSec.source).toBe('cfg.maxEntryRemainingSec_15m');
+  });
+
   it('prefers a trained stratum over the prior but not over the operator', () => {
     // Ordering check that does not depend on a trained store existing: the
     // candidate list must place automation between operator and default.

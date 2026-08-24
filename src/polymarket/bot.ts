@@ -45,6 +45,7 @@ import {
   reconcilePendingPackages,
   getArbPackageMetrics,
   loadPackages,
+  resetPackages,
 } from './arbEngine.js';
 import { persist, persistSync, load, FILES, dataPath } from './persistence.js';
 import { placeOrder, placeMarketSell, syncClobBalance } from './trade.js';
@@ -3705,10 +3706,32 @@ export function resetPaperData({ initialDeposit = 100 } = {}) {
     label: 'Before paper reset',
     source: 'paper_reset_backup',
   });
+
+  const paperTrades = botState.trades.filter((trade) => trade.mode === 'paper');
+  const paperPositions = botState.positions.filter((position) => position.mode === 'paper');
+  const paperPackages = loadPackages().filter((pkg) => pkg.mode === 'paper');
+
+  if (paperPackages.length > 0 || paperTrades.length > 0 || paperPositions.length > 0) {
+    const archiveFile = dataPath('poly_paper_archive.json');
+    const prev = load(archiveFile, []) || [];
+    persistSync(archiveFile, [
+      ...prev.slice(-20),
+      {
+        archivedAt: Date.now(),
+        reason: 'paper_reset_clean_slate',
+        packages: paperPackages,
+        trades: paperTrades,
+        positions: paperPositions,
+      },
+    ]);
+  }
+
+  const { removed: removedPackages } = resetPackages('paper');
   const removed = {
-    trades: botState.trades.filter((trade) => trade.mode === 'paper').length,
-    positions: botState.positions.filter((position) => position.mode === 'paper').length,
+    trades: paperTrades.length,
+    positions: paperPositions.length,
     actions: botState.actions.filter((action) => action.mode === 'paper').length,
+    packages: removedPackages,
   };
   botState.trades = botState.trades.filter((trade) => trade.mode !== 'paper');
   botState.positions = botState.positions.filter((position) => position.mode !== 'paper');
@@ -3726,7 +3749,7 @@ export function resetPaperData({ initialDeposit = 100 } = {}) {
   saveConfig({ mode: 'paper', enabled: false, paperBankroll: amount, paperInitialDeposit: amount },
     { tier: 'operator', source: 'reset-paper' });
   refreshKellyHistory();
-  log(`♻️ PAPER DATA RESET · $${amount.toFixed(2)} initial · removed ${removed.trades} trades`, 'system', removed);
+  log(`♻️ PAPER DATA RESET · $${amount.toFixed(2)} initial · removed ${removed.trades} trades, ${removed.packages} packages`, 'system', removed);
   notifyStateChange();
   return { ok: true, removed, paperBankroll: amount };
 }
@@ -3746,6 +3769,7 @@ export function resetLiveData({ baselineUsd = null } = {}) {
 
   const liveTrades = botState.trades.filter((trade) => trade.mode === 'live');
   const livePositions = botState.positions.filter((position) => position.mode === 'live');
+  const livePackages = loadPackages().filter((pkg) => pkg.mode === 'live');
   const phantomTrades = liveTrades.filter((t) => !t.orderId);
   const phantomOpen = livePositions.filter((p) => !p.closed && !p.orderId);
 
@@ -3756,6 +3780,7 @@ export function resetLiveData({ baselineUsd = null } = {}) {
     {
       archivedAt: Date.now(),
       reason: 'live_reset_clean_slate',
+      packages: livePackages,
       trades: liveTrades,
       positions: livePositions,
       phantomTradeCount: phantomTrades.length,
@@ -3763,9 +3788,11 @@ export function resetLiveData({ baselineUsd = null } = {}) {
     },
   ]);
 
+  const { removed: removedLivePackages } = resetPackages('live');
   const removed = {
     trades: liveTrades.length,
     positions: livePositions.length,
+    packages: removedLivePackages,
     actions: botState.actions.filter((action) => action.mode === 'live').length,
     phantomTrades: phantomTrades.length,
     phantomOpen: phantomOpen.length,

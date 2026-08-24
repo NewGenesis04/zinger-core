@@ -1,6 +1,6 @@
 import { describe, expect, it, beforeEach } from 'vitest';
 import { detectAndExecuteArbPackage, getArbPackageMetrics } from '../../src/polymarket/arbEngine.js';
-import { saveAllPackages } from '../../src/polymarket/arbPersistence.js';
+import { saveAllPackages, resetPackages } from '../../src/polymarket/arbPersistence.js';
 
 describe('Atomic Arb Engine', () => {
   beforeEach(() => {
@@ -198,5 +198,30 @@ describe('Atomic Arb Engine', () => {
       expect(plan.packageId).toBeDefined();
       expect(plan.isArbLeg).toBe(true);
     }
+  });
+
+  it('resets packages by mode cleanly (item 24)', () => {
+    saveAllPackages([
+      { packageId: 'paper-1', mode: 'paper', status: 'SETTLED', lockedProfitUsd: 1.0 },
+      { packageId: 'paper-2', mode: 'paper', status: 'LOCKED', lockedProfitUsd: 0.5 },
+      { packageId: 'live-1', mode: 'live', status: 'LOCKED', lockedProfitUsd: 0.8 },
+    ] as any);
+
+    // Resetting paper removes paper-1 and paper-2, preserving live-1
+    const { removed } = resetPackages('paper');
+    expect(removed).toBe(2);
+
+    const paperMetrics = getArbPackageMetrics('paper');
+    expect(paperMetrics.totalPackages).toBe(0);
+    expect(paperMetrics.netProfitUsd).toBe(0);
+
+    const liveMetrics = getArbPackageMetrics('live');
+    expect(liveMetrics.totalPackages).toBe(1);
+    expect(liveMetrics.activeLocked).toBe(1);
+
+    // Resetting live removes live-1
+    const { removed: removedLive } = resetPackages('live');
+    expect(removedLive).toBe(1);
+    expect(getArbPackageMetrics('live').totalPackages).toBe(0);
   });
 });

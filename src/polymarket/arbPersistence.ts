@@ -87,3 +87,11 @@ export function saveAllPackages(packages: ArbPackage[]): void {
 export function getActivePackages(mode: string = 'paper'): ArbPackage[] {
   return loadPackages().filter((p) => p.mode === mode && (p.status === 'LOCKED' || p.status === 'PENDING_FILL'));
 }
+
+export function resetPackages(mode?: string): { removed: number } {
+  const current = loadPackages();
+  const keep = mode ? current.filter((p) => p.mode !== mode) : [];
+  const removed = current.length - keep.length;
+  saveAllPackages(keep);
+  return { removed };
+}

@@ -8,6 +8,7 @@
  */
 import { load, dataPath } from '../persistence.js';
 import { resolveNumber } from '../config/resolver.js';
+import { DURATION_SECONDS } from '../config.js';
 
 const FILE = dataPath('fund_heuristics.json');
 let _cache = null;
@@ -56,6 +57,17 @@ export const DURATION_ENTRY_DEFAULTS = Object.freeze({
     slPct: 18,
     kellyFraction: 0.07,
     maxPositionPct: 0.1,
+    minConfidence: 0.45,
+    maxOpens: 1,
+  },
+  '4h': {
+    maxEntryRemainingSec: 12800,
+    minRemainingSec: 300,
+    tpPctLow: 10,
+    tpPctHigh: 25,
+    slPct: 20,
+    kellyFraction: 0.06,
+    maxPositionPct: 0.08,
     minConfidence: 0.45,
     maxOpens: 1,
   },
@@ -168,11 +180,19 @@ export function resolveEntryWindows(duration, cfg = {}) {
   const heur = heuristicForTrade({ duration });
   const dur = normalizeDuration(duration);
   const prior = DURATION_ENTRY_DEFAULTS[dur];
+  const windowSec = DURATION_SECONDS[dur] || 300;
+
+  const fracSec = (Number.isFinite(Number(cfg.entryWindowFrac)) && Number(cfg.entryWindowFrac) > 0)
+    ? Math.round(windowSec * Number(cfg.entryWindowFrac))
+    : null;
 
   // Omitting `genericAllDurations` reproduces the original 5m-only scoping of
   // the bare key: `dur === '5m' ? cfg[field] : null`.
   const pick = (field, { genericAllDurations = false } = {}) => resolveNumber([
     { tier: 'operator', value: cfg[`${field}_${dur}`], source: `cfg.${field}_${dur}` },
+    ...(field === 'maxEntryRemainingSec' && fracSec != null
+      ? [{ tier: 'operator', value: fracSec, source: `cfg.entryWindowFrac (${cfg.entryWindowFrac})` }]
+      : []),
     ...(genericAllDurations || dur === '5m'
       ? [{ tier: 'operator', value: cfg[field], source: `cfg.${field}` }]
       : []),

@@ -8,7 +8,7 @@ import { POLY_WINDOW_SECONDS, DURATION_SECONDS } from './config.js';
 
 export function parseSlugWindow(slug) {
   if (!slug || typeof slug !== 'string') return null;
-  const m = slug.match(/^(btc|eth)-updown-(5m|15m|30m|1h|60m)-(\d+)$/i);
+  const m = slug.match(/^(btc|eth)-updown-(5m|15m|30m|1h|60m|4h)-(\d+)$/i);
   if (!m) return null;
   const startSec = Number(m[3]);
   if (!Number.isFinite(startSec) || startSec <= 0) return null;

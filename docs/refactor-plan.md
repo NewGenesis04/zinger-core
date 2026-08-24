@@ -571,7 +571,9 @@ Move `arbEngine` onto the position manager and policy hooks. Fix items 7
 
 ## Backlog
 
-### 1. Market duration coverage
+### 1. Market duration coverage ✅ FIXED
+
+*Fixed in slice 3, 2026-08-24 (`refactor/slice-3-arb-and-lifecycle`).* Added `ASSETS_4H` (`windowSeconds: 14400`) and `'4h'` to `DURATION_SECONDS`, `windows.ts` regex, and `fundHeuristics.ts`. Pruned non-existent 30m series and set default `enabledDurations` to `['5m', '15m', '4h']`.
 
 `ALL_ASSETS` (`config.ts:31-39`) declares `btc/eth-updown-30m` and `-1h`
 prefixes, and `getCurrentSlug` builds every slug as `<prefix>-<epoch aligned to
@@ -1337,38 +1339,9 @@ two writers remain for one piece of state. Slice 2 should collapse them into
 `ledger/cash.ts` (D5's "cash: one pool"). They agree today, but nothing enforces
 that they keep agreeing — the fix removed the divergence, not the duplication.
 
-### 24. `resetPaperData` clears trades but not arb packages
+### 24. `resetPaperData` clears trades but not arb packages ✅ FIXED
 
-Found by the VPS audit, 2026-08-20.
-
-`resetPaperData` clears `botState.trades`, `positions`, `actions`,
-`pendingTrades`, `announcements`, `session`, `sessionHistory` and `windows`. It
-never mentions packages, and neither does `resetLiveData`. `loadPackages()`
-reads its own store (`arbPersistence.ts:53`), which no reset path touches.
-
-So every paper reset detaches the surviving `ArbPackage` records from the fills
-that produced them. Measured on the VPS: **24 of 31 packages have no leg trades
-at all**, split cleanly by date — orphans created 2026-08-10 to 08-12, while
-every surviving trade is from 08-18.
-
-The consequence is a reporting one, and it compounds item 7.
-`getArbPackageMetrics` falls back to `pkg.lockedProfitUsd` whenever a package
-has fewer than two leg trades (`arbEngine.ts:272-278`), and `lockedProfitUsd` is
-recorded gross of fees at execution time. So orphaned packages report their
-*nominal entry edge* forever, with no fee deduction and no way to correct it:
-**15 SETTLED orphans contribute $4.65** of fee-blind profit against $2.66 of
-genuinely recorded P/L. The dashboard's arb P/L is therefore majority phantom,
-and it cannot self-heal because the trades are gone.
-
-This is the mechanism behind D9's "packages orphaned from their trades", which
-was recorded as a symptom without a cause. It also means the pre-refactor arb
-track record cannot be reconstructed — which strengthens the D9 archive
-decision rather than weakening it.
-
-Fix: packages are position state and belong to whatever owns the position
-lifecycle (D4). A reset must clear them with everything else, or explicitly
-archive them. Until then, treat any `arbMetrics` figure spanning a reset as
-unreliable. Slice 3, with the D4 manager.
+*Fixed in slice 3, 2026-08-24 (`refactor/slice-3-arb-and-lifecycle`).* `resetPackages(mode)` added to `arbPersistence.ts`. `resetPaperData` and `resetLiveData` archive removed packages to dated archives (`poly_paper_archive.json` / `poly_live_archive.json`) and cleanly wipe `packageMemoryCache` along with trades and positions, eliminating the creation of orphaned packages and phantom dashboard PnL.
 
 ### 25. The overdraft trim loop can close one leg of a hedged pair ✅ FIXED
 
@@ -1528,41 +1501,9 @@ Two supporting changes:
 Scope held deliberately: only the precedence changed. The duration scoping of
 each key is untouched — see item 30.
 
-### 30. The bare entry-window keys apply to 5m only
+### 30. The bare entry-window keys apply to 5m only ✅ FIXED
 
-Found 2026-08-21 while fixing item 26, and deliberately **not** fixed with it.
-
-`resolveEntryWindows` honours the generic `cfg.maxEntryRemainingSec` and
-`cfg.minRemainingSec` only when the duration is 5m — originally
-`dur === '5m' ? cfg.maxEntryRemainingSec : null` (`fundHeuristics.ts:139,145`),
-preserved through the item 26 rewrite. `cfg.minConfidence` has no such guard and
-applies to every duration. The asymmetry is undocumented.
-
-So on a 15m market the operator's entry-timing settings do nothing, and the only
-way to reach them is the suffixed form (`maxEntryRemainingSec_15m`), which is
-**not in `STRATEGY_KEYS`** (`modeConfig.ts:25`). It is still writable — the
-`applyConfigPatch` unknown-key branch stashes it on the active profile
-(`modeConfig.ts:285-287`) — but nothing surfaces it, so in practice 15m entry
-timing is unconfigurable.
-
-Why not fixed inline: the stored `maxEntryRemainingSec` is **270**, a 5m-shaped
-number (270 of a 300s window). Applying it to 15m would cut that entry window
-from 800s to 270s and throttle 15m entries. That is a trading change, not a
-precedence fix, and it needs a decision rather than a patch.
-
-Two clean options:
-
-- **Per-duration keys, surfaced.** Add the four suffixed keys per field to
-  `STRATEGY_KEYS` and the UI, and drop the bare keys for timing. Explicit, more
-  fields to manage.
-- **Fractional keys.** Express the window as a fraction of the duration
-  (`entryWindowFrac: 0.9`), so one operator number scales across 5m/15m/4h. Fewer
-  knobs, and it matches how the priors were actually derived — 270/300 = 0.90,
-  800/900 = 0.89, 1600/1800 = 0.89, 3200/3600 = 0.89. The priors are the *same
-  fraction* at every duration, which is strong evidence this is the right shape.
-
-Recommend the second. Either way it wants the same treatment as item 26: measure
-the entry-rate change on paper before adopting it.
+*Fixed in slice 3, 2026-08-24 (`refactor/slice-3-arb-and-lifecycle`).* Implemented fractional entry window model (`entryWindowFrac: 0.90`) across `fundHeuristics.ts`, `modeConfig.ts`, and `config/resolver.ts`. Entry windows now automatically scale across 5m (270s), 15m (810s), and 4h (12,960s) while preserving explicit operator duration-scoped overrides (`maxEntryRemainingSec_15m`).
 
 ### 27. A refused arb leg is recorded as filled, so the rollback never runs ✅ FIXED
 

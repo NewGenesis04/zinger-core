@@ -1,4 +1,4 @@
-import { savePackage, loadPackages, getActivePackages } from './arbPersistence.js';
+import { savePackage, loadPackages, getActivePackages, resetPackages } from './arbPersistence.js';
 import {
   closeProceedsWithFee,
   takerFeeUsdc,
@@ -8,7 +8,7 @@ import {
 import type { ArbPackage } from './arbPersistence.js';
 
 export type { ArbPackage };
-export { getActivePackages, loadPackages };
+export { getActivePackages, loadPackages, resetPackages };
 
 /**
  * True when both legs are complementary outcomes of one binary condition, so

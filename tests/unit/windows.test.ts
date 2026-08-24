@@ -19,6 +19,17 @@ describe('parseSlugWindow', () => {
     expect(w?.windowSec).toBe(3600);
   });
 
+  it('parses 4h epoch slug correctly (item 1)', () => {
+    const w = parseSlugWindow('btc-updown-4h-1787083200');
+    expect(w).toMatchObject({
+      asset: 'BTC',
+      duration: '4h',
+      windowSec: 14400,
+      startSec: 1787083200,
+      endSec: 1787083200 + 14400,
+    });
+  });
+
   it('returns null for garbage', () => {
     expect(parseSlugWindow('')).toBeNull();
     expect(parseSlugWindow('not-a-slug')).toBeNull();
