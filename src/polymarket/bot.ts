@@ -95,6 +95,17 @@ import {
   windowKeyFromTrade,
 } from './windows.js';
 import {
+  formatRemainingMs,
+  prunePendingTrades as prunePendingTradesCycle,
+  updateBotTradeStats,
+  bookWindowExit as bookWindowExitCycle,
+  evaluateCycleBoundary,
+} from './scan/cycle.js';
+import {
+  collectSignals,
+  enrichMarketsWithOracle,
+} from './scan/inputs.js';
+import {
   saveConfigSession,
   listConfigSessions,
   getConfigSession,
@@ -541,114 +552,19 @@ async function arbHousekeeping(reason = 'scan') {
 
 /** Detect real 5m market-window rollover (slug open→end) → book window stats. */
 function maybeFinalizeCycle() {
-  const wall = currentWallWindow(POLY_WINDOW_SECONDS);
-  // Key by window START so it stays stable for the full open→end interval
-  const cycleKey = String(wall.startSec);
-  if (botState._cycleKey == null) {
-    botState._cycleKey = cycleKey;
-    botState.windows.current = {
-      ...wall,
-      ...computeWindowStats(botState.trades, botState.positions, wall, botState.config.mode),
-    };
-    return null;
-  }
-  if (botState._cycleKey === cycleKey) {
-    // Live-refresh current window stats without rolling
-    botState.windows.current = {
-      ...wall,
-      ...computeWindowStats(botState.trades, botState.positions, wall, botState.config.mode),
-      accum: { ...botState._cycleSettleAccum },
-    };
-    return null;
-  }
-
-  const prevStart = Number(botState._cycleKey);
-  const prevWindow = {
-    startSec: prevStart,
-    endSec: prevStart + POLY_WINDOW_SECONDS,
-    startAtMs: prevStart * 1000,
-    endAtMs: (prevStart + POLY_WINDOW_SECONDS) * 1000,
-    key: `wall-${POLY_WINDOW_SECONDS}-${prevStart}`,
-    windowSec: POLY_WINDOW_SECONDS,
-  };
-  const accum = { ...botState._cycleSettleAccum };
-  const wstats = computeWindowStats(botState.trades, botState.positions, prevWindow, botState.config.mode);
-  const portfolio = buildPortfolio(botState.readiness, botState.config.mode || 'paper');
-  const entry = {
-    cycleEndAt: prevWindow.endAtMs,
-    cycleStartAt: prevWindow.startAtMs,
-    cycleKey: String(prevStart),
-    openAt: prevWindow.startAtMs,
-    endAt: prevWindow.endAtMs,
-    pnl: wstats.pnl || accum.pnl || 0,
-    closes: wstats.closes || accum.closes || 0,
-    rewards: accum.rewards || 0,
-    tpFull: wstats.tpFull || accum.tp || 0,
-    tpPartial: wstats.tpPartial || accum.partial || 0,
-    tpHits: wstats.tpHits || 0,
-    sl: wstats.byReason?.sl || accum.sl || 0,
-    trail: wstats.byReason?.trail || accum.trail || 0,
-    settle: wstats.byReason?.settle || accum.settle || 0,
-    byReason: wstats.byReason,
-    wr: wstats.wr,
-    equity: portfolio.equity,
-    netPnl: portfolio.netPnl,
-    cash: portfolio.cash,
-    unrealizedPnl: portfolio.unrealizedPnl,
-    realizedPnl: portfolio.realizedPnl,
-    openCount: portfolio.openCount,
-    mode: botState.config.mode,
-  };
-  recordCycleSession(entry);
-  botState.cycleReward = { ...entry, at: Date.now() };
-  botState.settle.lastCycle = entry;
-  botState.settle.history = [entry, ...(botState.settle.history || [])].slice(0, 40);
-  botState.windows.history = [entry, ...(botState.windows.history || [])].slice(0, 40);
-  botState._cycleSettleAccum = { pnl: 0, closes: 0, rewards: 0, tp: 0, sl: 0, trail: 0, settle: 0, partial: 0 };
-  botState._cycleKey = cycleKey;
-  botState.windows.current = {
-    ...wall,
-    ...computeWindowStats(botState.trades, botState.positions, wall, botState.config.mode),
-    accum: { ...botState._cycleSettleAccum },
-  };
-
-  log(
-    `🏁 WINDOW ${new Date(prevWindow.startAtMs).toISOString().slice(11, 16)}→${new Date(prevWindow.endAtMs).toISOString().slice(11, 16)} · closes ${entry.closes} · TP ${entry.tpHits} · PnL $${Number(entry.pnl || 0).toFixed(2)} · cash $${Number(entry.cash || 0).toFixed(2)}`,
-    'system',
-    entry,
-  );
-
-  if (botState.stopRequest?.status === 'queued') {
-    const request = { ...botState.stopRequest };
-    stopBot({ immediate: true, reason: 'queued_window_end' });
-    log(
-      `⏹️ QUEUED STOP COMPLETE · requested ${new Date(request.requestedAt).toLocaleTimeString()} · window closed`,
-      'system',
-      request,
-    );
-  } else if (botState.config.llmOptimize !== false && botState.running) {
-    optimizeNow({ apply: true, useLlm: true }).catch((err) => {
-      log(`⚠️ Optimizer after cycle: ${err.message?.slice(0, 100) || err}`, 'error');
-    });
-  }
-  notifyStateChange();
-  return entry;
+  return evaluateCycleBoundary({
+    botState,
+    buildPortfolio,
+    recordCycleSession,
+    log,
+    stopBot,
+    optimizeNow,
+    notifyStateChange,
+  });
 }
 
 function bookWindowExit(exitReason, pnl) {
-  const reward = Number(pnl || 0);
-  botState._cycleSettleAccum.pnl = Math.round((botState._cycleSettleAccum.pnl + reward) * 100) / 100;
-  botState._cycleSettleAccum.closes += 1;
-  if (reward > 0) {
-    botState._cycleSettleAccum.rewards = Math.round((botState._cycleSettleAccum.rewards + reward) * 100) / 100;
-  }
-  const key = exitReason === 'tp' ? 'tp'
-    : exitReason === 'partial' ? 'partial'
-      : exitReason === 'sl' ? 'sl'
-        : exitReason === 'trail' ? 'trail'
-          : exitReason === 'settle' ? 'settle'
-            : null;
-  if (key) botState._cycleSettleAccum[key] = (botState._cycleSettleAccum[key] || 0) + 1;
+  bookWindowExitCycle(botState._cycleSettleAccum, exitReason, pnl);
 }
 
 function computeStats(trades) {
@@ -2058,55 +1974,15 @@ async function scan() {
     botState.stats.scansDone = (botState.stats.scansDone || 0) + 1;
     const readiness = await refreshTelemetry();
 
-    if (cfg.useSignals) {
-      // A signal-feed outage must not abort the whole scan pass: the arb engine
-      // further down needs only the Polymarket book, and the directional path
-      // already refuses stale/missing signals via data assurance. Keep the last
-      // known signals and carry on rather than throwing out of scan().
-      const freshSignals = await getSignalForBoth().catch((err) => {
-        if (Date.now() - (botState._signalFailLoggedAt || 0) > 60_000) {
-          botState._signalFailLoggedAt = Date.now();
-          log(`⚠️ Signal feed unavailable — ${String(err?.message || err).slice(0, 90)} · reusing last signals`, 'error');
-        }
-        return null;
-      });
-      if (freshSignals) botState.signals = freshSignals;
-      // Prefer cached ML ladder from background refresh; only force a light signal nudge
-      const mlOverride = cfg.useML
-        ? await getMLSignalForBoth('5m', 1).catch(() => ({ btc: null, eth: null }))
-        : null;
-      if (mlOverride) {
-        for (const asset of ['btc', 'eth']) {
-          const raw = botState.signals[asset];
-          const ml = mlOverride[asset];
-          if (!raw || !ml || ml.error || ml.direction === 'neutral' || ml.direction === 0) continue;
-          addMLPrediction(asset, ml);
-          const rawIsBull = raw.direction === 'up';
-          const mlIsBull = ml.direction === 1 || ml.direction === 'up';
-          const mlConf = Number(ml.confidence || 0);
-          // Paper: let a clear ML call fill neutral/weak technicals so scans actually fire
-          const paperLoose = cfg.mode === 'paper' && mlConf >= 0.58;
-          const liveStrong = mlConf >= 0.62;
-          if ((paperLoose || liveStrong) && (raw.direction === 'neutral' || rawIsBull !== mlIsBull)) {
-            raw.direction = mlIsBull ? 'up' : 'down';
-            raw.confidence = Math.min(0.65, Math.max(raw.confidence || 0, mlConf * 0.75));
-            raw.score = Math.min(6, mlConf * 6);
-            raw.mlOverride = true;
-            raw.mlConfidence = mlConf;
-          } else if ((paperLoose || liveStrong) && rawIsBull === mlIsBull) {
-            raw.confidence = Math.min(0.65, (raw.confidence || 0) + mlConf * 0.12);
-            raw.mlConfirmed = true;
-            raw.mlConfidence = mlConf;
-          }
-          const bias = getConfidenceBias(asset, raw);
-          if (bias.bias !== 0) {
-            raw.confidence = Math.min(0.65, bias.adjusted);
-            raw.confidenceBias = bias;
-            raw.confidenceBiasUsed = true;
-          }
-        }
-      }
-    }
+    await collectSignals({
+      cfg,
+      botState,
+      getSignalForBoth,
+      getMLSignalForBoth,
+      addMLPrediction,
+      getConfidenceBias,
+      log,
+    });
 
     const { markets, diagnostics } = await findMarkets(resolveMarketDurations(cfg));
     botState.diagnostics = diagnostics;
@@ -2144,21 +2020,7 @@ async function scan() {
     }
 
     // Restore window open clock + Chainlink to-beat before decisions (bounded).
-    await Promise.all(tradableMarkets.map(async (market) => {
-      const windowSec = Number(market.windowSeconds || POLY_WINDOW_SECONDS) || POLY_WINDOW_SECONDS;
-      if (!market.eventStartTime && market.endTime) {
-        market.eventStartTime = new Date((Number(market.endTime) - windowSec) * 1000).toISOString();
-      }
-      if (!market.endDate && market.endTime) {
-        market.endDate = new Date(Number(market.endTime) * 1000).toISOString();
-      }
-      const ptb = await Promise.race([
-        fetchPriceToBeat(market).catch(() => null),
-        new Promise((resolve) => setTimeout(() => resolve(null), 3500)),
-      ]);
-      market.priceToBeat = ptb?.openPrice ?? market.priceToBeat ?? null;
-      market.priceToBeatMeta = ptb || market.priceToBeatMeta || null;
-    }));
+    await enrichMarketsWithOracle(tradableMarkets, { fetchPriceToBeat, timeoutMs: 3500 });
 
     const signalTs = Math.max(
       Number(botState.signals?.btc?.timestamp || 0),
@@ -3049,11 +2911,7 @@ async function scan() {
       botRunning: true,
     });
 
-    const t = botState.trades;
-    botState.stats.totalTrades = t.length;
-    botState.stats.totalPnl = Math.round(t.reduce((s, x) => s + (x.pnl || 0), 0) * 100) / 100;
-    botState.stats.wins = t.filter(x => (x.pnl || 0) > 0).length;
-    botState.stats.losses = t.filter(x => (x.pnl || 0) <= 0).length;
+    updateBotTradeStats(botState);
 
     saveState();
 
