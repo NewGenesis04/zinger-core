@@ -38,8 +38,13 @@ export const ASSETS_1H = [
   { symbol: 'ETH', duration: '1h', slugPrefix: 'eth-updown-1h', windowSeconds: 3600 },
 ];
 
-/** All duration books the bot can discover (Gamma may not list 30m/1h yet). */
-export const ALL_ASSETS = [...ASSETS, ...ASSETS_15M, ...ASSETS_30M, ...ASSETS_1H];
+export const ASSETS_4H = [
+  { symbol: 'BTC', duration: '4h', slugPrefix: 'btc-updown-4h', windowSeconds: 14400 },
+  { symbol: 'ETH', duration: '4h', slugPrefix: 'eth-updown-4h', windowSeconds: 14400 },
+];
+
+/** All duration books the bot can discover (Gamma lists 5m, 15m, and 4h epoch series). */
+export const ALL_ASSETS = [...ASSETS, ...ASSETS_15M, ...ASSETS_4H, ...ASSETS_30M, ...ASSETS_1H];
 
 export const DURATION_SECONDS = {
   '5m': 300,
@@ -47,16 +52,17 @@ export const DURATION_SECONDS = {
   '30m': 1800,
   '1h': 3600,
   '60m': 3600,
+  '4h': 14400,
 };
 
-export function assetsForDurations(durations = ['5m', '15m', '30m', '1h']) {
+export function assetsForDurations(durations = ['5m', '15m', '4h']) {
   const want = new Set((durations || []).map((d) => String(d).toLowerCase()));
   return ALL_ASSETS.filter((a) => want.has(String(a.duration).toLowerCase()));
 }
 
 export function durationFromSlug(slug) {
   if (!slug || typeof slug !== 'string') return null;
-  const m = slug.match(/-updown-(5m|15m|30m|1h|60m)-/i);
+  const m = slug.match(/-updown-(5m|15m|30m|1h|60m|4h)-/i);
   return m ? (m[1].toLowerCase() === '60m' ? '1h' : m[1].toLowerCase()) : null;
 }
 

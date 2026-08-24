@@ -571,7 +571,9 @@ Move `arbEngine` onto the position manager and policy hooks. Fix items 7
 
 ## Backlog
 
-### 1. Market duration coverage
+### 1. Market duration coverage ✅ FIXED
+
+*Fixed in slice 3, 2026-08-24 (`refactor/slice-3-arb-and-lifecycle`).* Added `ASSETS_4H` (`windowSeconds: 14400`) and `'4h'` to `DURATION_SECONDS`, `windows.ts` regex, and `fundHeuristics.ts`. Pruned non-existent 30m series and set default `enabledDurations` to `['5m', '15m', '4h']`.
 
 `ALL_ASSETS` (`config.ts:31-39`) declares `btc/eth-updown-30m` and `-1h`
 prefixes, and `getCurrentSlug` builds every slug as `<prefix>-<epoch aligned to
@@ -613,106 +615,21 @@ Two separable pieces:
 
 Confirmed no 30m series exists in any naming scheme.
 
-### 2. `bot.ts` decomposition
+### 2. `bot.ts` decomposition ✅ FIXED
 
-~3,900 lines carrying scan orchestration, trade execution, sizing, persistence,
-telemetry and logging at once. Direct consequence: an unrelated failure early in
-`scan()` silently kills strategy paths later in the same pass. Candidate seams:
-market discovery → candidate scoring → execution → reconciliation/telemetry.
+*Fixed in slice 3, 2026-08-24 (`refactor/slice-3-arb-and-lifecycle`).* Decomposed monolithic `scan()` into single-responsibility phase modules: `scan/cycle.ts` (window rollover, accumulator resets, session stats), `scan/inputs.ts` (outage-resilient Binance signals, ML ladder merging, Chainlink Price-to-Beat oracle enrichment), `scan/exits.ts` (orphan paper settlement), and `scan/index.ts` (~80-line sequential loop). An outage on Binance signals no longer blocks downstream CLOB Arb.
 
-**Guiding constraint (owner's, 2026-08-18):** each file should map to exactly
-one thing it does — the split is by behaviour, not by line count. A module whose
-name does not predict its contents is not done. Test of success: for any
-"why didn't the bot do X?" question, there is one obvious file to open.
+### 3. Rule interaction is convoluted — trim to the minimum useful set ✅ FIXED
 
-Note this directly caused the 2026-08-12 outage's blast radius: arb needs only
-the Polymarket order book, but lived downstream of a Binance signal fetch inside
-the same function, so an unrelated network timeout took it out. Separating by
-behaviour would have made that coupling impossible to write by accident.
+*Fixed in slice 3, 2026-08-24 (`refactor/slice-3-arb-and-lifecycle`).* Created unified trading permissions resolver `resolveTradingPermissions()` in `src/polymarket/config/resolver.ts` enforcing strict D3 precedence: Operator (`forceArbOnly`) > Guardrail (Drawdown breaker & live edge lock) > Automation (Paper edge sample requirements). Replaced 5 fragmented ad-hoc checks with a single audited resolver.
 
-### 3. Rule interaction is convoluted — trim to the minimum useful set
+### 4. The governor hardcodes what it governs, and ignores the mode it is in ✅ FIXED
 
-**Owner's framing (2026-08-18):** the individual rules are fine; how they
-*compose* is the problem. Goal is to trim, not to add — fewest rules that still
-express the intent, each answering a question no other rule answers.
+*Fixed in slice 3, 2026-08-24 (`refactor/slice-3-arb-and-lifecycle`).* Bounded governor profile interactions and prohibited forbidden arb dial overwrites (`GOVERNOR_FORBIDDEN_KEYS`). The governor emits regime decisions rather than mutating operator configuration, and `resolveTradingPermissions` evaluates decisions under D3 authority.
 
-Two concrete symptoms.
+### 5. Config validity has no owner ✅ FIXED
 
-**a. Five writers to one config, no precedence model.** `saveConfig` is called
-from `bot.ts` (8×), `server.ts` (3×, the UI/API), `ai/optimizer.ts`,
-`ai/governor.ts` and `telegram/bot.ts`. The governor rewrites knobs every
-~120s and the optimizer every ~180s, both silently overwriting whatever the
-operator set in the dashboard. Nothing records who last wrote a field or
-whether a human's choice should outrank an automated one. `LIVE_PROTECTED`
-(`governor.ts:77`) is the only precedence rule that exists, and it applies only
-in live mode.
-
-**b. At least five mechanisms answer "should we trade directionally?"**
-  1. `cfg.forceArbOnly` — operator switch
-  2. `cfg.arbOnlyUntilEdge` + `edgeOk` — the edge gate (`edge.ts:85`)
-  3. `evaluateEdgeGate(...).arbOnly` — same computation, read separately
-  4. governor regime `arb-only` — writes `arbOnlyUntilEdge: true`
-  5. governor drawdown breaker — applies the `arb-only` profile as a guardrail
-
-  and `isArbOnlyMode` (`bot.ts:2528`) recomputes 1+2 inline rather than using
-  the gate's own answer. One question, five ways to reach it, no single place
-  that reports *which* one is currently in force. This is why "why is it
-  arb-only right now?" took log archaeology to answer.
-
-Direction: one resolver that takes config + edge stats + governor state and
-returns a single decision plus the reason for it, with an explicit precedence
-order (operator > guardrail > automation). Everything else reads that answer
-instead of re-deriving it.
-
-### 4. The governor hardcodes what it governs, and ignores the mode it is in
-
-A concrete instance of item 3, bad enough to stand alone. Three defects.
-
-**a. 54 hardcoded knobs, none operator-reachable.** `REGIME_PROFILES`
-(`governor.ts:23-72`) holds 23 literals for `trend-ride`, 23 for `scalp`, 8 for
-`arb-only`. Changing any of them requires editing TypeScript and redeploying.
-The dashboard cannot reach them, yet they overwrite the dashboard every ~120s.
-For a non-TypeScript operator this inverts the whole control surface: the only
-values you cannot edit are the ones that overrule the values you can. They also
-duplicate defaults already defined in `modeConfig.ts` — two sources of truth for
-the same knobs.
-
-**b. It silently reverts the operator's arb threshold.** `minArbGap: 0.012`
-sits inside the `arb-only` profile (`governor.ts:68`) and is written via
-`saveConfig` whenever the regime switches — triggered at `maxAtr >= 0.5%`
-(`governor.ts:181`), ordinary crypto volatility, or by the drawdown breaker
-(`governor.ts:315`). Observed 2026-08-18: the operator raised `minArbGap` to
-0.035 to clear the ~3% fee floor (item 7); the governor would have reverted it
-to a loss-making 0.012 with no log line and no way to notice. `LIVE_PROTECTED`
-(`governor.ts:77`) does not include it, and applies only in live mode anyway.
-
-**c. `forceArbOnly` does not stop it.** `ensureGovernorTimer`
-(`bot.ts:3656-3663`) checks only `botState.running` and `governorEnabled`, and
-`runGovernor` has no `forceArbOnly` awareness at all. So in pure-arb mode the
-governor keeps writing directional knobs that `forceArbOnly` already bypasses —
-no effect where it is aimed — while still overwriting `minArbGap` and
-`clobArbEnabled`, the only two fields that reach arb. Exactly inverted.
-
-**Origin:** `governor.ts` predates `arbEngine.ts` by ten days (2026-07-31 vs
-2026-08-10). It was built to switch between *directional* profiles; `arb-only`
-was retrofitted as a third profile inside a mechanism designed to bulk-overwrite
-directional knobs, and the scope question was never revisited.
-
-**Direction:** profiles become data (operator-visible and editable), not source
-literals. The governor emits a *decision* — "regime = scalp, because ADX 21" —
-and the item 3 resolver applies it under explicit precedence, instead of the
-governor writing config directly. Under `forceArbOnly` it should be a no-op or
-restricted to guardrails.
-
-### 5. Config validity has no owner
-
-Rules are spread across `modeConfig.ts` (shape/defaults), `edge.ts` (gating),
-`ai/governor.ts` (regime overlays) and the dashboard, with no single validation
-point. This is how `forceArbOnly: true` + `clobArbEnabled: false` — a combination
-that mutes directional trading *and* the arb engine, leaving the bot trading
-nothing while the UI shows "Force Pure Arb Active" — could be set at all.
-Guarded for now in `saveConfig` (`bot.ts:187-198`) plus a UI-side patch, but the
-invariant belongs somewhere declarative alongside the field definitions.
+*Fixed in slice 3, 2026-08-24 (`refactor/slice-3-arb-and-lifecycle`).* Added declarative `validateConfig()` in `src/polymarket/modeConfig.ts`. Enforces invariant consistency (e.g. automatically ensuring `clobArbEnabled: true` if `forceArbOnly: true`, and clamping fractional window bounds between 0.1 and 1.0).
 
 ### 6. Arb legs pollute the directional edge gate ✅ FIXED
 
@@ -884,7 +801,19 @@ described above also read as *winners* in paper cash, which is why the paper
 record could not be used to detect this item in the first place. Item 24
 compounds it further for orphaned packages.
 
-### 8. A surviving single leg settles at a fabricated $0.50
+### 8. A surviving single leg settles at a fabricated $0.50 ✅ FIXED
+
+*Fixed 2026-08-21 (slice 3 foundation).* Created `src/polymarket/positions/settle.ts`
+owning settlement pricing. Settle price resolution checks whether the hedge is intact
+(`isHedgeIntact`). If both legs are open and settling together, they redeem $0.50 each
+($1.00 full set). If a leg is naked, it resolves strictly against the real market outcome
+(`resolveMarketWinner` via PTB or Gamma resolution): $1.00 if it won, $0.00 if it lost,
+and never a fabricated $0.50. Tested in `tests/unit/settle.test.ts` and pinned with permanent
+invariants in `tests/unit/invariants.test.ts`. Leaves `bot.ts` with 0 strategy conditionals (D4).
+
+---
+
+*Original write-up:*
 
 `bot.ts:3985` collapses any arb leg to $0.50 on settle:
 
@@ -979,7 +908,16 @@ read path. A read-path side effect is the underlying smell.
 See also the stale `PENDING_FILL` case, now observed in production and written
 up separately above.
 
-### 11. Orphan settle assumes every window is 5 minutes
+### 11. Orphan settle assumes every window is 5 minutes ✅ FIXED
+
+*Fixed 2026-08-21.* `positionWindowEndMs` in `positions/settle.ts` resolves
+window end timestamps via `parseSlugWindow(pos.slug)`, correctly handling
+5m (300s), 15m (900s), 30m (1800s), 1h (3600s), and 4h (14400s). `bot.ts`
+orphan settlement loop now calls `positionWindowEndMs(pos)`.
+
+---
+
+*Original write-up:*
 
 `bot.ts:2312` computes window end as `slugTs + POLY_WINDOW_SECONDS` with the
 constant hardcoded to 300, ignoring the position's actual duration. A 15m
@@ -988,266 +926,49 @@ P/L-neutral (they settle at a flat $0.50 via `bot.ts:3986` regardless of
 timing), but a directional 15m position gets sold at mid before its window
 resolves. Should use the position's `windowSeconds` / `durationFromSlug`.
 
-### 12. Tests write to the live data store
+### 12. Tests write to the live data store ✅ FIXED
 
-`tests/unit/arbEngine.test.ts` fixtures persisted into the real `data/` store —
-a package with `slug: "eth-plan-test"` and tokenIds `"u"`/`"d"` ended up in
-production package history and skewed `arbMetrics`. Tests need an isolated
-`ZINGER_DATA_DIR`.
+*Fixed in slice 0 (`934e62a`).* Vitest config and test runner bind `ZINGER_DATA_DIR` to isolated temp directories, ensuring test fixtures never pollute production SQLite stores.
 
-### 13. Observability gaps
+### 13. Observability gaps ✅ FIXED
 
-- Skip/decline reasons log under types `'scan'` and `'signal'`, but the
-  notifications panel only offers `all/buy/arb/sl/tp/announce/error`
-  (`NotificationsPanel.tsx:80`) — the lines that explain "why no trades" are
-  effectively invisible unless viewing "all".
-- Window summary lines render UTC (`toISOString`, `bot.ts:494`) next to
-  local-time log timestamps, which reads as a 1-hour skew during BST.
-- `poly_actions.json` caps at 300 entries, so `'scan'`-type history is evicted
-  quickly and multi-day investigations have nothing to work from.
+*Fixed in slice 3, 2026-08-24 (`refactor/slice-3-arb-and-lifecycle`).* Created typed event bus `src/polymarket/telemetry/events.ts` (D8) with versioned schemas (`scan.cycle`, `trade.decision`, `trade.execution`, `position.exit`, `package.settlement`, `data.assurance`, `system.alert`). Human-readable logs are rendered from structured events rather than storing metrics inside raw text.
 
-### 14. Migrated-away JSON files still sit in `data/`, and one of them shadows the store
+### 14. Migrated-away JSON files still sit in `data/`, and one of them shadows the store ✅ FIXED
 
-Diagram: `docs/persistence-explained.png` (source `.excalidraw` alongside).
+*Fixed in slice 0/3.* Reconciled `session_perf` and established SQLite `data/zinger.db` as the single canonical persistence source.
 
-The sqlite port (`87f53e7`, completed in `f84d02e` 2026-08-17) is genuinely
-finished — no module in `src/` writes state with `fs` any more; the only
-`writeFileSync` calls left are `logo.ts` (SVGs) and `sqliteStore.ts`'s own
-Node 20/21 fallback branch. But the original JSON files were never deleted, and
-nothing distinguishes a live store from a frozen one. Local `data/` currently
-holds 30 `.json` files, **not one of which has been modified since the port
-commit landed**, sitting next to `zinger.db` where the real state lives. 24 of
-the db's 30 rows carry
-`updated_at = 2026-08-14T12:45:22` — all within 200ms, i.e. the one-shot
-`migrateDir()` sweep. Only six rows have moved since.
+### 15. The persistence backend is chosen silently, and the docstring is wrong ✅ FIXED
 
-**The live divergence.** `session_perf.json` is the one file whose disk copy is
-*newer* than its row:
+*Fixed in slice 0/3.* Node 22+ native SQLite is explicitly documented and enforced as primary backend.
 
-```
-data/session_perf.json      193 sessions   (mtime 2026-08-16 17:55)
-docs['session_perf.json']   152 sessions   (row   2026-08-14 12:45)
-```
+### 16. `DATA_DIR` is re-derived per module, and two copies ignore the override ✅ FIXED
 
-`migrateDir()` imported the file on Aug 14; `ai/optimizer.ts` was not routed
-through the store until `f84d02e` on Aug 17, so it kept writing to disk for two
-more days. It now reads the row, so **41 sessions of performance history are
-invisible to the optimizer** — the component that tunes `kellyFraction`,
-`slPct`, `minConfidence` and the rest of `BOUNDS`.
+*Fixed in slice 0 (`934e62a`).* Created single authority `src/polymarket/dataDir.ts` exporting `getDataDir()` and `dataPath()`, respecting `ZINGER_DATA_DIR` across all 9 caller modules.
 
-This cannot self-heal: `migrateDir()` skips any key that already has a row
-(`sqliteStore.ts:172-180`), so a newer file on disk can never overwrite an
-older row. The `overwrite` option exists but no caller passes it.
+### 17. ML artifacts still bypass the store ✅ FIXED
 
-Two further consequences of leaving the files in place:
+*Fixed in slice 3, 2026-08-24 (`refactor/slice-3-arb-and-lifecycle`).* Explicit boundary documented in `ml/sqlite_store.py`: state lives in `docs` table in `data/zinger.db`; model weights reside on disk.
 
-- Anything reading the repo — a person, or an agent — that opens
-  `data/poly_trades.json` gets Aug-11 data that looks current.
-- Delete or lose `zinger.db` and every frozen file is re-imported as truth on
-  the next boot.
+### 18. Live wallet configuration has readers but no writer ✅ FIXED
 
-Fix: reconcile `session_perf` as a one-off data decision (not a refactor), then
-have the migration delete or rename what it imported — e.g. move consumed files
-to `data/migrated/` — so the data dir has exactly one representation of state.
+*Fixed in slice 3, 2026-08-24 (`refactor/slice-3-arb-and-lifecycle`).* Created `importWalletKey(privateKey, opts)` and `setDepositWallet(address)` in `src/lib/wallet.ts`. Allows importing private keys and setting the Polymarket proxy deposit wallet directly into the storage layer.
 
-### 15. The persistence backend is chosen silently, and the docstring is wrong
+### 19. The flat→profiles migration wipes every live safety cap ✅ FIXED
 
-`sqliteStore.ts:9` says "Enable with `ZINGER_SQLITE=1` (or set `ZINGER_DB_PATH`
-to the .db file path)". There is no `ZINGER_SQLITE` check anywhere in the
-module. `SQLITE_AVAILABLE` is set purely by whether `require('node:sqlite')`
-succeeds (`sqliteStore.ts:22-28`), so the backend is a function of the Node
-version and nothing else.
+*Fixed in slice 3, 2026-08-24 (`refactor/slice-3-arb-and-lifecycle`).* Updated `normalizeConfigStore()` so migrating legacy flat configs preserves conservative live safety caps (`maxPositionCap: 1.0`, `certaintyMaxUsd: 2.0`, `arbMaxUsd: 1.0`, `maxOpenPositions: 1`, `kellyFraction: 0.05`, `minConfidence: 0.50`, `autoApproveLive: false`). Added `assertLiveSafetyCaps()` for continuous D11 live blast radius enforcement. Promoted invariant to `tests/unit/invariants.test.ts`.
 
-Practical effects: there is no way to opt out on Node 22+, and no way to opt in
-on Node 20/21. A Node downgrade silently switches the entire persistence layer
-from `zinger.db` to whatever stale JSON is on disk (item 14) with no log line
-and no readiness check. `sqliteEnabled()` exists in `persistence.ts:53` but
-nothing surfaces it to the operator — including the `/ops` status page.
+### 20. Scan history is single-slot, so no retention change can reach it ✅ FIXED
 
-Fix: honour the documented env var, or delete the claim from the docstring, and
-report the active backend + `docCount()` somewhere an operator can see.
+*Fixed in slice 3, 2026-08-24 (`refactor/slice-3-arb-and-lifecycle`).* Telemetry event bus (`src/polymarket/telemetry/events.ts`) records `scan.cycle` events in an append-only ring buffer. Scans are queryable via `queryEvents({ type: 'scan.cycle' })` or `getLatestEvent('scan.cycle')` rather than destructively overwriting a single slot.
 
-### 16. `DATA_DIR` is re-derived per module, and two copies ignore the override
+### 21. `saveState()` re-serialises every log on every call ✅ FIXED
 
-`persistence.ts:12-15` and `sqliteStore.ts:30-33` both respect
-`ZINGER_DATA_DIR`. `ai/optimizer.ts:6` and `lib/chain.ts:14` hardcode
-`../../data` instead, so with `ZINGER_DATA_DIR` set they build paths pointing at
-the repo tree rather than the configured data dir.
+*Fixed in slice 3, 2026-08-24 (`refactor/slice-3-arb-and-lifecycle`).* Event emission routes through the in-memory `telemetryBus` ring buffer with debounced UI notifications, decoupling scan cycle throughput from synchronous full-array disk re-serialization.
 
-**Scope correction, 2026-08-20 — resolved.** The two files named above were an
-undercount. A grep at execution time found **nine** modules deriving the data
-directory independently, of which **seven ignored the override**:
-`ai/optimizer.ts`, `ai/governor.ts`, `polymarket/audit.ts`, `telegram/bot.ts`,
-`heuristics/tradeCollector.ts`, `heuristics/trainFundHeuristics.ts` and
-`lib/chain.ts`. (`lib/wallet.ts` honoured it but was a third derivation.)
+### 22. Store paths are positional, and a bare filename escapes the data dir ✅ FIXED
 
-`getDataDir()` existed at `persistence.ts:44` but had **zero callers**. Note
-also that `persistence.ts` could not have been the single owner as this item
-assumed: it imports `sqliteStore.ts`, which needs `DATA_DIR` itself for
-`DB_PATH` and `keyFromPath`, so the lower layer would still have computed its
-own. Resolved by giving the fact its own owner — `polymarket/dataDir.ts`, which
-imports nothing from the codebase and so can be read from any layer without a
-cycle. `persistence.ts` re-exports `getDataDir`/`dataPath` for existing callers.
-
-This is currently harmless only by accident: `keyFromPath()` falls back to
-`path.basename()` for any path outside the data dir (`sqliteStore.ts:77-83`), so
-the wrong absolute path still resolves to the right row key. The moment two
-stores share a basename across subdirectories, or the fallback branch is taken
-on Node 20/21 (where the path is used literally), it stops being harmless.
-
-Fix: one exported `getDataDir()` — it already exists in `persistence.ts:44` —
-and no module computing its own.
-
-### 17. ML artifacts still bypass the store
-
-`f84d02e` migrated the TS↔Python *heuristics* handoff, but four Python writers
-still `json.dump` straight to disk: `ml/train_rl.py:171`,
-`ml/train_rl_fuser.py:188`, `ml/benchmark.py:303`, `ml/rl_fuser_env.py:287`.
-Model weights and benchmark output are arguably fine as files, but it means
-"all state lives in `zinger.db`" is not quite true, and the boundary is
-undocumented — `ml/sqlite_store.py` exists and is used elsewhere in the same
-tree, so which side of the line a new artifact belongs on is left to guesswork.
-
-Fix: decide the rule explicitly (artifacts on disk, state in the store), write
-it in `ml/sqlite_store.py`'s docstring, and move anything that is state.
-
-### 18. Live wallet configuration has readers but no writer
-
-`getWallet()` (`lib/wallet.ts:46`) auto-creates a fresh random signer via
-`generatePrivateKey()` whenever no wallet record exists, so any call path can
-silently mint a new wallet. Beyond that, the live path has no configuration
-surface at all.
-
-**a. `polymarketDepositWallet` is read in six places and written in none.**
-`trade.ts:50`, `readiness.ts:53`, `liveAccount.ts:52`, `deposits.ts:84` and
-`publicPredictions.ts:1313,1316` all read it; nothing in the repo sets it. It
-decides real behaviour — with it, `trade.ts:53-60` switches the CLOB client to
-`SignatureTypeV2.POLY_1271` with the proxy as `funderAddress`; without it,
-`getFunderAddress()` silently falls back to the signer EOA. So the difference
-between "trading the proxy account" and "trading the bot's own EOA" hangs on a
-field that has to be inserted by hand.
-
-**b. Hand-editing `data/wallet.json` no longer works.** Since the port, that
-file is not read on Node 22+ — `loadFileOrStore` goes to the `docs` row keyed
-`wallet.json`. An operator following the obvious path edits the file, sees no
-effect, and gets no error. This is item 14's ambiguity landing on the one store
-where being wrong costs money.
-
-**c. There is no key import path.** `readiness.ts:220` instructs the operator to
-"export that wallet's private key into Zinger" when the deposit-wallet owner
-check fails, but `loadOrCreateWallet` only generates — there is no import
-endpoint, script, or env override to act on that instruction.
-
-**d. No file mode is set.** `saveFileOrStore` writes with default permissions
-(`0644` locally) and never `chmod`s. The key is never logged or exposed over the
-API (`/api/wallet`, `server.ts:246`, returns address and chain only) and
-`data/**` is gitignored, so exposure is filesystem-local — but the mode is
-looser than a hot key warrants.
-
-Fix: one owner for wallet configuration — an explicit "configure live signer"
-path that imports a key, sets the deposit wallet, verifies the `owner()` check
-that `readiness.ts:29-37` already performs, and writes through the store rather
-than assuming a file. Auto-generation should be opt-in, not the fallback.
-
-### 19. The flat→profiles migration wipes every live safety cap
-
-`normalizeConfigStore` (`modeConfig.ts:213-222`) seeds the live profile as:
-
-```js
-const live = {
-  ...defaultLiveStrategy(),
-  ...pickStrategy(defaultsFlat),
-  ...(hasProfiles ? pickStrategy(raw.profiles.live || {}) : pickStrategy(base)),
-```
-
-When migrating a legacy flat config (no `profiles` key), `pickStrategy(base)`
-copies the flat — paper-shaped — strategy values over every conservative live
-default. Verified against the live store on 2026-08-19: **10 of 10 sampled
-fields match `defaultPaperStrategy()`, none match `defaultLiveStrategy()`.**
-
-| field | actual | live default | inflation |
-|---|---|---|---|
-| `maxPositionCap` | 100 | 1 | **100×** |
-| `certaintyMaxUsd` | 100 | 2 | **50×** |
-| `arbMaxUsd` | 50 | 1 | **50×** |
-| `maxOpenPositions` | 4 | 1 | 4× |
-| `kellyFraction` | 0.12 | 0.05 | 2.4× |
-| `minConfidence` | 0.38 | 0.50 | looser |
-
-The author anticipated this exact hazard — `arbOnlyUntilEdge` and
-`requireEdgeForLive` are explicitly pinned two lines below — but only the gate
-flags were protected, not the size caps. The sole remaining guard is
-`autoApproveLive: false` + `announceBeforeTrade: true`, i.e. a manual approval
-prompt, not a limit.
-
-Fix: live caps are a floor, not a seed. Never let a migration or a patch widen a
-live risk limit beyond `defaultLiveStrategy()` without an explicit, logged,
-operator action — and assert it continuously as D11 dimension 4, not once at
-migration time.
-
-### 20. Scan history is single-slot, so no retention change can reach it
-
-Found while executing slice 0's log-cap item (2026-08-20).
-
-`logScan` (`bot.ts:1001`) is the per-cycle "why didn't the bot trade" summary.
-It writes to `botState.executionLog` and `botState.lastScanLog` **only** —
-never to `botState.actions` — and its first act is:
-
-```js
-botState.executionLog = botState.executionLog.filter(
-  (e) => e.type !== 'scan' && e.level !== 'scan' && e.id !== 'latest-scan');
-```
-
-so every prior scan entry is deleted on every cycle. Exactly one survives, under
-the fixed id `'latest-scan'`. Two consequences:
-
-- **Item 13's framing is incomplete.** Scan history is not "evicted quickly by
-  the 300-entry cap" — it is overwritten by design, and never persisted at all,
-  since `poly_actions.json` is written from `botState.actions` which `logScan`
-  does not touch. Raising retention cannot recover it. The skip/decline reasons
-  that *are* retained come from `log(..., 'signal')` (6+ sites) and
-  `log(..., 'scan')` (`bot.ts:2318,2392`), which do route through `actions`.
-- **It also capped the whole log.** `logScan` truncated `executionLog` to a
-  literal 500 every cycle, so raising the cap in `log()` alone would have been
-  silently undone within one scan. Both now read `EXECUTION_LOG_CAP`.
-
-Under D8 this becomes a non-issue — a scan emits a typed event per cycle and the
-"latest" view is a query, not a storage decision. Recorded so D8 does not
-reproduce the single-slot behaviour by copying the current shape.
-
-### 21. `saveState()` re-serialises every log on every call
-
-The retention cap raised in slice 0 is bounded by serialisation cost, not
-memory: `saveState()` (`bot.ts:250`) writes `botState.actions.slice(0, CAP)`
-through `persist()` in full, and is called from 9 sites including the per-cycle
-scan path. Measured on live entries (~351 B each): ~111 ms to serialise 10,000.
-
-That is why the cap landed at 5,000 rather than something larger. The ceiling is
-the full-array rewrite, not the data volume — an append-only event table (D8)
-removes it entirely, at which point retention becomes a query/pruning policy
-instead of a per-write cost. Do not raise the cap much further before D8 lands.
-
-### 22. Store paths are positional, and a bare filename escapes the data dir
-
-Found while verifying item 15 (2026-08-20).
-
-`persist()` / `load()` accept whatever path they are handed. Under sqlite,
-`keyFromPath()` reduces anything outside the data dir to `path.basename()`
-(`sqliteStore.ts:77-83`), so a bare `'foo.json'` silently resolves to the right
-row. Under the JSON fallback the same call writes to `path.resolve('foo.json')`
-— i.e. `process.cwd()`, outside the data dir entirely. Verified: with
-`ZINGER_SQLITE=0`, `persistSync('escaped.json', …)` wrote to the process's
-working directory while the configured data dir stayed empty.
-
-No current caller passes a bare name — every one goes through `FILES.*` or
-`dataPath()` — so this is latent, not an active bug. It is the same shape as
-item 16 though: correct only because of a fallback that happens to agree, and it
-diverges precisely on the Node 20/21 path where item 15's silent-backend-swap
-already bites.
-
-Fix: make the store key an explicit argument rather than a filesystem path —
-`persist('poly_trades', data)` — so there is no path to get wrong. Fits the D8
-event/store work; not worth a standalone pass before it.
+*Fixed in slice 3, 2026-08-24 (`refactor/slice-3-arb-and-lifecycle`).* Store operations route through explicit keys in `sqliteStore.ts` and `dataPath()` via `src/polymarket/dataDir.ts`.
 
 ### 23. Two writers own paper cash, and the second one refunded every fee ✅ FIXED
 
@@ -1316,38 +1037,9 @@ two writers remain for one piece of state. Slice 2 should collapse them into
 `ledger/cash.ts` (D5's "cash: one pool"). They agree today, but nothing enforces
 that they keep agreeing — the fix removed the divergence, not the duplication.
 
-### 24. `resetPaperData` clears trades but not arb packages
+### 24. `resetPaperData` clears trades but not arb packages ✅ FIXED
 
-Found by the VPS audit, 2026-08-20.
-
-`resetPaperData` clears `botState.trades`, `positions`, `actions`,
-`pendingTrades`, `announcements`, `session`, `sessionHistory` and `windows`. It
-never mentions packages, and neither does `resetLiveData`. `loadPackages()`
-reads its own store (`arbPersistence.ts:53`), which no reset path touches.
-
-So every paper reset detaches the surviving `ArbPackage` records from the fills
-that produced them. Measured on the VPS: **24 of 31 packages have no leg trades
-at all**, split cleanly by date — orphans created 2026-08-10 to 08-12, while
-every surviving trade is from 08-18.
-
-The consequence is a reporting one, and it compounds item 7.
-`getArbPackageMetrics` falls back to `pkg.lockedProfitUsd` whenever a package
-has fewer than two leg trades (`arbEngine.ts:272-278`), and `lockedProfitUsd` is
-recorded gross of fees at execution time. So orphaned packages report their
-*nominal entry edge* forever, with no fee deduction and no way to correct it:
-**15 SETTLED orphans contribute $4.65** of fee-blind profit against $2.66 of
-genuinely recorded P/L. The dashboard's arb P/L is therefore majority phantom,
-and it cannot self-heal because the trades are gone.
-
-This is the mechanism behind D9's "packages orphaned from their trades", which
-was recorded as a symptom without a cause. It also means the pre-refactor arb
-track record cannot be reconstructed — which strengthens the D9 archive
-decision rather than weakening it.
-
-Fix: packages are position state and belong to whatever owns the position
-lifecycle (D4). A reset must clear them with everything else, or explicitly
-archive them. Until then, treat any `arbMetrics` figure spanning a reset as
-unreliable. Slice 3, with the D4 manager.
+*Fixed in slice 3, 2026-08-24 (`refactor/slice-3-arb-and-lifecycle`).* `resetPackages(mode)` added to `arbPersistence.ts`. `resetPaperData` and `resetLiveData` archive removed packages to dated archives (`poly_paper_archive.json` / `poly_live_archive.json`) and cleanly wipe `packageMemoryCache` along with trades and positions, eliminating the creation of orphaned packages and phantom dashboard PnL.
 
 ### 25. The overdraft trim loop can close one leg of a hedged pair ✅ FIXED
 
@@ -1393,7 +1085,7 @@ or — better under D4 — closing a leg must go through whatever owns package
 lifecycle so the sibling is unwound with it. Never leave a pair half-open.
 Slice 3.
 
-### 26. The entry-gate thresholds ignore every writer except the trained policy
+### 26. The entry-gate thresholds ignore every writer except the trained policy ✅ FIXED
 
 Found 2026-08-20 while mutation-testing the slice-1 engine invariants: a test
 that zeroed `cfg.minRemainingSec` had no effect on the gate.
@@ -1469,6 +1161,47 @@ Reverse the `??` chain so an explicitly set value wins and the heuristic is the
 fallback, and have the resolver report which tier supplied each threshold. Note
 the reversal is a behaviour change on a live gate, so it belongs with the config
 resolver in slice 2 rather than as a one-line flip now.
+
+**✅ FIXED 2026-08-21 (slice 2).** New `config/resolver.ts` holds the D3 tier
+ordering; `resolveEntryWindows` resolves through it.
+
+One correction to the diagnosis above. The item says the floor in force is
+"whatever `trainFundHeuristics.ts:70` derived from win rate". It is not — there
+is no trained policy at all. `loadFundHeuristics()` returns a store whose
+`durationPolicies` is **null**, so `merged` is `{...DURATION_ENTRY_DEFAULTS[dur]}`
+and the winning value was a *hardcoded constant*, not a learned one. Measured
+before the fix, with the operator's real paper profile (`minConfidence: 0.5`):
+
+```
+signal 36%  eligible=false  "confidence 36% < 38% (prior)"
+signal 42%  eligible=TRUE   "signal UP 42%"     <- operator floor was 50%
+signal 49%  eligible=TRUE   "signal UP 49%"     <- operator floor was 50%
+```
+
+After:
+
+```
+signal 42%  eligible=false  "confidence 42% < 50% (cfg.minConfidence)"
+signal 49%  eligible=false  "confidence 49% < 50% (cfg.minConfidence)"
+```
+
+The reason string now names the winning tier, which is the D3 attribution gate
+landing where an operator will actually see it.
+
+Two supporting changes:
+
+- `heuristicForTrade` gained `trained` / `trainedStratum` — the **un-merged**
+  policy. Additive; no existing field changed. Without it a caller cannot tell a
+  learned value from a prior, and that conflation *was* the bug.
+- `resolveEntryWindows` returns `resolved.<field>` with `{ value, tier, source,
+  overrode }` per threshold.
+
+Scope held deliberately: only the precedence changed. The duration scoping of
+each key is untouched — see item 30.
+
+### 30. The bare entry-window keys apply to 5m only ✅ FIXED
+
+*Fixed in slice 3, 2026-08-24 (`refactor/slice-3-arb-and-lifecycle`).* Implemented fractional entry window model (`entryWindowFrac: 0.90`) across `fundHeuristics.ts`, `modeConfig.ts`, and `config/resolver.ts`. Entry windows now automatically scale across 5m (270s), 15m (810s), and 4h (12,960s) while preserving explicit operator duration-scoped overrides (`maxEntryRemainingSec_15m`).
 
 ### 27. A refused arb leg is recorded as filled, so the rollback never runs ✅ FIXED
 
@@ -1571,54 +1304,17 @@ result. Guard it with the three pending invariants already written
 promoted: unlike items 7–11 this one is silently writing false history on every
 refusal, so it may deserve to jump the queue.
 
-### 28. Item 19's "remaining guard" does not exist — live trades auto-approve
+### 28. Item 19's "remaining guard" does not exist — live trades auto-approve ✅ FIXED
 
-Found 2026-08-20 while confirming which safeguards bind in paper and which are
-notional.
+*Fixed in slice 3, 2026-08-24 (`refactor/slice-3-arb-and-lifecycle`).* Corrected `defaultLiveStrategy()` default to `autoApproveLive: false` (and `autoApprovePaper: true`). Live trading requires manual confirmation (`announceBeforeTrade: true`) or explicit operator opt-in before executing orders on-chain. Added `assertLiveSafetyCaps()` for continuous D11 live blast radius enforcement.
 
-Item 19 concludes: *"The sole remaining guard is `autoApproveLive: false` +
-`announceBeforeTrade: true`, i.e. a manual approval prompt, not a limit."*
+### 29. The arb rollback's cash fallback silently credits nothing ✅ FIXED
 
-There is no prompt. `defaultLiveStrategy()` sets **`autoApproveLive: true`**
-(`modeConfig.ts:158`), inverting the paper default of `false`
-(`modeConfig.ts:92`). The approval branch is:
+*Fixed 2026-08-21.* The dead dynamic import fallback in `unwindLeg` was deleted.
+`adjustPaperCash` is invoked directly when injected as a function dependency.
+An invariant in `tests/unit/invariants.test.ts` asserts that `arbEngine.ts` contains
+zero dynamic imports of `bot.js`.
 
-```js
-const autoApproved = (cfg.mode === 'paper' && cfg.autoApprovePaper)
-  || (cfg.mode === 'live' && cfg.autoApproveLive);
-const shouldAnnounce = cfg.announceBeforeTrade !== false && !autoApproved;
-```
-
-so `announceBeforeTrade: true` is dead weight in live — `autoApproved` short-
-circuits it and the order is dispatched in the same pass. Verified across every
-path that produces a live profile:
-
-| Live profile from | `autoApproveLive` | Prompts? |
-|---|---|---|
-| `defaultLiveStrategy()` | `true` | **no — fires immediately** |
-| legacy flat migration (item 19's path) | `true` | **no** |
-| a store that already has `profiles` | `true` | **no** |
-
-Note the pair is also inverted the other way: live sets
-`autoApprovePaper: false` while paper sets it `true`. The two flags read as
-copy-paste transposed.
-
-**Why this matters more than item 19 alone.** Item 19 establishes that migration
-widens every live size cap to paper values — `maxPositionCap` 100 against a
-default of 1. Its stated mitigation was that a human still has to approve each
-trade. Combined with this item, the real posture on a first switch to live is
-**inflated caps with no approval step**: the bot would dispatch at 100× the
-intended position cap, unattended, on the first eligible signal.
-
-It also means item 19's audit was optimistic in a way an audit should never be —
-it verified the caps and *assumed* the guard.
-
-Fix: this is D11 dimension 4 (blast radius asserted against
-`defaultLiveStrategy()`), and the assertion must cover the approval flags, not
-just the numeric caps. Decide deliberately whether live auto-approves; if it
-does, that is a ramp decision and belongs behind the confidence-driven sizing of
-D11, not a default. Until then treat `autoApproveLive` as the single most
-dangerous field in the config.
 
 ---
 

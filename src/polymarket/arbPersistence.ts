@@ -31,10 +31,12 @@ export interface ArbPackage {
   breakEvenGap?: number;
   /** The book gap actually taken, so the margin over break-even is auditable. */
   gap?: number;
-  status: 'PENDING_FILL' | 'LOCKED' | 'SETTLED' | 'ABORTED';
+  status: 'PENDING_FILL' | 'LOCKED' | 'SETTLED' | 'MERGED' | 'ABORTED';
   mode: 'paper' | 'live';
   createdAt: number;
   settledAt?: number;
+  mergedAt?: number;
+  mergeTxHash?: string;
   unwoundAt?: number;
   abortReason?: string;
   legs: {
@@ -86,4 +88,12 @@ export function saveAllPackages(packages: ArbPackage[]): void {
 
 export function getActivePackages(mode: string = 'paper'): ArbPackage[] {
   return loadPackages().filter((p) => p.mode === mode && (p.status === 'LOCKED' || p.status === 'PENDING_FILL'));
+}
+
+export function resetPackages(mode?: string): { removed: number } {
+  const current = loadPackages();
+  const keep = mode ? current.filter((p) => p.mode !== mode) : [];
+  const removed = current.length - keep.length;
+  saveAllPackages(keep);
+  return { removed };
 }

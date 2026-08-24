@@ -37,3 +37,39 @@ export function getWallet() {
   if (!wallet) return loadOrCreateWallet();
   return wallet;
 }
+
+/**
+ * Explicit key import path for live trading (Item 18).
+ * Derives account address from private key and records optional deposit proxy.
+ */
+export function importWalletKey(privateKey: string, { polymarketDepositWallet = null, instance = 'live' } = {}) {
+  const cleanKey = privateKey.startsWith('0x') ? privateKey : `0x${privateKey}`;
+  const account = privateKeyToAccount(cleanKey);
+
+  const wallet = {
+    address: account.address,
+    privateKey: cleanKey,
+    polymarketDepositWallet: polymarketDepositWallet || null,
+    createdAt: new Date().toISOString(),
+    importedAt: new Date().toISOString(),
+    instance: instance || process.env.ZINGER_INSTANCE || 'live',
+  };
+
+  saveFileOrStore(WALLET_FILE, wallet);
+  return wallet;
+}
+
+/**
+ * Configure Polymarket proxy deposit wallet (Item 18).
+ */
+export function setDepositWallet(depositWalletAddress: string) {
+  const current = getWallet();
+  const updated = {
+    ...current,
+    polymarketDepositWallet: depositWalletAddress,
+    updatedAt: new Date().toISOString(),
+  };
+  saveFileOrStore(WALLET_FILE, updated);
+  return updated;
+}
+

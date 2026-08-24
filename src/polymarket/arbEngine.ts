@@ -1,14 +1,16 @@
-import { savePackage, loadPackages, getActivePackages } from './arbPersistence.js';
+import { savePackage, loadPackages, getActivePackages, resetPackages } from './arbPersistence.js';
 import {
   closeProceedsWithFee,
   takerFeeUsdc,
   arbBreakEvenGap,
   peekClobFeeParams,
 } from './fees.js';
+import { executeCtfMerge } from './ctf/merge.js';
+import { emitEvent } from './telemetry/events.js';
 import type { ArbPackage } from './arbPersistence.js';
 
 export type { ArbPackage };
-export { getActivePackages, loadPackages };
+export { getActivePackages, loadPackages, resetPackages };
 
 /**
  * True when both legs are complementary outcomes of one binary condition, so
@@ -209,6 +211,44 @@ export async function detectAndExecuteArbPackage({
           { packageId, slug: market.slug, totalCost, expectedPayout, lockedProfitUsd, lockedProfitPct },
         );
       }
+
+      // Instant On-Chain CTF Merge / Burn Trigger (Live Mode)
+      if (cfg?.instantCtfMerge !== false && mode === 'live' && (botState?.walletClient || botState?.signer)) {
+        const mergeRes = await executeCtfMerge({
+          conditionId: market.conditionId,
+          shares,
+          collateralToken: market.collateralToken,
+          walletClient: botState.walletClient || botState.signer,
+          publicClient: botState.publicClient,
+        });
+
+        if (mergeRes?.ok) {
+          pkg.status = 'MERGED';
+          pkg.mergedAt = Date.now();
+          pkg.mergeTxHash = mergeRes.txHash;
+          savePackage(pkg);
+
+          emitEvent('package.settlement', {
+            packageId,
+            symbol: market.symbol,
+            slug: market.slug,
+            action: 'instant_ctf_merge',
+            shares,
+            lockedProfitUsd,
+            txHash: mergeRes.txHash,
+            mode: 'live',
+          });
+
+          if (log) {
+            log(
+              `📦 INSTANT CTF MERGE: ${shares} sh burned on-chain → $${shares.toFixed(2)} USDC returned (tx: ${mergeRes.txHash})`,
+              'system',
+              { packageId, txHash: mergeRes.txHash, shares },
+            );
+          }
+        }
+      }
+
       return pkg;
     }
 
@@ -325,17 +365,9 @@ async function unwindLeg({ outcome, pkg, market, mode, cfg, botState, log, adjus
   // Sold back at the price it was bought at, so the only loss is the two fees.
   pos.pnl = Math.round(-(entryFee + exitFee) * 100) / 100;
 
-  if (mode === 'paper') {
+  if (mode === 'paper' && typeof adjustPaperCash === 'function') {
     const refund = Math.round((pack.premium - exitFee) * 100) / 100;
-    if (adjustPaperCash) {
-      adjustPaperCash(refund, `ROLLBACK ${pos.symbol} ${outcome.toUpperCase()}`);
-    } else {
-      // Fallback if not injected directly (typed loosely — dynamic import to avoid a cycle)
-      const mod = (await import('./bot.js').catch(() => null)) as unknown as {
-        adjustPaperCash?: (amount: number, note: string) => void;
-      } | null;
-      if (mod?.adjustPaperCash) mod.adjustPaperCash(refund, `ROLLBACK ${pos.symbol} ${outcome.toUpperCase()}`);
-    }
+    adjustPaperCash(refund, `ROLLBACK ${pos.symbol} ${outcome.toUpperCase()}`);
   }
 
   if (saveTrade) {
@@ -473,7 +505,7 @@ export function syncPackageSettlements(trades = [], mode = 'paper') {
  */
 export function getArbPackageMetrics(mode = 'paper', trades = []) {
   const all = loadPackages().filter((p) => p.mode === mode);
-  const settled = all.filter((p) => p.status === 'SETTLED');
+  const settled = all.filter((p) => p.status === 'SETTLED' || p.status === 'MERGED');
   const locked = all.filter((p) => p.status === 'LOCKED');
   const aborted = all.filter((p) => p.status === 'ABORTED');
 

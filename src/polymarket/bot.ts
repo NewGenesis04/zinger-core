@@ -45,6 +45,7 @@ import {
   reconcilePendingPackages,
   getArbPackageMetrics,
   loadPackages,
+  resetPackages,
 } from './arbEngine.js';
 import { persist, persistSync, load, FILES, dataPath } from './persistence.js';
 import { placeOrder, placeMarketSell, syncClobBalance } from './trade.js';
@@ -58,10 +59,20 @@ import {
   saveBaseline,
   normalizeTrade,
   tradeRealizedPnl,
-  tradeNetPnl,
   tradeCostBasis,
   tradeEngine,
 } from './audit.js';
+import { createPaperCashLedger } from './ledger/cash.js';
+import { record as recordAttribution, writerSummary, recentChanges } from './config/attribution.js';
+import {
+  countOpen,
+  sideBalance,
+  isSlugOccupied,
+  exitManagedPositions,
+  portfolioView as buildPortfolioView,
+} from './positions/manager.js';
+import { holdsToSettlement, capacityFor } from './positions/policy.js';
+import { resolveSettlementPrice, positionWindowEndMs } from './positions/settle.js';
 import { evaluateEdgeGate, passesEdgeFilter } from './edge.js';
 import { buildDecision, resolveOrderSize, sideBalanceBonus } from './engines/directional.js';
 import { recordTradeSample } from './heuristics/tradeCollector.js';
@@ -83,6 +94,23 @@ import {
   computeWindowStats,
   windowKeyFromTrade,
 } from './windows.js';
+import {
+  formatRemainingMs,
+  prunePendingTrades as prunePendingTradesCycle,
+  updateBotTradeStats,
+  bookWindowExit as bookWindowExitCycle,
+  evaluateCycleBoundary,
+} from './scan/cycle.js';
+import {
+  collectSignals,
+  enrichMarketsWithOracle,
+} from './scan/inputs.js';
+import { resolveTradingPermissions } from './config/resolver.js';
+import {
+  emitEvent,
+  queryEvents as queryTelemetryEvents,
+  getLatestEvent as getLatestTelemetryEvent,
+} from './telemetry/events.js';
 import {
   saveConfigSession,
   listConfigSessions,
@@ -188,21 +216,64 @@ function syncConfigFromStore() {
   botState.config = resolveActiveConfig(botState.configStore);
 }
 
-export function saveConfig(cfg) {
+/**
+ * The single config writer. Every change funnels through here (D3).
+ *
+ * `origin` records who is writing: `{ tier, source, reason }`. Attribution is
+ * derived by diffing the store before and after rather than from the patch, so
+ * the two guards below — which mutate the store in place — are attributed to
+ * themselves rather than to whoever happened to call in. Those are the writes
+ * most worth having a name on.
+ *
+ * Defaulting an untagged caller to `system/unattributed` is deliberate: it is
+ * visible in `writerSummary()` rather than silently mislabelled as the operator.
+ */
+export function saveConfig(cfg, origin = { tier: 'system', source: 'unattributed' }) {
   const patch = cfg || {};
-  let store = applyConfigPatch(botState.configStore || loadConfigStore(), patch);
+  const before = botState.configStore || loadConfigStore();
+  let store = applyConfigPatch(before, patch);
+  const now = Date.now();
+
+  // Attribute the caller's own change first, before any guard runs.
+  store = { ...store, attribution: recordAttribution(before, store, origin, now) };
+
+  // A real snapshot, not an alias. The guard below mutates
+  // `store.profiles[mode]` IN PLACE, and a spread copy of `store` shares that
+  // same profiles object — so diffing against it would see nothing and the
+  // guard's correction would be recorded as the caller's own value. Measured:
+  // the guard set clobArbEnabled true while attribution said the operator set
+  // it false.
+  const beforeGuards = {
+    ...store,
+    profiles: {
+      paper: { ...store.profiles.paper },
+      live: { ...store.profiles.live },
+    },
+  };
 
   // Invariant: forceArbOnly mutes directional trading and relies entirely on
   // the arb engine — if clobArbEnabled is off too, the bot locks into a dead
   // state (no directional, no arb) that can persist indefinitely. Authoritative
   // guard here since every config write (UI, governor, session restore) funnels
   // through this function.
+  let guardFired = false;
   for (const modeKey of ['paper', 'live']) {
     const strat = store.profiles[modeKey];
     if (strat?.forceArbOnly === true && strat?.clobArbEnabled === false) {
       strat.clobArbEnabled = true;
+      guardFired = true;
       log(`⚠️ Config guard: forceArbOnly requires clobArbEnabled — auto-enabled CLOB arb on the ${modeKey} profile (was about to trade nothing).`, 'system');
     }
+  }
+  if (guardFired) {
+    store = {
+      ...store,
+      attribution: recordAttribution(beforeGuards, store, {
+        tier: 'guardrail',
+        source: 'forceArbOnly-guard',
+        reason: 'forceArbOnly requires clobArbEnabled',
+      }, now),
+    };
   }
 
   // Switching to live: evaluate gate against PAPER expectancy only (isolation)
@@ -210,8 +281,17 @@ export function saveConfig(cfg) {
     const liveFlat = resolveActiveConfig({ ...store, mode: 'live' });
     const gate = evaluateEdgeGate(botState.trades, liveFlat);
     if (!gate.liveAllowed) {
+      const beforeLock = store;
       store = { ...store, mode: 'paper' };
       log(`🔒 LIVE blocked — ${gate.reason} (paper WR ${(gate.wr * 100).toFixed(1)}% · E $${gate.expectancy})`, 'system', { edgeGate: gate });
+      store = {
+        ...store,
+        attribution: recordAttribution(beforeLock, store, {
+          tier: 'guardrail',
+          source: 'edge-gate',
+          reason: gate.reason,
+        }, now),
+      };
     }
   }
 
@@ -224,6 +304,7 @@ export function saveConfig(cfg) {
     paperBankroll: store.paperBankroll,
     paperInitialDeposit: store.paperInitialDeposit,
     profiles: store.profiles,
+    attribution: store.attribution,
   });
   notifyStateChange();
 }
@@ -293,105 +374,57 @@ function saveTrade(trade) {
 }
 
 /**
- * Rebuild paper spendable cash from initial + closed PnL − open cost (idempotent).
+ * Paper cash has one owner: `ledger/cash.ts` (D5).
  *
- * The identity this must satisfy (backlog item 23):
+ * This binding is the only place that couples the ledger to `botState`. The
+ * arithmetic and the write-decision both live in the module, which is the point
+ * — item 23 collapsed the formula but left two functions deciding *when* to
+ * write, and reconcile-overwrites-increment is precisely how the fee-refund bug
+ * stayed invisible.
  *
- *   cash = initial
- *        + Σ net realized P/L over closed trades      (gross − entry fee − exit fee)
- *        − Σ (cost basis + entry fee) over open positions
- *
- * Both fee terms used to be missing, so this function silently refunded every
- * fee the incremental ledger (`adjustPaperCash`) had correctly charged — and
- * because it recomputes from scratch and overwrites, it always won. Measured on
- * production before the fix: it would have moved cash $100.70 → $102.66, a
- * phantom gain exactly equal to fees paid.
- *
- * Realized P/L is recomputed from primitives via `tradeNetPnl` rather than read
- * from `trade.pnl`, because records written before this fix carry a *gross*
- * `pnl` and nothing marks them as such. Recomputing makes the ledger correct
- * for existing history with no migration.
+ * The three wrappers below exist so ~20 existing call sites keep working. They
+ * hold no logic. Do not add any: put it in the ledger.
  */
+const paperCash = createPaperCashLedger({
+  readBalance: () => botState.config.paperBankroll,
+  readInitial: () => botState.config.paperInitialDeposit ?? 100,
+  readBooks: () => ({ trades: botState.trades, positions: botState.positions }),
+  writeBalance: (next) => {
+    botState.config.paperBankroll = next;
+    saveConfig({ paperBankroll: next }, { tier: 'system', source: 'cash-ledger' });
+  },
+  isPaper: () => botState.config.mode === 'paper',
+  log: (msg, level) => log(msg, level),
+});
+
 function paperBooksCash() {
-  const initial = Number(botState.config.paperInitialDeposit ?? 100);
-  const paperTrades = dedupeTrades(botState.trades).filter((t) => t.mode === 'paper');
-  const realized = paperTrades.reduce((s, t) => s + tradeNetPnl(t), 0);
-  const openCost = botState.positions
-    .filter((p) => !p.closed && p.mode === 'paper')
-    // The entry fee left the account with the premium, so it is part of what an
-    // open position has tied up.
-    .reduce((s, p) => s + Number(p.costBasis || p.size || 0) + Number(p.entryFee || 0), 0);
-  return Math.round((initial + realized - openCost) * 100) / 100;
+  return paperCash.books();
 }
 
 function reconcilePaperCash(reason = 'reconcile') {
-  if (botState.config.mode !== 'paper') return null;
-  const next = paperBooksCash();
-  const prev = Number(botState.config.paperBankroll ?? initial);
-  if (Math.abs(prev - next) < 0.01) return prev;
-  botState.config.paperBankroll = next;
-  saveConfig({ paperBankroll: next });
-  log(`💵 PAPER CASH reconcile $${prev.toFixed(2)} → $${next.toFixed(2)} · ${reason}`, 'system');
-  return next;
+  return paperCash.reconcile(reason);
 }
 
-/** Paper cash ledger — spendable bankroll in config.paperBankroll */
 function adjustPaperCash(delta, reason = '') {
-  if (botState.config.mode !== 'paper') return null;
-  const current = Number(botState.config.paperBankroll ?? botState.config.paperInitialDeposit ?? 100);
-  const next = Math.round((current + Number(delta || 0)) * 100) / 100;
-  botState.config.paperBankroll = next;
-  saveConfig({ paperBankroll: next });
-  if (reason) {
-    log(`💵 PAPER CASH ${delta >= 0 ? '+' : ''}${Number(delta).toFixed(2)} → $${next.toFixed(2)} · ${reason}`, 'system');
-  }
-  return next;
+  return paperCash.adjust(delta, reason);
 }
 
 /**
- * Open position count, optionally for one engine (D5).
- *
- * `engine` omitted counts every open position — correct for reporting, wrong for
- * a capacity gate. The two engines' slot counts are independent by decision:
- *
- *   directional   maxOpenPositions   risk dial: slots x size x SL%
- *   arb           maxArbPackages     2 positions per package, hold-to-settle
- *
- * They were cross-wired. `maxOpenPositions` counted arb legs too, so a hedged
- * pair consumed two directional slots and the two settings contradicted each
- * other outright — the VPS runs maxArbPackages 40 (authorising 80 legs) against
- * maxOpenPositions 4. Arb was therefore capped at two packages regardless of
- * its own setting, and the boot-time trim closed arb legs to get under a limit
- * that was never meant to govern them.
+ * Position queries live in `positions/manager.ts` (D4). These wrappers bind the
+ * pure functions there to `botState` and hold no logic of their own — the
+ * strategy conditionals they used to carry are now the policy predicate in
+ * `positions/policy.ts`. Do not add logic here.
  */
 function countOpenPositions(mode = botState.config.mode, engine = null) {
-  return botState.positions.filter((p) => (
-    !p.closed
-    && (!mode || p.mode === mode)
-    && (!engine || tradeEngine(p) === engine)
-  )).length;
+  return countOpen(botState.positions, { mode, engine });
 }
 
-/** Recent closed/open outcome mix — used to break chronic UP-only bias */
 function sideBalanceStats(cfg) {
-  const mode = cfg.mode || 'paper';
-  const recent = dedupeTrades(botState.trades)
-    .filter((t) => t.mode === mode)
-    .slice(0, 50);
-  const open = botState.positions.filter((p) => !p.closed && p.mode === mode);
-  let up = 0;
-  let down = 0;
-  for (const t of recent) {
-    if (t.outcome === 'up') up += 1;
-    else if (t.outcome === 'down') down += 1;
-  }
-  for (const p of open) {
-    if (p.outcome === 'up') up += 2;
-    else if (p.outcome === 'down') down += 2;
-  }
-  const total = up + down;
-  const upShare = total > 0 ? up / total : 0.5;
-  return { up, down, total, upShare };
+  return sideBalance({
+    positions: botState.positions,
+    trades: botState.trades,
+    mode: cfg.mode || 'paper',
+  });
 }
 
 function detectClobArb(depth, prices, cfg, market) {
@@ -425,7 +458,7 @@ function repairPaperOverdraft(reason = 'overdraft repair') {
   while (paperBooksCash() < -0.01 && guard < 120) {
     guard += 1;
     const open = botState.positions
-      .filter((p) => !p.closed && p.mode === 'paper' && !p.packageId && !p.isArbLeg)
+      .filter((p) => !p.closed && p.mode === 'paper' && !holdsToSettlement(p))
       .sort((a, b) => (a.entryTime || 0) - (b.entryTime || 0));
     if (!open.length) break;
     const pos = open[0];
@@ -452,13 +485,17 @@ function repairPaperOverdraft(reason = 'overdraft repair') {
   // maxOpenPositions is the directional risk dial (D5); arb capacity is
   // maxArbPackages, and arb legs are hold-to-settle with no stop, so trimming
   // them serves nothing.
+  //
+  // The loop condition and the selection must read the SAME set, or a position
+  // counted but not selectable spins the loop to its guard. Both go through
+  // exitManagedPositions.
   const maxOpen = Number(botState.config.maxOpenPositions ?? 6);
   let trim = 0;
-  while (countOpenPositions('paper', 'directional') > maxOpen && trim < 80) {
-    trim += 1;
-    const open = botState.positions
-      .filter((p) => !p.closed && p.mode === 'paper' && tradeEngine(p) === 'directional')
+  while (trim < 80) {
+    const open = exitManagedPositions(botState.positions, { mode: 'paper' })
       .sort((a, b) => (a.entryTime || 0) - (b.entryTime || 0));
+    if (open.length <= maxOpen) break;
+    trim += 1;
     if (!open.length) break;
     const pos = open[0];
     const price = Number(pos.currentPrice || pos.entryPrice || 0);
@@ -521,114 +558,19 @@ async function arbHousekeeping(reason = 'scan') {
 
 /** Detect real 5m market-window rollover (slug open→end) → book window stats. */
 function maybeFinalizeCycle() {
-  const wall = currentWallWindow(POLY_WINDOW_SECONDS);
-  // Key by window START so it stays stable for the full open→end interval
-  const cycleKey = String(wall.startSec);
-  if (botState._cycleKey == null) {
-    botState._cycleKey = cycleKey;
-    botState.windows.current = {
-      ...wall,
-      ...computeWindowStats(botState.trades, botState.positions, wall, botState.config.mode),
-    };
-    return null;
-  }
-  if (botState._cycleKey === cycleKey) {
-    // Live-refresh current window stats without rolling
-    botState.windows.current = {
-      ...wall,
-      ...computeWindowStats(botState.trades, botState.positions, wall, botState.config.mode),
-      accum: { ...botState._cycleSettleAccum },
-    };
-    return null;
-  }
-
-  const prevStart = Number(botState._cycleKey);
-  const prevWindow = {
-    startSec: prevStart,
-    endSec: prevStart + POLY_WINDOW_SECONDS,
-    startAtMs: prevStart * 1000,
-    endAtMs: (prevStart + POLY_WINDOW_SECONDS) * 1000,
-    key: `wall-${POLY_WINDOW_SECONDS}-${prevStart}`,
-    windowSec: POLY_WINDOW_SECONDS,
-  };
-  const accum = { ...botState._cycleSettleAccum };
-  const wstats = computeWindowStats(botState.trades, botState.positions, prevWindow, botState.config.mode);
-  const portfolio = buildPortfolio(botState.readiness, botState.config.mode || 'paper');
-  const entry = {
-    cycleEndAt: prevWindow.endAtMs,
-    cycleStartAt: prevWindow.startAtMs,
-    cycleKey: String(prevStart),
-    openAt: prevWindow.startAtMs,
-    endAt: prevWindow.endAtMs,
-    pnl: wstats.pnl || accum.pnl || 0,
-    closes: wstats.closes || accum.closes || 0,
-    rewards: accum.rewards || 0,
-    tpFull: wstats.tpFull || accum.tp || 0,
-    tpPartial: wstats.tpPartial || accum.partial || 0,
-    tpHits: wstats.tpHits || 0,
-    sl: wstats.byReason?.sl || accum.sl || 0,
-    trail: wstats.byReason?.trail || accum.trail || 0,
-    settle: wstats.byReason?.settle || accum.settle || 0,
-    byReason: wstats.byReason,
-    wr: wstats.wr,
-    equity: portfolio.equity,
-    netPnl: portfolio.netPnl,
-    cash: portfolio.cash,
-    unrealizedPnl: portfolio.unrealizedPnl,
-    realizedPnl: portfolio.realizedPnl,
-    openCount: portfolio.openCount,
-    mode: botState.config.mode,
-  };
-  recordCycleSession(entry);
-  botState.cycleReward = { ...entry, at: Date.now() };
-  botState.settle.lastCycle = entry;
-  botState.settle.history = [entry, ...(botState.settle.history || [])].slice(0, 40);
-  botState.windows.history = [entry, ...(botState.windows.history || [])].slice(0, 40);
-  botState._cycleSettleAccum = { pnl: 0, closes: 0, rewards: 0, tp: 0, sl: 0, trail: 0, settle: 0, partial: 0 };
-  botState._cycleKey = cycleKey;
-  botState.windows.current = {
-    ...wall,
-    ...computeWindowStats(botState.trades, botState.positions, wall, botState.config.mode),
-    accum: { ...botState._cycleSettleAccum },
-  };
-
-  log(
-    `🏁 WINDOW ${new Date(prevWindow.startAtMs).toISOString().slice(11, 16)}→${new Date(prevWindow.endAtMs).toISOString().slice(11, 16)} · closes ${entry.closes} · TP ${entry.tpHits} · PnL $${Number(entry.pnl || 0).toFixed(2)} · cash $${Number(entry.cash || 0).toFixed(2)}`,
-    'system',
-    entry,
-  );
-
-  if (botState.stopRequest?.status === 'queued') {
-    const request = { ...botState.stopRequest };
-    stopBot({ immediate: true, reason: 'queued_window_end' });
-    log(
-      `⏹️ QUEUED STOP COMPLETE · requested ${new Date(request.requestedAt).toLocaleTimeString()} · window closed`,
-      'system',
-      request,
-    );
-  } else if (botState.config.llmOptimize !== false && botState.running) {
-    optimizeNow({ apply: true, useLlm: true }).catch((err) => {
-      log(`⚠️ Optimizer after cycle: ${err.message?.slice(0, 100) || err}`, 'error');
-    });
-  }
-  notifyStateChange();
-  return entry;
+  return evaluateCycleBoundary({
+    botState,
+    buildPortfolio,
+    recordCycleSession,
+    log,
+    stopBot,
+    optimizeNow,
+    notifyStateChange,
+  });
 }
 
 function bookWindowExit(exitReason, pnl) {
-  const reward = Number(pnl || 0);
-  botState._cycleSettleAccum.pnl = Math.round((botState._cycleSettleAccum.pnl + reward) * 100) / 100;
-  botState._cycleSettleAccum.closes += 1;
-  if (reward > 0) {
-    botState._cycleSettleAccum.rewards = Math.round((botState._cycleSettleAccum.rewards + reward) * 100) / 100;
-  }
-  const key = exitReason === 'tp' ? 'tp'
-    : exitReason === 'partial' ? 'partial'
-      : exitReason === 'sl' ? 'sl'
-        : exitReason === 'trail' ? 'trail'
-          : exitReason === 'settle' ? 'settle'
-            : null;
-  if (key) botState._cycleSettleAccum[key] = (botState._cycleSettleAccum[key] || 0) + 1;
+  bookWindowExitCycle(botState._cycleSettleAccum, exitReason, pnl);
 }
 
 function computeStats(trades) {
@@ -663,32 +605,26 @@ function getChartSeries(slug) {
 }
 
 function hasOpenOnSlug(slug) {
-  const cfg = botState.config;
-  if (cfg.maxConcurrentPerSlug === 0) return true;
-  const maxConcurrent = cfg.maxConcurrentPerSlug || 1;
-  const openCount = botState.positions.filter((p) => !p.closed && p.slug === slug).length;
-  if (openCount >= maxConcurrent) return true;
-  const pendingCount = botState.pendingTrades.filter((p) => p.slug === slug && p.status === 'pending').length;
-  if (openCount + pendingCount >= maxConcurrent) return true;
-  return botState._buyLocks.has(slug);
+  return isSlugOccupied({
+    positions: botState.positions,
+    pendingTrades: botState.pendingTrades,
+    buyLocks: botState._buyLocks,
+    slug,
+    cfg: botState.config,
+  });
 }
 
-/**
- * The slice of portfolio state the directional engine's gate depends on.
- *
- * The engine is a pure function (`engines/directional.ts`) and deliberately
- * cannot see `botState`. This is the one place that translates: three reads,
- * gathered here, at the call site that owns the state.
- *
- * Slice 2 note — when the D4 position manager lands it becomes the owner of
- * these three facts and this function moves there. It is a seam, not a home.
- */
+/** Binds the D4 manager's portfolio view to botState. No logic here. */
 function portfolioView(slug, cfg) {
-  return {
-    hasOpenOnSlug: hasOpenOnSlug(slug),
-    sideBalance: sideBalanceStats(cfg),
+  return buildPortfolioView({
+    slug,
+    cfg,
+    positions: botState.positions,
+    trades: botState.trades,
+    pendingTrades: botState.pendingTrades,
+    buyLocks: botState._buyLocks,
     dataAssurance: botState._dataAssurance || null,
-  };
+  });
 }
 
 function prunePendingTrades() {
@@ -818,10 +754,8 @@ async function executePendingTrade(pending) {
   // legs used to be charged against maxOpenPositions, which is the directional
   // risk dial — so a hedged pair ate two directional slots, and arb's effective
   // capacity was maxOpenPositions/2 no matter what maxArbPackages said.
-  const engine = tradeEngine(plan);
-  const budget = engine === 'arb'
-    ? { max: Number(cfg.maxArbPackages ?? 4) * 2, label: `max arb legs (${Number(cfg.maxArbPackages ?? 4)} packages)` }
-    : { max: Number(cfg.maxOpenPositions ?? 6), label: `max open directional positions (${Number(cfg.maxOpenPositions ?? 6)})` };
+  const budget = capacityFor(plan, cfg);
+  const engine = budget.engine;
   if (countOpenPositions(cfg.mode, engine) >= budget.max) {
     pending.status = 'skipped';
     botState._buyLocks.delete(pending.slug);
@@ -1048,6 +982,14 @@ function log(msg, type = 'info', meta = null) {
   });
   if (botState.executionLog.length > EXECUTION_LOG_CAP) botState.executionLog.length = EXECUTION_LOG_CAP;
 
+  // D8 typed event emission
+  const evtType = (type === 'sl' || type === 'tp') ? 'position.exit'
+    : (type === 'buy') ? 'trade.execution'
+    : (meta?.arb || type === 'arb') ? 'package.settlement'
+    : (type === 'signal') ? 'trade.decision'
+    : 'system.alert';
+  emitEvent(evtType, { message: msg, type, ...(meta || {}) });
+
   if (AGILE_NOTIFY_TYPES.has(type) || (meta && meta.arb)) {
     pushNotification({
       id: entry.id,
@@ -1117,6 +1059,9 @@ function logScan(msg, meta) {
   // Same cap as log(); this runs every cycle, so a smaller literal here would
   // silently truncate the log back down and undo the retention raise.
   if (botState.executionLog.length > EXECUTION_LOG_CAP) botState.executionLog.length = EXECUTION_LOG_CAP;
+
+  // D8 typed scan cycle event
+  emitEvent('scan.cycle', { message: msg, ...(meta || {}) });
 }
 
 function summarizeSignal(signal) {
@@ -1669,6 +1614,22 @@ export function getState(opts = {}) {
         },
       };
     })(),
+    // Who last changed each setting, and what changed recently (D3).
+    //
+    // Read-only. The counts are the useful part: they say how much of the
+    // active profile the operator actually chose, versus how much the governor
+    // and optimizer wrote. Before this existed the answer was unknowable — the
+    // stored profile mixed overlays from regimes that were never both active.
+    settingWriters: (() => {
+      const summary = writerSummary(botState.configStore, mode);
+      return {
+        ...summary,
+        note: summary.total
+          ? 'Counts settings on this profile by who set them. "unattributed" means it was already there before changes were tracked.'
+          : 'Nothing recorded yet — this fills in as settings change.',
+      };
+    })(),
+    settingChanges: recentChanges(botState.configStore, { limit: 20 }),
   };
   const narrative = buildSystemNarrative(stateCore);
   const liveScoreCards = buildLiveScoreCards(stateCore);
@@ -1755,6 +1716,13 @@ export function getState(opts = {}) {
     signals: botState.signals,
     stats: isolatedStats,
     audit,
+    // These three live on `stateCore` because the narrative and score-card
+    // builders read it — but `stateCore` is an ARGUMENT to those builders, never
+    // spread into this return. Adding a field there does not expose it, which is
+    // how `slots` shipped invisible in the D5 work. See backlog item 31.
+    slots: stateCore.slots,
+    settingWriters: stateCore.settingWriters,
+    settingChanges: stateCore.settingChanges,
     telemetry: {
       uptime: botState.running ? Math.floor((Date.now() - botState._startTime) / 1000) : 0,
       uptimeMs: botState.running ? Date.now() - botState._startTime : 0,
@@ -1873,7 +1841,7 @@ export async function optimizeNow({ apply = true, useLlm = true } = {}) {
   const state = getState();
   return runOptimizer({
     state,
-    saveConfig,
+    saveConfig: (patch) => saveConfig(patch, { tier: 'automation', source: 'optimizer' }),
     log,
     apply,
     useLlm: useLlm && botState.config.llmOptimize !== false,
@@ -1886,7 +1854,7 @@ export async function governorNow({ useLlm = true } = {}) {
     signals: botState.signals,
     portfolio: buildPortfolio(botState.readiness, botState.config.mode || 'paper'),
     trades: botState.trades,
-    saveConfig,
+    saveConfig: (patch) => saveConfig(patch, { tier: 'automation', source: 'governor' }),
     log,
     useLlm: useLlm && botState.config.llmOptimize !== false,
   });
@@ -1895,7 +1863,7 @@ export async function governorNow({ useLlm = true } = {}) {
 export async function applyLlmPrimitives(actions) {
   const { runPrimitives } = await import('../ai/primitives.js');
   return runPrimitives(actions, {
-    saveConfig,
+    saveConfig: (patch) => saveConfig(patch, { tier: 'automation', source: 'llm-primitives' }),
     startBot,
     stopBot,
     optimizeNow,
@@ -1933,7 +1901,7 @@ async function scanOpenExitsFast() {
     const prices = await getPricesForMarket(market).catch(() => ({}));
     const depth = await getDepthForMarket(market).catch(() => null);
     for (const pos of positions) {
-      if (pos.closed || pos.packageId || pos.isArbLeg) continue;
+      if (pos.closed || holdsToSettlement(pos)) continue;
       const mark = exitMarkPrice(pos.outcome, prices, depth);
       if (!mark) continue;
       markPosition(pos, mark);
@@ -2005,7 +1973,7 @@ async function scanOpenExitsFast() {
   saveState();
 }
 
-async function scan() {
+export async function scan() {
   const cfg = botState.config;
   if (!cfg.enabled) return;
   if (botState._scanning) {
@@ -2023,55 +1991,15 @@ async function scan() {
     botState.stats.scansDone = (botState.stats.scansDone || 0) + 1;
     const readiness = await refreshTelemetry();
 
-    if (cfg.useSignals) {
-      // A signal-feed outage must not abort the whole scan pass: the arb engine
-      // further down needs only the Polymarket book, and the directional path
-      // already refuses stale/missing signals via data assurance. Keep the last
-      // known signals and carry on rather than throwing out of scan().
-      const freshSignals = await getSignalForBoth().catch((err) => {
-        if (Date.now() - (botState._signalFailLoggedAt || 0) > 60_000) {
-          botState._signalFailLoggedAt = Date.now();
-          log(`⚠️ Signal feed unavailable — ${String(err?.message || err).slice(0, 90)} · reusing last signals`, 'error');
-        }
-        return null;
-      });
-      if (freshSignals) botState.signals = freshSignals;
-      // Prefer cached ML ladder from background refresh; only force a light signal nudge
-      const mlOverride = cfg.useML
-        ? await getMLSignalForBoth('5m', 1).catch(() => ({ btc: null, eth: null }))
-        : null;
-      if (mlOverride) {
-        for (const asset of ['btc', 'eth']) {
-          const raw = botState.signals[asset];
-          const ml = mlOverride[asset];
-          if (!raw || !ml || ml.error || ml.direction === 'neutral' || ml.direction === 0) continue;
-          addMLPrediction(asset, ml);
-          const rawIsBull = raw.direction === 'up';
-          const mlIsBull = ml.direction === 1 || ml.direction === 'up';
-          const mlConf = Number(ml.confidence || 0);
-          // Paper: let a clear ML call fill neutral/weak technicals so scans actually fire
-          const paperLoose = cfg.mode === 'paper' && mlConf >= 0.58;
-          const liveStrong = mlConf >= 0.62;
-          if ((paperLoose || liveStrong) && (raw.direction === 'neutral' || rawIsBull !== mlIsBull)) {
-            raw.direction = mlIsBull ? 'up' : 'down';
-            raw.confidence = Math.min(0.65, Math.max(raw.confidence || 0, mlConf * 0.75));
-            raw.score = Math.min(6, mlConf * 6);
-            raw.mlOverride = true;
-            raw.mlConfidence = mlConf;
-          } else if ((paperLoose || liveStrong) && rawIsBull === mlIsBull) {
-            raw.confidence = Math.min(0.65, (raw.confidence || 0) + mlConf * 0.12);
-            raw.mlConfirmed = true;
-            raw.mlConfidence = mlConf;
-          }
-          const bias = getConfidenceBias(asset, raw);
-          if (bias.bias !== 0) {
-            raw.confidence = Math.min(0.65, bias.adjusted);
-            raw.confidenceBias = bias;
-            raw.confidenceBiasUsed = true;
-          }
-        }
-      }
-    }
+    await collectSignals({
+      cfg,
+      botState,
+      getSignalForBoth,
+      getMLSignalForBoth,
+      addMLPrediction,
+      getConfidenceBias,
+      log,
+    });
 
     const { markets, diagnostics } = await findMarkets(resolveMarketDurations(cfg));
     botState.diagnostics = diagnostics;
@@ -2090,10 +2018,7 @@ async function scan() {
       const nowMs = Date.now();
       for (const pos of [...botState.positions]) {
         if (pos.closed || pos.mode !== 'paper') continue;
-        const slugTs = Number(String(pos.slug || '').split('-').pop());
-        const windowEndMs = Number.isFinite(slugTs) && slugTs > 1e9
-          ? (slugTs + POLY_WINDOW_SECONDS) * 1000
-          : null;
+        const windowEndMs = positionWindowEndMs(pos);
         if (windowEndMs == null || nowMs < windowEndMs + 5000) continue;
         try {
           const result = await executeSell(pos, 'settle');
@@ -2112,21 +2037,7 @@ async function scan() {
     }
 
     // Restore window open clock + Chainlink to-beat before decisions (bounded).
-    await Promise.all(tradableMarkets.map(async (market) => {
-      const windowSec = Number(market.windowSeconds || POLY_WINDOW_SECONDS) || POLY_WINDOW_SECONDS;
-      if (!market.eventStartTime && market.endTime) {
-        market.eventStartTime = new Date((Number(market.endTime) - windowSec) * 1000).toISOString();
-      }
-      if (!market.endDate && market.endTime) {
-        market.endDate = new Date(Number(market.endTime) * 1000).toISOString();
-      }
-      const ptb = await Promise.race([
-        fetchPriceToBeat(market).catch(() => null),
-        new Promise((resolve) => setTimeout(() => resolve(null), 3500)),
-      ]);
-      market.priceToBeat = ptb?.openPrice ?? market.priceToBeat ?? null;
-      market.priceToBeatMeta = ptb || market.priceToBeatMeta || null;
-    }));
+    await enrichMarketsWithOracle(tradableMarkets, { fetchPriceToBeat, timeoutMs: 3500 });
 
     const signalTs = Math.max(
       Number(botState.signals?.btc?.timestamp || 0),
@@ -2308,7 +2219,12 @@ async function scan() {
       }
 
       const edgeGateNow = evaluateEdgeGate(botState.trades, cfg);
-      const isArbOnlyMode = cfg.forceArbOnly === true || (cfg.arbOnlyUntilEdge !== false && !edgeGateNow.edgeOk);
+      const tradingPerms = resolveTradingPermissions({
+        cfg,
+        edgeState: edgeGateNow,
+        governorDecision: getGovernorStatus(),
+      });
+      const isArbOnlyMode = tradingPerms.arbOnly;
 
       // Atomic Arb Engine Execution: Execute ArbPackage and bypass directional evaluation when arb-only mode or gap is active
       if (cfg.clobArbEnabled !== false && (isArbOnlyMode || arb)) {
@@ -2409,7 +2325,7 @@ async function scan() {
         // counting arb legs here meant a single hedged pair on a 5m market
         // exhausted that duration's directional budget outright.
         const env = manageEnvironment({
-          opens: botState.positions.filter((p) => tradeEngine(p) === 'directional'),
+          opens: exitManagedPositions(botState.positions),
           mode: cfg.mode,
           maxOpenPositions: Number(cfg.maxOpenPositions ?? 6),
           cash: readiness?.spendableBalance ?? cfg.paperBankroll,
@@ -2505,7 +2421,7 @@ async function scan() {
             for (const op of modePositions) {
               // Arb legs are hedged to $1.00 at settlement — force-closing mid-window
               // forfeits the locked edge and books the spread. Keep them immune.
-              if (op.packageId || op.isArbLeg) continue;
+              if (holdsToSettlement(op)) continue;
               if (op.mode === 'live' && op.tokenId && op.shares > 0) {
                 try {
                   const sellRes = await placeMarketSell({
@@ -2793,7 +2709,7 @@ async function scan() {
         }
 
         // Package legs are immune from mid-window exits — hold strictly to settlement
-        if (pos.packageId || pos.isArbLeg) {
+        if (holdsToSettlement(pos)) {
           continue;
         }
 
@@ -3017,11 +2933,7 @@ async function scan() {
       botRunning: true,
     });
 
-    const t = botState.trades;
-    botState.stats.totalTrades = t.length;
-    botState.stats.totalPnl = Math.round(t.reduce((s, x) => s + (x.pnl || 0), 0) * 100) / 100;
-    botState.stats.wins = t.filter(x => (x.pnl || 0) > 0).length;
-    botState.stats.losses = t.filter(x => (x.pnl || 0) <= 0).length;
+    updateBotTradeStats(botState);
 
     saveState();
 
@@ -3458,10 +3370,10 @@ export function startBot() {
   // Enforce paper lock before enabling
   const gate = evaluateEdgeGate(botState.trades, botState.config);
   if (botState.config.mode === 'live' && !gate.liveAllowed) {
-    saveConfig({ mode: 'paper', enabled: true });
+    saveConfig({ mode: 'paper', enabled: true }, { tier: 'operator', source: 'bot-start' });
     log(`🔒 LIVE → PAPER on start — ${gate.reason}`, 'system', { edgeGate: gate });
   } else {
-    saveConfig({ enabled: true });
+    saveConfig({ enabled: true }, { tier: 'operator', source: 'bot-start' });
   }
   botState.running = true;
   botState._startTime = Date.now();
@@ -3622,7 +3534,7 @@ export function stopBot(options = {}) {
     };
   }
   botState.running = false;
-  saveConfig({ enabled: false });
+  saveConfig({ enabled: false }, { tier: 'operator', source: 'bot-stop' });
   if (botState.interval) { clearInterval(botState.interval); botState.interval = null; }
   const session = completeSession(options?.reason || (immediate ? 'immediate' : 'stopped'));
   botState.stopRequest = null;
@@ -3657,7 +3569,7 @@ export function restoreConfigSession(id) {
   });
   botState.configStore = normalizeConfigStore(row.configStore, flatDefaults());
   syncConfigFromStore();
-  saveConfig({});
+  saveConfig({}, { tier: 'system', source: 'persist-touch' });
   log(`↩️ CONFIG RESTORED · ${row.label} · ${row.mode}`, 'system', { configSessionId: id });
   return { ok: true, restored: row, config: botState.config };
 }
@@ -3674,10 +3586,32 @@ export function resetPaperData({ initialDeposit = 100 } = {}) {
     label: 'Before paper reset',
     source: 'paper_reset_backup',
   });
+
+  const paperTrades = botState.trades.filter((trade) => trade.mode === 'paper');
+  const paperPositions = botState.positions.filter((position) => position.mode === 'paper');
+  const paperPackages = loadPackages().filter((pkg) => pkg.mode === 'paper');
+
+  if (paperPackages.length > 0 || paperTrades.length > 0 || paperPositions.length > 0) {
+    const archiveFile = dataPath('poly_paper_archive.json');
+    const prev = load(archiveFile, []) || [];
+    persistSync(archiveFile, [
+      ...prev.slice(-20),
+      {
+        archivedAt: Date.now(),
+        reason: 'paper_reset_clean_slate',
+        packages: paperPackages,
+        trades: paperTrades,
+        positions: paperPositions,
+      },
+    ]);
+  }
+
+  const { removed: removedPackages } = resetPackages('paper');
   const removed = {
-    trades: botState.trades.filter((trade) => trade.mode === 'paper').length,
-    positions: botState.positions.filter((position) => position.mode === 'paper').length,
+    trades: paperTrades.length,
+    positions: paperPositions.length,
     actions: botState.actions.filter((action) => action.mode === 'paper').length,
+    packages: removedPackages,
   };
   botState.trades = botState.trades.filter((trade) => trade.mode !== 'paper');
   botState.positions = botState.positions.filter((position) => position.mode !== 'paper');
@@ -3692,9 +3626,10 @@ export function resetPaperData({ initialDeposit = 100 } = {}) {
   persistSync(FILES.POSITIONS, botState.positions);
   persistSync(FILES.ACTIONS, botState.actions);
   resetGovernorPeak('paper');
-  saveConfig({ mode: 'paper', enabled: false, paperBankroll: amount, paperInitialDeposit: amount });
+  saveConfig({ mode: 'paper', enabled: false, paperBankroll: amount, paperInitialDeposit: amount },
+    { tier: 'operator', source: 'reset-paper' });
   refreshKellyHistory();
-  log(`♻️ PAPER DATA RESET · $${amount.toFixed(2)} initial · removed ${removed.trades} trades`, 'system', removed);
+  log(`♻️ PAPER DATA RESET · $${amount.toFixed(2)} initial · removed ${removed.trades} trades, ${removed.packages} packages`, 'system', removed);
   notifyStateChange();
   return { ok: true, removed, paperBankroll: amount };
 }
@@ -3714,6 +3649,7 @@ export function resetLiveData({ baselineUsd = null } = {}) {
 
   const liveTrades = botState.trades.filter((trade) => trade.mode === 'live');
   const livePositions = botState.positions.filter((position) => position.mode === 'live');
+  const livePackages = loadPackages().filter((pkg) => pkg.mode === 'live');
   const phantomTrades = liveTrades.filter((t) => !t.orderId);
   const phantomOpen = livePositions.filter((p) => !p.closed && !p.orderId);
 
@@ -3724,6 +3660,7 @@ export function resetLiveData({ baselineUsd = null } = {}) {
     {
       archivedAt: Date.now(),
       reason: 'live_reset_clean_slate',
+      packages: livePackages,
       trades: liveTrades,
       positions: livePositions,
       phantomTradeCount: phantomTrades.length,
@@ -3731,9 +3668,11 @@ export function resetLiveData({ baselineUsd = null } = {}) {
     },
   ]);
 
+  const { removed: removedLivePackages } = resetPackages('live');
   const removed = {
     trades: liveTrades.length,
     positions: livePositions.length,
+    packages: removedLivePackages,
     actions: botState.actions.filter((action) => action.mode === 'live').length,
     phantomTrades: phantomTrades.length,
     phantomOpen: phantomOpen.length,
@@ -3762,7 +3701,7 @@ export function resetLiveData({ baselineUsd = null } = {}) {
     ?? 0,
   );
   const baseline = saveBaseline(cash, 'Live account normalized — clean slate');
-  saveConfig({ mode: 'live', enabled: false });
+  saveConfig({ mode: 'live', enabled: false }, { tier: 'operator', source: 'reset-live' });
   refreshKellyHistory();
   log(
     `♻️ LIVE DATA RESET · baseline $${Number(baseline.balanceUsd).toFixed(2)} · removed ${removed.trades} trades (${removed.phantomTrades} phantom)`,
@@ -3777,8 +3716,17 @@ async function executeSell(pos, reason = 'manual') {
   if (!pos || pos.closed) return { ok: false, error: 'Position not found or already closed' };
 
   let price = pos.currentPrice || pos.entryPrice;
-  if (reason === 'settle' && pos.mode === 'paper' && pos.isArbLeg) {
-    price = 0.50; // Guaranteed $1.00 payout distributed evenly across the 2 hedge legs
+  if (reason === 'settle' && pos.mode === 'paper') {
+    const market = (botState.markets || []).find((m) => m.slug === pos.slug || m.conditionId === pos.conditionId);
+    const ptb = market?.priceToBeatMeta;
+    const res = resolveSettlementPrice({
+      pos,
+      openPositions: botState.positions,
+      market,
+      ptb,
+      finalPrice: pos.currentPrice,
+    });
+    price = res.price;
   }
 
   markPosition(pos, price);
@@ -3861,3 +3809,5 @@ export async function rapidSellPmAsset({ assetId, size }) {
 
 // Model state changes trigger SSE push
 onModelChange(() => notifyStateChange());
+
+export { queryTelemetryEvents, getLatestTelemetryEvent };

@@ -466,7 +466,8 @@ export async function createApp() {
   });
 
   app.post('/api/poly/config', (req, res) => {
-    poly.saveConfig(req.body);
+    // The dashboard form: the one write that is unambiguously the operator.
+    poly.saveConfig(req.body, { tier: 'operator', source: 'dashboard' });
     const state = poly.getState({ lean: true });
     res.json({
       ok: true,
@@ -525,7 +526,8 @@ export async function createApp() {
       const deposit = Number(amount);
       if (!Number.isFinite(deposit) || deposit < 0) return res.status(400).json({ error: 'invalid amount' });
       const newBankroll = Math.round((current + deposit) * 100) / 100;
-      poly.saveConfig({ paperBankroll: newBankroll, paperInitialDeposit: cfg.paperInitialDeposit ?? 100 });
+      poly.saveConfig({ paperBankroll: newBankroll, paperInitialDeposit: cfg.paperInitialDeposit ?? 100 },
+        { tier: 'operator', source: 'paper-deposit' });
       res.json({ ok: true, paperBankroll: newBankroll });
     } catch (err) {
       res.status(500).json({ error: err.message });
@@ -540,7 +542,8 @@ export async function createApp() {
       const withdraw = Number(amount);
       if (!Number.isFinite(withdraw) || withdraw < 0) return res.status(400).json({ error: 'invalid amount' });
       const newBankroll = Math.round(Math.max(0, current - withdraw) * 100) / 100;
-      poly.saveConfig({ paperBankroll: newBankroll, paperInitialDeposit: cfg.paperInitialDeposit ?? 100 });
+      poly.saveConfig({ paperBankroll: newBankroll, paperInitialDeposit: cfg.paperInitialDeposit ?? 100 },
+        { tier: 'operator', source: 'paper-withdraw' });
       res.json({ ok: true, paperBankroll: newBankroll });
     } catch (err) {
       res.status(500).json({ error: err.message });
@@ -623,6 +626,27 @@ export async function createApp() {
     try {
       const limit = Math.min(200, Number(req.query.limit) || 80);
       res.json(poly.getTraces({ limit }));
+    } catch (err) {
+      res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
+  /**
+   * Structured Telemetry Event Bus Endpoint (D8 / Item 13/20).
+   * Exposes versioned telemetry events to external systems, audit tools, and dashboards.
+   */
+  app.get('/api/poly/events', (req, res) => {
+    try {
+      const { type, symbol, slug, since, limit, level } = req.query;
+      const events = poly.queryTelemetryEvents({
+        type: type ? (String(type).includes(',') ? String(type).split(',') : String(type)) : undefined,
+        symbol: symbol ? String(symbol) : undefined,
+        slug: slug ? String(slug) : undefined,
+        since: since ? Number(since) : undefined,
+        limit: limit ? Math.min(1000, Number(limit)) : 100,
+        level: level ? String(level) : undefined,
+      });
+      res.json({ ok: true, count: events.length, events });
     } catch (err) {
       res.status(500).json({ ok: false, error: err.message });
     }
