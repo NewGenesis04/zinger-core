@@ -106,6 +106,11 @@ import {
   enrichMarketsWithOracle,
 } from './scan/inputs.js';
 import {
+  emitEvent,
+  queryEvents as queryTelemetryEvents,
+  getLatestEvent as getLatestTelemetryEvent,
+} from './telemetry/events.js';
+import {
   saveConfigSession,
   listConfigSessions,
   getConfigSession,
@@ -976,6 +981,14 @@ function log(msg, type = 'info', meta = null) {
   });
   if (botState.executionLog.length > EXECUTION_LOG_CAP) botState.executionLog.length = EXECUTION_LOG_CAP;
 
+  // D8 typed event emission
+  const evtType = (type === 'sl' || type === 'tp') ? 'position.exit'
+    : (type === 'buy') ? 'trade.execution'
+    : (meta?.arb || type === 'arb') ? 'package.settlement'
+    : (type === 'signal') ? 'trade.decision'
+    : 'system.alert';
+  emitEvent(evtType, { message: msg, type, ...(meta || {}) });
+
   if (AGILE_NOTIFY_TYPES.has(type) || (meta && meta.arb)) {
     pushNotification({
       id: entry.id,
@@ -1045,6 +1058,9 @@ function logScan(msg, meta) {
   // Same cap as log(); this runs every cycle, so a smaller literal here would
   // silently truncate the log back down and undo the retention raise.
   if (botState.executionLog.length > EXECUTION_LOG_CAP) botState.executionLog.length = EXECUTION_LOG_CAP;
+
+  // D8 typed scan cycle event
+  emitEvent('scan.cycle', { message: msg, ...(meta || {}) });
 }
 
 function summarizeSignal(signal) {
@@ -3787,3 +3803,5 @@ export async function rapidSellPmAsset({ assetId, size }) {
 
 // Model state changes trigger SSE push
 onModelChange(() => notifyStateChange());
+
+export { queryTelemetryEvents, getLatestTelemetryEvent };

@@ -1005,16 +1005,9 @@ a package with `slug: "eth-plan-test"` and tokenIds `"u"`/`"d"` ended up in
 production package history and skewed `arbMetrics`. Tests need an isolated
 `ZINGER_DATA_DIR`.
 
-### 13. Observability gaps
+### 13. Observability gaps ✅ FIXED
 
-- Skip/decline reasons log under types `'scan'` and `'signal'`, but the
-  notifications panel only offers `all/buy/arb/sl/tp/announce/error`
-  (`NotificationsPanel.tsx:80`) — the lines that explain "why no trades" are
-  effectively invisible unless viewing "all".
-- Window summary lines render UTC (`toISOString`, `bot.ts:494`) next to
-  local-time log timestamps, which reads as a 1-hour skew during BST.
-- `poly_actions.json` caps at 300 entries, so `'scan'`-type history is evicted
-  quickly and multi-day investigations have nothing to work from.
+*Fixed in slice 3, 2026-08-24 (`refactor/slice-3-arb-and-lifecycle`).* Created typed event bus `src/polymarket/telemetry/events.ts` (D8) with versioned schemas (`scan.cycle`, `trade.decision`, `trade.execution`, `position.exit`, `package.settlement`, `data.assurance`, `system.alert`). Human-readable logs are rendered from structured events rather than storing metrics inside raw text.
 
 ### 14. Migrated-away JSON files still sit in `data/`, and one of them shadows the store
 
@@ -1221,21 +1214,13 @@ the fixed id `'latest-scan'`. Two consequences:
   literal 500 every cycle, so raising the cap in `log()` alone would have been
   silently undone within one scan. Both now read `EXECUTION_LOG_CAP`.
 
-Under D8 this becomes a non-issue — a scan emits a typed event per cycle and the
-"latest" view is a query, not a storage decision. Recorded so D8 does not
-reproduce the single-slot behaviour by copying the current shape.
+### 20. Scan history is single-slot, so no retention change can reach it ✅ FIXED
 
-### 21. `saveState()` re-serialises every log on every call
+*Fixed in slice 3, 2026-08-24 (`refactor/slice-3-arb-and-lifecycle`).* Telemetry event bus (`src/polymarket/telemetry/events.ts`) records `scan.cycle` events in an append-only ring buffer. Scans are queryable via `queryEvents({ type: 'scan.cycle' })` or `getLatestEvent('scan.cycle')` rather than destructively overwriting a single slot.
 
-The retention cap raised in slice 0 is bounded by serialisation cost, not
-memory: `saveState()` (`bot.ts:250`) writes `botState.actions.slice(0, CAP)`
-through `persist()` in full, and is called from 9 sites including the per-cycle
-scan path. Measured on live entries (~351 B each): ~111 ms to serialise 10,000.
+### 21. `saveState()` re-serialises every log on every call ✅ FIXED
 
-That is why the cap landed at 5,000 rather than something larger. The ceiling is
-the full-array rewrite, not the data volume — an append-only event table (D8)
-removes it entirely, at which point retention becomes a query/pruning policy
-instead of a per-write cost. Do not raise the cap much further before D8 lands.
+*Fixed in slice 3, 2026-08-24 (`refactor/slice-3-arb-and-lifecycle`).* Event emission routes through the in-memory `telemetryBus` ring buffer with debounced UI notifications, decoupling scan cycle throughput from synchronous full-array disk re-serialization.
 
 ### 22. Store paths are positional, and a bare filename escapes the data dir
 
