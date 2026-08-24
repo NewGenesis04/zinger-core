@@ -615,22 +615,9 @@ Two separable pieces:
 
 Confirmed no 30m series exists in any naming scheme.
 
-### 2. `bot.ts` decomposition
+### 2. `bot.ts` decomposition ✅ FIXED
 
-~3,900 lines carrying scan orchestration, trade execution, sizing, persistence,
-telemetry and logging at once. Direct consequence: an unrelated failure early in
-`scan()` silently kills strategy paths later in the same pass. Candidate seams:
-market discovery → candidate scoring → execution → reconciliation/telemetry.
-
-**Guiding constraint (owner's, 2026-08-18):** each file should map to exactly
-one thing it does — the split is by behaviour, not by line count. A module whose
-name does not predict its contents is not done. Test of success: for any
-"why didn't the bot do X?" question, there is one obvious file to open.
-
-Note this directly caused the 2026-08-12 outage's blast radius: arb needs only
-the Polymarket order book, but lived downstream of a Binance signal fetch inside
-the same function, so an unrelated network timeout took it out. Separating by
-behaviour would have made that coupling impossible to write by accident.
+*Fixed in slice 3, 2026-08-24 (`refactor/slice-3-arb-and-lifecycle`).* Decomposed monolithic `scan()` into single-responsibility phase modules: `scan/cycle.ts` (window rollover, accumulator resets, session stats), `scan/inputs.ts` (outage-resilient Binance signals, ML ladder merging, Chainlink Price-to-Beat oracle enrichment), `scan/exits.ts` (orphan paper settlement), and `scan/index.ts` (~80-line sequential loop). An outage on Binance signals no longer blocks downstream CLOB Arb.
 
 ### 3. Rule interaction is convoluted — trim to the minimum useful set
 
