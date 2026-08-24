@@ -13,6 +13,13 @@ export const SHARED_KEYS = new Set([
   'paperInitialDeposit',
 ]);
 
+/** Default paper bankroll from environment variable (ZINGER_DEFAULT_PAPER_BANKROLL / PAPER_BANKROLL) defaulting to 100 */
+export function getDefaultPaperBankroll(): number {
+  const envVal = process.env.ZINGER_DEFAULT_PAPER_BANKROLL || process.env.PAPER_BANKROLL;
+  const parsed = Number(envVal);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 100;
+}
+
 /** Strategy knobs that must NOT leak across modes */
 export const STRATEGY_KEYS = [
   'minPrice', 'maxPrice',
@@ -239,8 +246,8 @@ export function normalizeConfigStore(raw, defaultsFlat = {}) {
   return {
     mode: base.mode === 'live' ? 'live' : 'paper',
     enabled: !!base.enabled,
-    paperBankroll: Number(base.paperBankroll ?? base.paperInitialDeposit ?? 100),
-    paperInitialDeposit: Number(base.paperInitialDeposit ?? 100),
+    paperBankroll: Number(base.paperBankroll ?? base.paperInitialDeposit ?? getDefaultPaperBankroll()),
+    paperInitialDeposit: Number(base.paperInitialDeposit ?? getDefaultPaperBankroll()),
     profiles: { paper, live },
     // Carried through load, or this record resets on every restart (D3 · C).
     attribution: normalizeAttribution(raw?.attribution),
@@ -251,12 +258,13 @@ export function normalizeConfigStore(raw, defaultsFlat = {}) {
 export function resolveActiveConfig(store) {
   const mode = store?.mode === 'live' ? 'live' : 'paper';
   const strat = store?.profiles?.[mode] || (mode === 'live' ? defaultLiveStrategy() : defaultPaperStrategy());
+  const defaultBankroll = getDefaultPaperBankroll();
   return {
     ...strat,
     mode,
     enabled: !!store?.enabled,
-    paperBankroll: Number(store?.paperBankroll ?? store?.paperInitialDeposit ?? 100),
-    paperInitialDeposit: Number(store?.paperInitialDeposit ?? 100),
+    paperBankroll: Number(store?.paperBankroll ?? store?.paperInitialDeposit ?? defaultBankroll),
+    paperInitialDeposit: Number(store?.paperInitialDeposit ?? defaultBankroll),
   };
 }
 

@@ -41,6 +41,7 @@
  */
 
 import { dedupeTrades, tradeNetPnl } from '../audit.js';
+import { getDefaultPaperBankroll } from '../modeConfig.js';
 
 /** Money precision — cents. The protocol's 5dp applies to fees, not balances. */
 export function roundCash(value) {
@@ -58,7 +59,7 @@ export function roundCash(value) {
  */
 export function booksCash({ trades = [], positions = [], initialDeposit = 100, mode = 'paper' } = {}) {
   const initial = Number(initialDeposit);
-  const base = Number.isFinite(initial) ? initial : 100;
+  const base = Number.isFinite(initial) ? initial : getDefaultPaperBankroll();
 
   const realized = dedupeTrades(trades)
     .filter((t) => !mode || t.mode === mode)

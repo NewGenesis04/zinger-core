@@ -68,4 +68,28 @@ describe('Chunk 3: Governor Advice & Trading Permissions Resolver (D3, Items 3, 
       expect(validateConfig({ entryWindowFrac: -0.2 }).entryWindowFrac).toBe(0.1);
     });
   });
+
+  describe('getDefaultPaperBankroll()', () => {
+    it('defaults to 100 when env variable is unset', async () => {
+      const { getDefaultPaperBankroll } = await import('../../src/polymarket/modeConfig.js');
+      const prevEnv = process.env.PAPER_BANKROLL;
+      delete process.env.PAPER_BANKROLL;
+      delete process.env.ZINGER_DEFAULT_PAPER_BANKROLL;
+
+      expect(getDefaultPaperBankroll()).toBe(100);
+
+      if (prevEnv != null) process.env.PAPER_BANKROLL = prevEnv;
+    });
+
+    it('respects PAPER_BANKROLL env variable when set', async () => {
+      const { getDefaultPaperBankroll } = await import('../../src/polymarket/modeConfig.js');
+      const prevEnv = process.env.PAPER_BANKROLL;
+      process.env.PAPER_BANKROLL = '250';
+
+      expect(getDefaultPaperBankroll()).toBe(250);
+
+      if (prevEnv != null) process.env.PAPER_BANKROLL = prevEnv;
+      else delete process.env.PAPER_BANKROLL;
+    });
+  });
 });

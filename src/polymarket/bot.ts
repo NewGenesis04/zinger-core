@@ -86,6 +86,7 @@ import {
   applyConfigPatch,
   defaultPaperStrategy,
   defaultLiveStrategy,
+  getDefaultPaperBankroll,
 } from './modeConfig.js';
 import {
   currentWallWindow,
@@ -185,12 +186,13 @@ function notifyStateChangeDebounced(ms = 120) {
 }
 
 function flatDefaults() {
+  const defaultBankroll = getDefaultPaperBankroll();
   return {
     enabled: false,
     mode: 'paper',
     ...defaultPaperStrategy(),
-    paperBankroll: 1000,
-    paperInitialDeposit: 1000,
+    paperBankroll: defaultBankroll,
+    paperInitialDeposit: defaultBankroll,
   };
 }
 
