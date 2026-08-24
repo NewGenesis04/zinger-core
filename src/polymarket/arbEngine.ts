@@ -5,6 +5,8 @@ import {
   arbBreakEvenGap,
   peekClobFeeParams,
 } from './fees.js';
+import { executeCtfMerge } from './ctf/merge.js';
+import { emitEvent } from './telemetry/events.js';
 import type { ArbPackage } from './arbPersistence.js';
 
 export type { ArbPackage };
@@ -209,6 +211,44 @@ export async function detectAndExecuteArbPackage({
           { packageId, slug: market.slug, totalCost, expectedPayout, lockedProfitUsd, lockedProfitPct },
         );
       }
+
+      // Instant On-Chain CTF Merge / Burn Trigger (Live Mode)
+      if (cfg?.instantCtfMerge !== false && mode === 'live' && (botState?.walletClient || botState?.signer)) {
+        const mergeRes = await executeCtfMerge({
+          conditionId: market.conditionId,
+          shares,
+          collateralToken: market.collateralToken,
+          walletClient: botState.walletClient || botState.signer,
+          publicClient: botState.publicClient,
+        });
+
+        if (mergeRes?.ok) {
+          pkg.status = 'MERGED';
+          pkg.mergedAt = Date.now();
+          pkg.mergeTxHash = mergeRes.txHash;
+          savePackage(pkg);
+
+          emitEvent('package.settlement', {
+            packageId,
+            symbol: market.symbol,
+            slug: market.slug,
+            action: 'instant_ctf_merge',
+            shares,
+            lockedProfitUsd,
+            txHash: mergeRes.txHash,
+            mode: 'live',
+          });
+
+          if (log) {
+            log(
+              `📦 INSTANT CTF MERGE: ${shares} sh burned on-chain → $${shares.toFixed(2)} USDC returned (tx: ${mergeRes.txHash})`,
+              'system',
+              { packageId, txHash: mergeRes.txHash, shares },
+            );
+          }
+        }
+      }
+
       return pkg;
     }
 
@@ -465,7 +505,7 @@ export function syncPackageSettlements(trades = [], mode = 'paper') {
  */
 export function getArbPackageMetrics(mode = 'paper', trades = []) {
   const all = loadPackages().filter((p) => p.mode === mode);
-  const settled = all.filter((p) => p.status === 'SETTLED');
+  const settled = all.filter((p) => p.status === 'SETTLED' || p.status === 'MERGED');
   const locked = all.filter((p) => p.status === 'LOCKED');
   const aborted = all.filter((p) => p.status === 'ABORTED');
 
