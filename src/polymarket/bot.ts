@@ -1973,7 +1973,7 @@ async function scanOpenExitsFast() {
   saveState();
 }
 
-async function scan() {
+export async function scan() {
   const cfg = botState.config;
   if (!cfg.enabled) return;
   if (botState._scanning) {
