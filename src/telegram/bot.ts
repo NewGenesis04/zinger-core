@@ -1,9 +1,9 @@
 // @ts-nocheck
 import TelegramBot from 'node-telegram-bot-api';
-import fs from 'fs';
-import path from 'path';
 import { generateSummary, generateSummaryIfStale, ask } from '../ai/monitor.js';
 import { chat } from '../ai/llm.js';
+import { loadFileOrStore, saveFileOrStore } from '../polymarket/sqliteStore.js';
+import { dataPath } from '../polymarket/dataDir.js';
 
 let bot = null;
 let chatId = null;
@@ -12,21 +12,17 @@ let dashboardMsgId = null;
 let pinnedMsgId = null;
 
 const TRADE_EMOJI = { tp: '✅', sl: '❌', panic: '⚠️', rapid: '⚡', settle: '🏁', partial: '🔹' };
-const TG_CHAT_FILE = path.resolve(import.meta.dirname, '../../data/telegram_chat.json');
+const TG_CHAT_FILE = dataPath('telegram_chat.json');
 
 function loadPersistedChatId() {
-  try {
-    const data = JSON.parse(fs.readFileSync(TG_CHAT_FILE, 'utf-8'));
-    const id = Number(data.chatId);
-    return Number.isFinite(id) && id !== 0 ? id : null;
-  } catch {
-    return null;
-  }
+  const data = loadFileOrStore(TG_CHAT_FILE, null);
+  const id = Number(data?.chatId);
+  return Number.isFinite(id) && id !== 0 ? id : null;
 }
 
 function persistChatId(id) {
   try {
-    fs.writeFileSync(TG_CHAT_FILE, JSON.stringify({ chatId: Number(id), setAt: Date.now() }, null, 2));
+    saveFileOrStore(TG_CHAT_FILE, { chatId: Number(id), setAt: Date.now() });
   } catch {}
 }
 

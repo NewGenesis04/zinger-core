@@ -1,5 +1,4 @@
 // @ts-nocheck
-import fs from 'fs';
 import path from 'path';
 import {
   SQLITE_AVAILABLE,
@@ -7,16 +6,17 @@ import {
   saveFileOrStore,
   getDb,
   migrateDir,
+  describeBackend,
 } from './sqliteStore.js';
 
-const DEFAULT_DATA_DIR = path.resolve(import.meta.dirname, '../../data');
-const DATA_DIR = process.env.ZINGER_DATA_DIR
-  ? path.resolve(process.env.ZINGER_DATA_DIR)
-  : DEFAULT_DATA_DIR;
+export { describeBackend } from './sqliteStore.js';
+import { getDataDir } from './dataDir.js';
 
-if (!fs.existsSync(DATA_DIR)) {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-}
+// `dataDir.ts` owns where the data directory is; re-exported here so existing
+// callers of persistence.ts keep working (backlog item 16).
+export { getDataDir, dataPath } from './dataDir.js';
+
+const DATA_DIR = getDataDir();
 
 export function persist(file, data) {
   saveFileOrStore(file, data);
@@ -35,14 +35,6 @@ export function loadWithDefault(file, defaults) {
   if (existing) return existing;
   persistSync(file, defaults);
   return defaults;
-}
-
-export function dataPath(name) {
-  return path.join(DATA_DIR, name);
-}
-
-export function getDataDir() {
-  return DATA_DIR;
 }
 
 export function migrateLegacyStores() {

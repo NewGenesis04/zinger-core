@@ -3,11 +3,12 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { spawn } from 'child_process';
+import { loadFileOrStore, saveFileOrStore } from '../sqliteStore.js';
+import { dataPath } from '../dataDir.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const DATA_DIR = path.resolve(__dirname, '../../../data');
-const SAMPLES_FILE = path.join(DATA_DIR, 'trade_samples.json');
-const OPTIMIZED_FILE = path.join(DATA_DIR, 'heuristics_optimized.json');
+const SAMPLES_FILE = dataPath('trade_samples.json');
+const OPTIMIZED_FILE = dataPath('heuristics_optimized.json');
 const SCRIPTS_DIR = path.resolve(__dirname, '../../../scripts');
 
 let _samples = null;
@@ -17,20 +18,13 @@ let _pendingTrain = 0;
 
 function loadSamples() {
   if (_samples) return _samples;
-  try {
-    _samples = JSON.parse(fs.readFileSync(SAMPLES_FILE, 'utf-8'));
-  } catch {
-    _samples = [];
-  }
+  _samples = loadFileOrStore(SAMPLES_FILE, []);
   return _samples;
 }
 
 function saveSamples() {
   try {
-    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-    const tmp = SAMPLES_FILE + '.tmp';
-    fs.writeFileSync(tmp, JSON.stringify(_samples, null, 2), 'utf-8');
-    fs.renameSync(tmp, SAMPLES_FILE);
+    saveFileOrStore(SAMPLES_FILE, _samples);
   } catch (err) {
     console.error('Failed to save trade samples:', err.message);
   }
@@ -96,12 +90,8 @@ export function recordTradeSample(trade) {
 
 function loadOptimized() {
   if (_optimized && Date.now() - _optimizedLoaded < 30000) return _optimized;
-  try {
-    _optimized = JSON.parse(fs.readFileSync(OPTIMIZED_FILE, 'utf-8'));
-    _optimizedLoaded = Date.now();
-  } catch {
-    _optimized = null;
-  }
+  _optimized = loadFileOrStore(OPTIMIZED_FILE, null);
+  _optimizedLoaded = Date.now();
   return _optimized;
 }
 

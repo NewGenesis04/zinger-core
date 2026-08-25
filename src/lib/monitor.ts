@@ -1,9 +1,9 @@
 // @ts-nocheck
-import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { createPublicClient, http, formatEther, formatUnits, parseAbi } from 'viem';
 import { robinhood } from 'viem/chains';
+import { loadFileOrStore, saveFileOrStore } from '../polymarket/sqliteStore.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '../..');
@@ -23,15 +23,14 @@ const publicClient = createPublicClient({
 });
 
 export function loadBalanceHistory() {
-  try { return JSON.parse(fs.readFileSync(BALANCE_FILE, 'utf-8')); }
-  catch { return []; }
+  return loadFileOrStore(BALANCE_FILE, []);
 }
 
 export function saveBalanceSnapshot(balanceEth) {
   const history = loadBalanceHistory();
   history.push({ time: Date.now(), balance: balanceEth });
   if (history.length > 500) history.splice(0, history.length - 500);
-  fs.writeFileSync(BALANCE_FILE, JSON.stringify(history, null, 2));
+  saveFileOrStore(BALANCE_FILE, history);
   return history;
 }
 
@@ -43,12 +42,11 @@ export function getBalanceChanges(history) {
 }
 
 export function loadAutoSellConfig() {
-  try { return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf-8')); }
-  catch { return { enabled: false, tpPct: 50, slPct: 25 }; }
+  return loadFileOrStore(CONFIG_FILE, { enabled: false, tpPct: 50, slPct: 25 });
 }
 
 export function saveAutoSellConfig(config) {
-  fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
+  saveFileOrStore(CONFIG_FILE, config);
 }
 
 export async function refreshTokenValue(token) {

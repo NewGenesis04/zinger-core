@@ -1,19 +1,9 @@
 // @ts-nocheck
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
-import fs from 'fs';
-import path from 'path';
-import { fileURLToPath } from 'url';
+import { loadFileOrStore, saveFileOrStore } from '../polymarket/sqliteStore.js';
+import { dataPath } from '../polymarket/dataDir.js';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const ROOT = path.resolve(__dirname, '../..');
-const DATA_DIR = process.env.ZINGER_DATA_DIR
-  ? path.resolve(process.env.ZINGER_DATA_DIR)
-  : path.join(ROOT, 'data');
-const WALLET_FILE = path.join(DATA_DIR, 'wallet.json');
-
-if (!fs.existsSync(DATA_DIR)) {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-}
+const WALLET_FILE = dataPath('wallet.json');
 
 export function loadOrCreateWallet() {
   const existing = tryLoadWallet();
@@ -29,7 +19,7 @@ export function loadOrCreateWallet() {
     instance: process.env.ZINGER_INSTANCE || 'experiment',
   };
 
-  fs.writeFileSync(WALLET_FILE, JSON.stringify(wallet, null, 2));
+  saveFileOrStore(WALLET_FILE, wallet);
   console.log(`\n🔐 Generated new wallet`);
   console.log(`   Instance: ${wallet.instance}`);
   console.log(`   Address: ${wallet.address}`);
@@ -39,12 +29,7 @@ export function loadOrCreateWallet() {
 }
 
 export function tryLoadWallet() {
-  try {
-    if (fs.existsSync(WALLET_FILE)) {
-      return JSON.parse(fs.readFileSync(WALLET_FILE, 'utf-8'));
-    }
-  } catch {}
-  return null;
+  return loadFileOrStore(WALLET_FILE, null);
 }
 
 export function getWallet() {
@@ -52,3 +37,39 @@ export function getWallet() {
   if (!wallet) return loadOrCreateWallet();
   return wallet;
 }
+
+/**
+ * Explicit key import path for live trading (Item 18).
+ * Derives account address from private key and records optional deposit proxy.
+ */
+export function importWalletKey(privateKey: string, { polymarketDepositWallet = null, instance = 'live' } = {}) {
+  const cleanKey = privateKey.startsWith('0x') ? privateKey : `0x${privateKey}`;
+  const account = privateKeyToAccount(cleanKey);
+
+  const wallet = {
+    address: account.address,
+    privateKey: cleanKey,
+    polymarketDepositWallet: polymarketDepositWallet || null,
+    createdAt: new Date().toISOString(),
+    importedAt: new Date().toISOString(),
+    instance: instance || process.env.ZINGER_INSTANCE || 'live',
+  };
+
+  saveFileOrStore(WALLET_FILE, wallet);
+  return wallet;
+}
+
+/**
+ * Configure Polymarket proxy deposit wallet (Item 18).
+ */
+export function setDepositWallet(depositWalletAddress: string) {
+  const current = getWallet();
+  const updated = {
+    ...current,
+    polymarketDepositWallet: depositWalletAddress,
+    updatedAt: new Date().toISOString(),
+  };
+  saveFileOrStore(WALLET_FILE, updated);
+  return updated;
+}
+

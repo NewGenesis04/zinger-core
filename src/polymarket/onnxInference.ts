@@ -2,6 +2,7 @@
 import path from 'path';
 import fs from 'fs';
 import { spawn } from 'child_process';
+import { loadFileOrStore } from './sqliteStore.js';
 
 const ROOT_DIR = path.resolve(import.meta.dirname, '../..');
 const ML_DIR = path.join(ROOT_DIR, 'ml');
@@ -32,12 +33,8 @@ async function getORT() {
 
 function loadManifest() {
   if (_manifest) return _manifest;
-  try {
-    _manifest = JSON.parse(fs.readFileSync(MANIFEST_PATH, 'utf-8'));
-    return _manifest;
-  } catch {
-    return [];
-  }
+  _manifest = loadFileOrStore(MANIFEST_PATH, []);
+  return _manifest;
 }
 
 export function getOnnxModelPath(symbol, timeframe, horizon) {

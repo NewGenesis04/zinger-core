@@ -1,17 +1,13 @@
 // @ts-nocheck
 import { createPublicClient, http, formatEther } from 'viem';
 import { robinhood } from 'viem/chains';
-import fs from 'fs';
-import path from 'path';
-import { fileURLToPath } from 'url';
 import { launchTokenOnPons } from './pons.js';
 import { saveTokenLogo, getLogoUrl } from './logo.js';
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const ROOT = path.resolve(__dirname, '../..');
+import { loadFileOrStore } from '../polymarket/sqliteStore.js';
+import { dataPath } from '../polymarket/dataDir.js';
 
 export async function launchFlashToken({ name, symbol, description, initialBuyPct }) {
-  const wallet = JSON.parse(fs.readFileSync(path.join(ROOT, 'data', 'wallet.json'), 'utf-8'));
+  const wallet = loadFileOrStore(dataPath('wallet.json'), null);
 
   const publicClient = createPublicClient({
     chain: robinhood,

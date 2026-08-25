@@ -31,6 +31,7 @@ import {
   normalizeAddress,
 } from './pilotLedger.js';
 import { sseLine } from '../lib/sse.js';
+import { getDefaultPaperBankroll } from '../polymarket/modeConfig.js';
 
 const predictionSseClients = new Set();
 const spotSseClients = new Set();
@@ -41,7 +42,7 @@ let depositScannerCleanup = null;
 
 /** Pilot paper book — mirrors live CLOB economics as closely as we can on mids. */
 const PILOT = Object.freeze({
-  initialBankroll: 1000,
+  initialBankroll: getDefaultPaperBankroll(),
   maxCashFrac: 0.10,
   minTicketUsd: 5,
   minConfidence: 0.35,
@@ -670,7 +671,7 @@ function buildPredictionResponse(polyState) {
 function summarizeBotPaper(polyState) {
   const portfolio = polyState?.portfolio || null;
   const cfg = polyState?.config || {};
-  const initialBankroll = Number(cfg.paperInitialDeposit ?? cfg.paperBankroll ?? 1000) || 1000;
+  const initialBankroll = Number(cfg.paperInitialDeposit ?? cfg.paperBankroll ?? getDefaultPaperBankroll()) || getDefaultPaperBankroll();
   const allTrades = (polyState?.trades || []).filter((t) => t.mode === 'paper' || !t.mode);
   const open = (polyState?.positions || []).filter((p) => !p.closed && (p.mode === 'paper' || !p.mode));
   const closed = allTrades.filter((t) => t.closed);

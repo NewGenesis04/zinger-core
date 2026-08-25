@@ -12,12 +12,11 @@
  *   - live safety               → never relaxes the live edge-gate lock
  * Every action is logged with its rationale.
  */
-import fs from 'fs';
-import path from 'path';
 import { chat, llmStatus } from './llm.js';
+import { loadFileOrStore, saveFileOrStore } from '../polymarket/sqliteStore.js';
+import { dataPath } from '../polymarket/dataDir.js';
 
-const DATA_DIR = path.resolve(import.meta.dirname, '../../data');
-const GOV_FILE = path.join(DATA_DIR, 'governor_state.json');
+const GOV_FILE = dataPath('governor_state.json');
 
 // Bounded knob overlays per regime. Values stay inside optimizer/primitive bounds.
 export const REGIME_PROFILES = {
@@ -65,7 +64,6 @@ export const REGIME_PROFILES = {
     minConfidence: 0.5,
     kellyFraction: 0.1,
     certaintyMaxPct: 0.18,
-    minArbGap: 0.012,
     adaptiveSl: false,
     holdToSettleFavorites: false,
   },
@@ -75,6 +73,37 @@ export const REGIME_LIST = Object.keys(REGIME_PROFILES);
 
 // Keys the governor must never relax while live — the edge-gate owns these.
 const LIVE_PROTECTED = new Set(['arbOnlyUntilEdge', 'requireEdgeForLive', 'forceArbOnly']);
+
+/**
+ * Arb thresholds and sizing. The governor may not write these — ever, in any
+ * mode (operator decision, 2026-08-21).
+ *
+ * The regime detector reads ADX and ATR on BTC/ETH spot. That tells it something
+ * about *directional* conditions. It says nothing about whether a Polymarket
+ * order book is offering a mispriced complementary pair, which is the only thing
+ * an arb threshold should respond to. The `arb-only` profile was setting
+ * `minArbGap: 0.012` on that basis — an arb dial moved by a directional signal,
+ * with no mechanism connecting the two.
+ *
+ * Since item 7 the real gate is fee-aware (`arbBreakEvenGap` + `arbMinMarginPct`)
+ * and `minArbGap` is only an absolute floor beneath it, so the blast radius was
+ * small. The reason to remove it is that there was never an argument for it.
+ *
+ * Deliberately NOT forbidden: `clobArbEnabled` and `arbOnlyUntilEdge`. Those are
+ * "should we be doing arb at all right now", which is exactly the regime call the
+ * governor exists to make — turning a strategy on is not the same as tuning its
+ * risk. The line here is on/off versus how-much.
+ *
+ * Enforced in `applyProfile` rather than by the key's absence from the overlays,
+ * so re-adding one to a profile cannot quietly re-enable it.
+ */
+export const GOVERNOR_FORBIDDEN_KEYS = Object.freeze(new Set([
+  'minArbGap',
+  'arbMinMarginPct',
+  'maxArbPackages',
+  'arbBankrollFrac',
+  'arbMaxUsd',
+]));
 
 const DEFAULTS = {
   cooldownMs: 240_000,      // min gap between switches
@@ -108,13 +137,11 @@ function round(n, d = 2) {
 }
 
 function loadJson(file, fallback) {
-  try { return JSON.parse(fs.readFileSync(file, 'utf-8')); } catch { return fallback; }
+  return loadFileOrStore(file, fallback);
 }
 
 function saveJson(file, data) {
-  const tmp = `${file}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
-  fs.renameSync(tmp, file);
+  saveFileOrStore(file, data);
 }
 
 export function getGovernorStatus() {
@@ -197,6 +224,8 @@ function applyProfile(name, { saveConfig, config }) {
   const overlay = REGIME_PROFILES[name];
   if (!overlay || typeof saveConfig !== 'function') return false;
   const patch = { ...overlay };
+  // The arb engine's thresholds are not the governor's to set, in any mode.
+  for (const k of GOVERNOR_FORBIDDEN_KEYS) delete patch[k];
   // Live safety: never let a profile loosen the edge-gate lock.
   if ((config.mode || 'paper') === 'live') {
     for (const k of LIVE_PROTECTED) {
@@ -209,13 +238,7 @@ function applyProfile(name, { saveConfig, config }) {
   return true;
 }
 
-function record(entry) {
-  const result = { ...entry, at: Date.now() };
-  _state.regime = entry.regime;
-  _state.lastResult = result;
-  if (entry.changed) {
-    _state.history = [result, ..._state.history].slice(0, 40);
-  }
+function persistState() {
   saveJson(GOV_FILE, {
     enabled: _state.enabled,
     profile: _state.profile,
@@ -227,9 +250,35 @@ function record(entry) {
     peakEquity: _state.peakEquity,
     peakEquityByMode: _state.peakEquityByMode,
     breakerActiveByMode: _state.breakerActiveByMode,
-    lastResult: result,
+    lastResult: _state.lastResult,
     history: _state.history.slice(0, 20),
   });
+}
+
+/** Clear peak/breaker memory for a mode so a data reset starts from a clean slate. */
+export function resetGovernorPeak(mode) {
+  _state.peakEquityByMode = { ...(_state.peakEquityByMode || {}), [mode]: null };
+  _state.breakerActiveByMode = { ...(_state.breakerActiveByMode || {}), [mode]: false };
+  if (mode === _state.lastMode) {
+    _state.peakEquity = null;
+    _state.breakerActive = false;
+    _state.profile = null;
+    _state.prevProfile = null;
+    _state.switchBaseline = null;
+    _state.lastSwitchAt = 0;
+    _state.cooling = {};
+  }
+  persistState();
+}
+
+function record(entry) {
+  const result = { ...entry, at: Date.now() };
+  _state.regime = entry.regime;
+  _state.lastResult = result;
+  if (entry.changed) {
+    _state.history = [result, ..._state.history].slice(0, 40);
+  }
+  persistState();
   return result;
 }
 

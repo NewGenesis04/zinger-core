@@ -10,20 +10,13 @@
  *   node src/polymarket/heuristics/trainFundHeuristics.js
  *   node src/polymarket/heuristics/trainFundHeuristics.js --apply
  */
-import fs from 'fs';
-import path from 'path';
-import { fileURLToPath } from 'url';
+import { loadFileOrStore, saveFileOrStore } from '../sqliteStore.js';
+import { dataPath } from '../dataDir.js';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const DATA = path.resolve(__dirname, '../../../data');
-const OUT = path.join(DATA, 'fund_heuristics.json');
+const OUT = dataPath('fund_heuristics.json');
 
 function loadJson(name, fallback) {
-  try {
-    return JSON.parse(fs.readFileSync(path.join(DATA, name), 'utf8'));
-  } catch {
-    return fallback;
-  }
+  return loadFileOrStore(dataPath(name), fallback);
 }
 
 function durationFromSlug(slug) {
@@ -215,7 +208,7 @@ function main() {
     ],
   };
 
-  fs.writeFileSync(OUT, JSON.stringify(payload, null, 2));
+  saveFileOrStore(OUT, payload);
   console.log(`Wrote ${OUT}`);
   console.log('durations', Object.keys(durationPolicies));
   console.log('strata', Object.keys(strata).length, 'global', payload.global);

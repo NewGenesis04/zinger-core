@@ -8,7 +8,7 @@ import {
   closeProceedsWithFeeForToken,
   isFeeFreeExit,
 } from './fees.js';
-import { buildDataAssurance, dataAssuranceBuyBlockReason } from './dataAssurance.js';
+import { buildDataAssurance } from './dataAssurance.js';
 import { getPricesForMarket, getDepthForMarket } from './clob.js';
 import {
   startClobMarketStream,
@@ -32,17 +32,25 @@ import {
 } from './liveAccount.js';
 import { buildSystemNarrative, buildLiveScoreCards } from './accountNarrative.js';
 import { appendEquityPoint, buildAccountBundle } from './accountSnapshot.js';
-import { getRemainingSeconds, getRemainingMs, getCycleEndMs, formatRemainingMs, POLY_MIN_ORDER_USD, POLY_SCAN_INTERVAL_MS, POLY_WINDOW_SECONDS, durationFromSlug, windowSecondsForDuration } from './config.js';
+import { getRemainingSeconds, getRemainingMs, getCycleEndMs, formatRemainingMs, POLY_SCAN_INTERVAL_MS, POLY_WINDOW_SECONDS, durationFromSlug, windowSecondsForDuration } from './config.js';
 import { getSignalForBoth } from './signal.js';
 import { getMLSignalForBoth, getMLTraceForBoth } from './predict.js';
 import { addMLPrediction, addPriceTrace, getConfidenceBias, getConfidenceBufferStats, getPriceTrace } from './confidence.js';
 import { addSpotTick } from './spotPriceHistory.js';
 import { getModelStates, getModelHealth, onModelChange } from './modelRegistry.js';
-import { detectAndExecuteArbPackage, syncPackageSettlements, getArbPackageMetrics, loadPackages } from './arbEngine.js';
+import {
+  detectAndExecuteArbPackage,
+  isComplementaryBinary,
+  syncPackageSettlements,
+  reconcilePendingPackages,
+  getArbPackageMetrics,
+  loadPackages,
+  resetPackages,
+} from './arbEngine.js';
 import { persist, persistSync, load, FILES, dataPath } from './persistence.js';
 import { placeOrder, placeMarketSell, syncClobBalance } from './trade.js';
 import { checkReadiness } from './readiness.js';
-import { computeKellySize, computeCertaintyKelly, resolveDynamicLimits, setKellyTradeHistory, getKellyStats, buildDynamicPlan, checkTrailingStop, checkPartialProfit, resolveAdaptiveSl } from './kelly.js';
+import { resolveDynamicLimits, setKellyTradeHistory, getKellyStats, buildDynamicPlan, checkTrailingStop, checkPartialProfit, resolveAdaptiveSl } from './kelly.js';
 import {
   dedupeTrades,
   computeTradeStats,
@@ -52,12 +60,23 @@ import {
   normalizeTrade,
   tradeRealizedPnl,
   tradeCostBasis,
+  tradeEngine,
 } from './audit.js';
+import { createPaperCashLedger } from './ledger/cash.js';
+import { record as recordAttribution, writerSummary, recentChanges } from './config/attribution.js';
+import {
+  countOpen,
+  sideBalance,
+  isSlugOccupied,
+  exitManagedPositions,
+  portfolioView as buildPortfolioView,
+} from './positions/manager.js';
+import { holdsToSettlement, capacityFor } from './positions/policy.js';
+import { resolveSettlementPrice, positionWindowEndMs } from './positions/settle.js';
 import { evaluateEdgeGate, passesEdgeFilter } from './edge.js';
+import { buildDecision, resolveOrderSize, sideBalanceBonus } from './engines/directional.js';
 import { recordTradeSample } from './heuristics/tradeCollector.js';
 import {
-  heuristicForTrade,
-  resolveEntryWindows,
   overlayPlanWithHeuristics,
   manageEnvironment,
 } from './heuristics/fundHeuristics.js';
@@ -67,6 +86,7 @@ import {
   applyConfigPatch,
   defaultPaperStrategy,
   defaultLiveStrategy,
+  getDefaultPaperBankroll,
 } from './modeConfig.js';
 import {
   currentWallWindow,
@@ -76,6 +96,23 @@ import {
   windowKeyFromTrade,
 } from './windows.js';
 import {
+  formatRemainingMs,
+  prunePendingTrades as prunePendingTradesCycle,
+  updateBotTradeStats,
+  bookWindowExit as bookWindowExitCycle,
+  evaluateCycleBoundary,
+} from './scan/cycle.js';
+import {
+  collectSignals,
+  enrichMarketsWithOracle,
+} from './scan/inputs.js';
+import { resolveTradingPermissions } from './config/resolver.js';
+import {
+  emitEvent,
+  queryEvents as queryTelemetryEvents,
+  getLatestEvent as getLatestTelemetryEvent,
+} from './telemetry/events.js';
+import {
   saveConfigSession,
   listConfigSessions,
   getConfigSession,
@@ -83,7 +120,7 @@ import {
 } from './configSessions.js';
 import { llmStatus } from '../ai/llm.js';
 import { runOptimizer, getOptimizerStatus, recordCycleSession, loadSessionPerf } from '../ai/optimizer.js';
-import { runGovernor, getGovernorStatus, getActiveProfile, computeProfilePerf } from '../ai/governor.js';
+import { runGovernor, getGovernorStatus, getActiveProfile, computeProfilePerf, resetGovernorPeak } from '../ai/governor.js';
 
 let botState = {
   running: false,
@@ -149,12 +186,13 @@ function notifyStateChangeDebounced(ms = 120) {
 }
 
 function flatDefaults() {
+  const defaultBankroll = getDefaultPaperBankroll();
   return {
     enabled: false,
     mode: 'paper',
     ...defaultPaperStrategy(),
-    paperBankroll: 1000,
-    paperInitialDeposit: 1000,
+    paperBankroll: defaultBankroll,
+    paperInitialDeposit: defaultBankroll,
   };
 }
 
@@ -180,17 +218,82 @@ function syncConfigFromStore() {
   botState.config = resolveActiveConfig(botState.configStore);
 }
 
-export function saveConfig(cfg) {
+/**
+ * The single config writer. Every change funnels through here (D3).
+ *
+ * `origin` records who is writing: `{ tier, source, reason }`. Attribution is
+ * derived by diffing the store before and after rather than from the patch, so
+ * the two guards below — which mutate the store in place — are attributed to
+ * themselves rather than to whoever happened to call in. Those are the writes
+ * most worth having a name on.
+ *
+ * Defaulting an untagged caller to `system/unattributed` is deliberate: it is
+ * visible in `writerSummary()` rather than silently mislabelled as the operator.
+ */
+export function saveConfig(cfg, origin = { tier: 'system', source: 'unattributed' }) {
   const patch = cfg || {};
-  let store = applyConfigPatch(botState.configStore || loadConfigStore(), patch);
+  const before = botState.configStore || loadConfigStore();
+  let store = applyConfigPatch(before, patch);
+  const now = Date.now();
+
+  // Attribute the caller's own change first, before any guard runs.
+  store = { ...store, attribution: recordAttribution(before, store, origin, now) };
+
+  // A real snapshot, not an alias. The guard below mutates
+  // `store.profiles[mode]` IN PLACE, and a spread copy of `store` shares that
+  // same profiles object — so diffing against it would see nothing and the
+  // guard's correction would be recorded as the caller's own value. Measured:
+  // the guard set clobArbEnabled true while attribution said the operator set
+  // it false.
+  const beforeGuards = {
+    ...store,
+    profiles: {
+      paper: { ...store.profiles.paper },
+      live: { ...store.profiles.live },
+    },
+  };
+
+  // Invariant: forceArbOnly mutes directional trading and relies entirely on
+  // the arb engine — if clobArbEnabled is off too, the bot locks into a dead
+  // state (no directional, no arb) that can persist indefinitely. Authoritative
+  // guard here since every config write (UI, governor, session restore) funnels
+  // through this function.
+  let guardFired = false;
+  for (const modeKey of ['paper', 'live']) {
+    const strat = store.profiles[modeKey];
+    if (strat?.forceArbOnly === true && strat?.clobArbEnabled === false) {
+      strat.clobArbEnabled = true;
+      guardFired = true;
+      log(`⚠️ Config guard: forceArbOnly requires clobArbEnabled — auto-enabled CLOB arb on the ${modeKey} profile (was about to trade nothing).`, 'system');
+    }
+  }
+  if (guardFired) {
+    store = {
+      ...store,
+      attribution: recordAttribution(beforeGuards, store, {
+        tier: 'guardrail',
+        source: 'forceArbOnly-guard',
+        reason: 'forceArbOnly requires clobArbEnabled',
+      }, now),
+    };
+  }
 
   // Switching to live: evaluate gate against PAPER expectancy only (isolation)
   if (store.mode === 'live') {
     const liveFlat = resolveActiveConfig({ ...store, mode: 'live' });
     const gate = evaluateEdgeGate(botState.trades, liveFlat);
     if (!gate.liveAllowed) {
+      const beforeLock = store;
       store = { ...store, mode: 'paper' };
       log(`🔒 LIVE blocked — ${gate.reason} (paper WR ${(gate.wr * 100).toFixed(1)}% · E $${gate.expectancy})`, 'system', { edgeGate: gate });
+      store = {
+        ...store,
+        attribution: recordAttribution(beforeLock, store, {
+          tier: 'guardrail',
+          source: 'edge-gate',
+          reason: gate.reason,
+        }, now),
+      };
     }
   }
 
@@ -203,6 +306,7 @@ export function saveConfig(cfg) {
     paperBankroll: store.paperBankroll,
     paperInitialDeposit: store.paperInitialDeposit,
     profiles: store.profiles,
+    attribution: store.attribution,
   });
   notifyStateChange();
 }
@@ -216,13 +320,29 @@ function loadPositions() {
   return load(FILES.POSITIONS, []);
 }
 
+/**
+ * Retention for the in-memory action / execution logs (slice 0).
+ *
+ * Was 300 and 500 — small enough that `'scan'`-type history was evicted within
+ * hours, so multi-day "why didn't the bot trade?" investigations had nothing to
+ * read (backlog item 13). Env-overridable so the VPS can be tuned without a
+ * redeploy.
+ *
+ * Note the cost model: `saveState()` re-serialises the whole array on every
+ * call, so this cap is bounded by serialisation time (~11ms per 1,000 entries
+ * at ~350 B/entry), not by memory. D8's append-only event store is what removes
+ * that ceiling — see backlog item 20.
+ */
+const ACTION_LOG_CAP = Number(process.env.ZINGER_ACTION_LOG_CAP || 5000);
+const EXECUTION_LOG_CAP = Number(process.env.ZINGER_EXECUTION_LOG_CAP || 5000);
+
 function loadActions() {
   return load(FILES.ACTIONS, []);
 }
 
 function saveState() {
   persist(FILES.POSITIONS, botState.positions);
-  persist(FILES.ACTIONS, botState.actions.slice(0, 300));
+  persist(FILES.ACTIONS, botState.actions.slice(0, ACTION_LOG_CAP));
   notifyStateChange();
 }
 
@@ -255,87 +375,62 @@ function saveTrade(trade) {
   refreshKellyHistory();
 }
 
-/** Rebuild paper spendable cash from initial + closed PnL − open cost (idempotent). */
+/**
+ * Paper cash has one owner: `ledger/cash.ts` (D5).
+ *
+ * This binding is the only place that couples the ledger to `botState`. The
+ * arithmetic and the write-decision both live in the module, which is the point
+ * — item 23 collapsed the formula but left two functions deciding *when* to
+ * write, and reconcile-overwrites-increment is precisely how the fee-refund bug
+ * stayed invisible.
+ *
+ * The three wrappers below exist so ~20 existing call sites keep working. They
+ * hold no logic. Do not add any: put it in the ledger.
+ */
+const paperCash = createPaperCashLedger({
+  readBalance: () => botState.config.paperBankroll,
+  readInitial: () => botState.config.paperInitialDeposit ?? 100,
+  readBooks: () => ({ trades: botState.trades, positions: botState.positions }),
+  writeBalance: (next) => {
+    botState.config.paperBankroll = next;
+    saveConfig({ paperBankroll: next }, { tier: 'system', source: 'cash-ledger' });
+  },
+  isPaper: () => botState.config.mode === 'paper',
+  log: (msg, level) => log(msg, level),
+});
+
+function paperBooksCash() {
+  return paperCash.books();
+}
+
 function reconcilePaperCash(reason = 'reconcile') {
-  if (botState.config.mode !== 'paper') return null;
-  const initial = Number(botState.config.paperInitialDeposit ?? 100);
-  const paperTrades = dedupeTrades(botState.trades).filter((t) => t.mode === 'paper');
-  const realized = paperTrades.reduce((s, t) => s + Number(t.pnl || 0), 0);
-  const openCost = botState.positions
-    .filter((p) => !p.closed && p.mode === 'paper')
-    .reduce((s, p) => s + Number(p.costBasis || p.size || 0), 0);
-  const next = Math.round((initial + realized - openCost) * 100) / 100;
-  const prev = Number(botState.config.paperBankroll ?? initial);
-  if (Math.abs(prev - next) < 0.01) return prev;
-  botState.config.paperBankroll = next;
-  saveConfig({ paperBankroll: next });
-  log(`💵 PAPER CASH reconcile $${prev.toFixed(2)} → $${next.toFixed(2)} · ${reason}`, 'system');
-  return next;
+  return paperCash.reconcile(reason);
 }
 
-/** Paper cash ledger — spendable bankroll in config.paperBankroll */
 function adjustPaperCash(delta, reason = '') {
-  if (botState.config.mode !== 'paper') return null;
-  const current = Number(botState.config.paperBankroll ?? botState.config.paperInitialDeposit ?? 100);
-  const next = Math.round((current + Number(delta || 0)) * 100) / 100;
-  botState.config.paperBankroll = next;
-  saveConfig({ paperBankroll: next });
-  if (reason) {
-    log(`💵 PAPER CASH ${delta >= 0 ? '+' : ''}${Number(delta).toFixed(2)} → $${next.toFixed(2)} · ${reason}`, 'system');
-  }
-  return next;
+  return paperCash.adjust(delta, reason);
 }
 
-function countOpenPositions(mode = botState.config.mode) {
-  return botState.positions.filter((p) => !p.closed && (!mode || p.mode === mode)).length;
+/**
+ * Position queries live in `positions/manager.ts` (D4). These wrappers bind the
+ * pure functions there to `botState` and hold no logic of their own — the
+ * strategy conditionals they used to carry are now the policy predicate in
+ * `positions/policy.ts`. Do not add logic here.
+ */
+function countOpenPositions(mode = botState.config.mode, engine = null) {
+  return countOpen(botState.positions, { mode, engine });
 }
 
-/** Recent closed/open outcome mix — used to break chronic UP-only bias */
 function sideBalanceStats(cfg) {
-  const mode = cfg.mode || 'paper';
-  const recent = dedupeTrades(botState.trades)
-    .filter((t) => t.mode === mode)
-    .slice(0, 50);
-  const open = botState.positions.filter((p) => !p.closed && p.mode === mode);
-  let up = 0;
-  let down = 0;
-  for (const t of recent) {
-    if (t.outcome === 'up') up += 1;
-    else if (t.outcome === 'down') down += 1;
-  }
-  for (const p of open) {
-    if (p.outcome === 'up') up += 2;
-    else if (p.outcome === 'down') down += 2;
-  }
-  const total = up + down;
-  const upShare = total > 0 ? up / total : 0.5;
-  return { up, down, total, upShare };
-}
-
-function sideBalanceBonus(outcome, cfg) {
-  if (cfg.sideBalanceEnabled === false) return { bonus: 0, note: null };
-  const weight = Number(cfg.sideBalanceWeight ?? 12);
-  const { up, down, total, upShare } = sideBalanceStats(cfg);
-  if (total < 5) return { bonus: 0, note: null, up, down, upShare };
-
-  // Soft tilt only — never hard-force a side (FORCE DOWN caused live SL massacre)
-  if (outcome === 'down' && upShare > 0.62) {
-    return { bonus: weight * (upShare - 0.5) * 1.6, note: `soft-balance DOWN (+${((upShare - 0.5) * 100).toFixed(0)}% UP skew)`, up, down, upShare };
-  }
-  if (outcome === 'up' && upShare < 0.38) {
-    return { bonus: weight * (0.5 - upShare) * 1.6, note: `soft-balance UP`, up, down, upShare };
-  }
-  if (outcome === 'up' && upShare > 0.70) {
-    return { bonus: -weight * (upShare - 0.5) * 1.2, note: `UP overtraded soft`, up, down, upShare };
-  }
-  if (outcome === 'down' && (1 - upShare) > 0.70) {
-    return { bonus: -weight * ((1 - upShare) - 0.5) * 1.2, note: `DOWN overtraded soft`, up, down, upShare };
-  }
-  return { bonus: 0, note: null, up, down, upShare };
+  return sideBalance({
+    positions: botState.positions,
+    trades: botState.trades,
+    mode: cfg.mode || 'paper',
+  });
 }
 
 function detectClobArb(depth, prices, cfg, market) {
-  if (market?.negRisk !== true) return null;
+  if (!isComplementaryBinary(market)) return null;
   const upAsk = Number(depth?.up?.bestAsk || prices?.up || 0);
   const downAsk = Number(depth?.down?.bestAsk || prices?.down || 0);
   if (!(upAsk > 0.01 && downAsk > 0.01 && upAsk < 0.99 && downAsk < 0.99)) return null;
@@ -358,21 +453,14 @@ function detectClobArb(depth, prices, cfg, market) {
  */
 function repairPaperOverdraft(reason = 'overdraft repair') {
   if (botState.config.mode !== 'paper') return null;
-  const booksCash = () => {
-    const initial = Number(botState.config.paperInitialDeposit ?? 100);
-    const paperTrades = dedupeTrades(botState.trades).filter((t) => t.mode === 'paper');
-    const realized = paperTrades.reduce((s, t) => s + Number(t.pnl || 0), 0);
-    const openCost = botState.positions
-      .filter((p) => !p.closed && p.mode === 'paper')
-      .reduce((s, p) => s + Number(p.costBasis || p.size || 0), 0);
-    return Math.round((initial + realized - openCost) * 100) / 100;
-  };
-
+  // Was a third copy of the cash formula, fee-blind and reading `t.pnl`
+  // directly (backlog item 23). It read cash as higher than reality, so the
+  // repair loop could exit while the account was genuinely overdrawn.
   let guard = 0;
-  while (booksCash() < -0.01 && guard < 120) {
+  while (paperBooksCash() < -0.01 && guard < 120) {
     guard += 1;
     const open = botState.positions
-      .filter((p) => !p.closed && p.mode === 'paper' && !p.packageId && !p.isArbLeg)
+      .filter((p) => !p.closed && p.mode === 'paper' && !holdsToSettlement(p))
       .sort((a, b) => (a.entryTime || 0) - (b.entryTime || 0));
     if (!open.length) break;
     const pos = open[0];
@@ -390,14 +478,26 @@ function repairPaperOverdraft(reason = 'overdraft repair') {
     log(`🧰 PAPER REPAIR close ${pos.symbol} ${pos.outcome?.toUpperCase()} @ $${price.toFixed(3)} · freed $${proceeds.toFixed(2)}`, 'system');
   }
 
-  // Also trim down to max open so we don't sit oversized after a near-zero cash repair
+  // Also trim down to max open so we don't sit oversized after a near-zero cash repair.
+  //
+  // Directional only, on both the count and the selection (backlog item 25 —
+  // the repair loop above already excluded hedges, this one did not). Closing
+  // one leg of a pair manufactures the naked leg item 8 settles at a fabricated
+  // $0.50, and leaves the package holding a maxArbPackages slot (item 9).
+  // maxOpenPositions is the directional risk dial (D5); arb capacity is
+  // maxArbPackages, and arb legs are hold-to-settle with no stop, so trimming
+  // them serves nothing.
+  //
+  // The loop condition and the selection must read the SAME set, or a position
+  // counted but not selectable spins the loop to its guard. Both go through
+  // exitManagedPositions.
   const maxOpen = Number(botState.config.maxOpenPositions ?? 6);
   let trim = 0;
-  while (countOpenPositions('paper') > maxOpen && trim < 80) {
-    trim += 1;
-    const open = botState.positions
-      .filter((p) => !p.closed && p.mode === 'paper')
+  while (trim < 80) {
+    const open = exitManagedPositions(botState.positions, { mode: 'paper' })
       .sort((a, b) => (a.entryTime || 0) - (b.entryTime || 0));
+    if (open.length <= maxOpen) break;
+    trim += 1;
     if (!open.length) break;
     const pos = open[0];
     const price = Number(pos.currentPrice || pos.entryPrice || 0);
@@ -417,116 +517,62 @@ function repairPaperOverdraft(reason = 'overdraft repair') {
   return botState.config.paperBankroll;
 }
 
+/**
+ * Arb package lifecycle upkeep — the write path that used to hide inside a read.
+ *
+ * Two jobs, both about capacity draining on its own (backlog items 9 and 10):
+ *
+ *   1. settle LOCKED packages whose legs have both closed
+ *   2. reconcile packages stranded at PENDING_FILL by a mid-dispatch restart
+ *
+ * Called from `scan()` housekeeping and once at boot. `getState()` no longer
+ * transitions anything — it only reads. That was the actual defect in item 10:
+ * `syncPackageSettlements` had exactly one caller and it was a read path with
+ * no timer behind it, so an unattended bot never settled a package at all.
+ */
+async function arbHousekeeping(reason = 'scan') {
+  const mode = botState.config.mode || 'paper';
+  try {
+    const settled = syncPackageSettlements(botState.trades, mode);
+
+    const rec = await reconcilePendingPackages({
+      mode,
+      positions: botState.positions,
+      trades: botState.trades,
+      minAgeMs: Number(botState.config.arbPendingReconcileMs ?? 120_000),
+      cfg: botState.config,
+      botState,
+      log,
+      adjustPaperCash,
+      saveTrade,
+    });
+
+    if (settled || rec.locked || rec.aborted || rec.discarded) {
+      saveState();
+      notifyStateChange();
+    }
+    return { settled, ...rec };
+  } catch (err) {
+    log(`⚠️ Arb housekeeping failed (${reason}): ${String(err?.message || err).slice(0, 120)}`, 'error');
+    return null;
+  }
+}
+
 /** Detect real 5m market-window rollover (slug open→end) → book window stats. */
 function maybeFinalizeCycle() {
-  const wall = currentWallWindow(POLY_WINDOW_SECONDS);
-  // Key by window START so it stays stable for the full open→end interval
-  const cycleKey = String(wall.startSec);
-  if (botState._cycleKey == null) {
-    botState._cycleKey = cycleKey;
-    botState.windows.current = {
-      ...wall,
-      ...computeWindowStats(botState.trades, botState.positions, wall, botState.config.mode),
-    };
-    return null;
-  }
-  if (botState._cycleKey === cycleKey) {
-    // Live-refresh current window stats without rolling
-    botState.windows.current = {
-      ...wall,
-      ...computeWindowStats(botState.trades, botState.positions, wall, botState.config.mode),
-      accum: { ...botState._cycleSettleAccum },
-    };
-    return null;
-  }
-
-  const prevStart = Number(botState._cycleKey);
-  const prevWindow = {
-    startSec: prevStart,
-    endSec: prevStart + POLY_WINDOW_SECONDS,
-    startAtMs: prevStart * 1000,
-    endAtMs: (prevStart + POLY_WINDOW_SECONDS) * 1000,
-    key: `wall-${POLY_WINDOW_SECONDS}-${prevStart}`,
-    windowSec: POLY_WINDOW_SECONDS,
-  };
-  const accum = { ...botState._cycleSettleAccum };
-  const wstats = computeWindowStats(botState.trades, botState.positions, prevWindow, botState.config.mode);
-  const portfolio = buildPortfolio(botState.readiness, botState.config.mode || 'paper');
-  const entry = {
-    cycleEndAt: prevWindow.endAtMs,
-    cycleStartAt: prevWindow.startAtMs,
-    cycleKey: String(prevStart),
-    openAt: prevWindow.startAtMs,
-    endAt: prevWindow.endAtMs,
-    pnl: wstats.pnl || accum.pnl || 0,
-    closes: wstats.closes || accum.closes || 0,
-    rewards: accum.rewards || 0,
-    tpFull: wstats.tpFull || accum.tp || 0,
-    tpPartial: wstats.tpPartial || accum.partial || 0,
-    tpHits: wstats.tpHits || 0,
-    sl: wstats.byReason?.sl || accum.sl || 0,
-    trail: wstats.byReason?.trail || accum.trail || 0,
-    settle: wstats.byReason?.settle || accum.settle || 0,
-    byReason: wstats.byReason,
-    wr: wstats.wr,
-    equity: portfolio.equity,
-    netPnl: portfolio.netPnl,
-    cash: portfolio.cash,
-    unrealizedPnl: portfolio.unrealizedPnl,
-    realizedPnl: portfolio.realizedPnl,
-    openCount: portfolio.openCount,
-    mode: botState.config.mode,
-  };
-  recordCycleSession(entry);
-  botState.cycleReward = { ...entry, at: Date.now() };
-  botState.settle.lastCycle = entry;
-  botState.settle.history = [entry, ...(botState.settle.history || [])].slice(0, 40);
-  botState.windows.history = [entry, ...(botState.windows.history || [])].slice(0, 40);
-  botState._cycleSettleAccum = { pnl: 0, closes: 0, rewards: 0, tp: 0, sl: 0, trail: 0, settle: 0, partial: 0 };
-  botState._cycleKey = cycleKey;
-  botState.windows.current = {
-    ...wall,
-    ...computeWindowStats(botState.trades, botState.positions, wall, botState.config.mode),
-    accum: { ...botState._cycleSettleAccum },
-  };
-
-  log(
-    `🏁 WINDOW ${new Date(prevWindow.startAtMs).toISOString().slice(11, 16)}→${new Date(prevWindow.endAtMs).toISOString().slice(11, 16)} · closes ${entry.closes} · TP ${entry.tpHits} · PnL $${Number(entry.pnl || 0).toFixed(2)} · cash $${Number(entry.cash || 0).toFixed(2)}`,
-    'system',
-    entry,
-  );
-
-  if (botState.stopRequest?.status === 'queued') {
-    const request = { ...botState.stopRequest };
-    stopBot({ immediate: true, reason: 'queued_window_end' });
-    log(
-      `⏹️ QUEUED STOP COMPLETE · requested ${new Date(request.requestedAt).toLocaleTimeString()} · window closed`,
-      'system',
-      request,
-    );
-  } else if (botState.config.llmOptimize !== false && botState.running) {
-    optimizeNow({ apply: true, useLlm: true }).catch((err) => {
-      log(`⚠️ Optimizer after cycle: ${err.message?.slice(0, 100) || err}`, 'error');
-    });
-  }
-  notifyStateChange();
-  return entry;
+  return evaluateCycleBoundary({
+    botState,
+    buildPortfolio,
+    recordCycleSession,
+    log,
+    stopBot,
+    optimizeNow,
+    notifyStateChange,
+  });
 }
 
 function bookWindowExit(exitReason, pnl) {
-  const reward = Number(pnl || 0);
-  botState._cycleSettleAccum.pnl = Math.round((botState._cycleSettleAccum.pnl + reward) * 100) / 100;
-  botState._cycleSettleAccum.closes += 1;
-  if (reward > 0) {
-    botState._cycleSettleAccum.rewards = Math.round((botState._cycleSettleAccum.rewards + reward) * 100) / 100;
-  }
-  const key = exitReason === 'tp' ? 'tp'
-    : exitReason === 'partial' ? 'partial'
-      : exitReason === 'sl' ? 'sl'
-        : exitReason === 'trail' ? 'trail'
-          : exitReason === 'settle' ? 'settle'
-            : null;
-  if (key) botState._cycleSettleAccum[key] = (botState._cycleSettleAccum[key] || 0) + 1;
+  bookWindowExitCycle(botState._cycleSettleAccum, exitReason, pnl);
 }
 
 function computeStats(trades) {
@@ -561,14 +607,26 @@ function getChartSeries(slug) {
 }
 
 function hasOpenOnSlug(slug) {
-  const cfg = botState.config;
-  if (cfg.maxConcurrentPerSlug === 0) return true;
-  const maxConcurrent = cfg.maxConcurrentPerSlug || 1;
-  const openCount = botState.positions.filter((p) => !p.closed && p.slug === slug).length;
-  if (openCount >= maxConcurrent) return true;
-  const pendingCount = botState.pendingTrades.filter((p) => p.slug === slug && p.status === 'pending').length;
-  if (openCount + pendingCount >= maxConcurrent) return true;
-  return botState._buyLocks.has(slug);
+  return isSlugOccupied({
+    positions: botState.positions,
+    pendingTrades: botState.pendingTrades,
+    buyLocks: botState._buyLocks,
+    slug,
+    cfg: botState.config,
+  });
+}
+
+/** Binds the D4 manager's portfolio view to botState. No logic here. */
+function portfolioView(slug, cfg) {
+  return buildPortfolioView({
+    slug,
+    cfg,
+    positions: botState.positions,
+    trades: botState.trades,
+    pendingTrades: botState.pendingTrades,
+    buyLocks: botState._buyLocks,
+    dataAssurance: botState._dataAssurance || null,
+  });
 }
 
 function prunePendingTrades() {
@@ -694,12 +752,17 @@ async function executePendingTrade(pending) {
   const cfg = botState.config;
   const plan = pending.plan;
   const costNeeded = Number(plan.costEst || plan.sizeUsd || 0);
-  const maxOpen = Number(cfg.maxOpenPositions ?? 6);
-  if (countOpenPositions(cfg.mode) >= maxOpen) {
+  // D5: each engine is gated by its own dial, counting its own positions. Arb
+  // legs used to be charged against maxOpenPositions, which is the directional
+  // risk dial — so a hedged pair ate two directional slots, and arb's effective
+  // capacity was maxOpenPositions/2 no matter what maxArbPackages said.
+  const budget = capacityFor(plan, cfg);
+  const engine = budget.engine;
+  if (countOpenPositions(cfg.mode, engine) >= budget.max) {
     pending.status = 'skipped';
     botState._buyLocks.delete(pending.slug);
-    log(`⛔ SKIP ${pending.symbol} — max open positions (${maxOpen})`, 'signal');
-    return { ok: false, error: 'max open positions' };
+    log(`⛔ SKIP ${pending.symbol} — ${budget.label}`, 'signal');
+    return { ok: false, error: `${engine} capacity` };
   }
   if (cfg.mode === 'paper' && costNeeded > Number(cfg.paperBankroll ?? 0) + 0.001) {
     pending.status = 'skipped';
@@ -737,6 +800,12 @@ async function executePendingTrade(pending) {
     arb: !!plan.arb,
     packageId: plan.packageId || null,
     isArbLeg: !!plan.isArbLeg || !!plan.arb,
+    // D5: per-engine P/L comes from tagging trades, not from segregating
+    // capital. `isArbLeg` already says "not directional"; this says which
+    // engine positively, so a third strategy does not silently inherit the
+    // directional bucket. Every saveTrade() call spreads the position, so the
+    // tag reaches the trade record.
+    engine: tradeEngine(plan),
     effectiveSlPct: plan.slPct,
     adaptiveSlArmed: false,
     volFactor: plan.volFactor,
@@ -908,12 +977,20 @@ const AGILE_NOTIFY_TYPES = new Set(['buy', 'sl', 'tp', 'error', 'announce', 'sys
 function log(msg, type = 'info', meta = null) {
   const entry = { id: `a-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 5)}`, msg, type, time: Date.now(), meta };
   botState.actions.unshift(entry);
-  if (botState.actions.length > 300) botState.actions.length = 300;
+  if (botState.actions.length > ACTION_LOG_CAP) botState.actions.length = ACTION_LOG_CAP;
   botState.executionLog.unshift({
     ...entry,
     level: type,
   });
-  if (botState.executionLog.length > 500) botState.executionLog.length = 500;
+  if (botState.executionLog.length > EXECUTION_LOG_CAP) botState.executionLog.length = EXECUTION_LOG_CAP;
+
+  // D8 typed event emission
+  const evtType = (type === 'sl' || type === 'tp') ? 'position.exit'
+    : (type === 'buy') ? 'trade.execution'
+    : (meta?.arb || type === 'arb') ? 'package.settlement'
+    : (type === 'signal') ? 'trade.decision'
+    : 'system.alert';
+  emitEvent(evtType, { message: msg, type, ...(meta || {}) });
 
   if (AGILE_NOTIFY_TYPES.has(type) || (meta && meta.arb)) {
     pushNotification({
@@ -981,7 +1058,12 @@ function logScan(msg, meta) {
   botState.lastScanLog = entry;
   botState.executionLog = botState.executionLog.filter((e) => e.type !== 'scan' && e.level !== 'scan' && e.id !== 'latest-scan');
   botState.executionLog.unshift(entry);
-  if (botState.executionLog.length > 500) botState.executionLog.length = 500;
+  // Same cap as log(); this runs every cycle, so a smaller literal here would
+  // silently truncate the log back down and undo the retention raise.
+  if (botState.executionLog.length > EXECUTION_LOG_CAP) botState.executionLog.length = EXECUTION_LOG_CAP;
+
+  // D8 typed scan cycle event
+  emitEvent('scan.cycle', { message: msg, ...(meta || {}) });
 }
 
 function summarizeSignal(signal) {
@@ -1218,374 +1300,6 @@ function buildPortfolio(readiness, mode) {
     live: liveStats,
     paper: paperStats,
     pnlSource: 'clob+pm_tracked',
-  };
-}
-
-function resolveOrderSize(cfg, { price, signal, readiness, stats, remaining, windowSec, duration, symbol }) {
-  const paperBankroll = Number(cfg.paperBankroll ?? cfg.paperInitialDeposit ?? 100);
-  const liveBankroll = readiness?.spendableBalance ?? readiness?.clobBalance ?? 0;
-  // Never pretend cash is $100 when paper ledger is empty/negative — that over-bought to -cash
-  if (cfg.mode === 'paper' && !(paperBankroll > 0.05)) {
-    return { sizeUsd: 0, kelly: null, limits: resolveDynamicLimits(cfg, 0), reason: 'no_paper_cash' };
-  }
-  const bankroll = cfg.mode === 'paper' ? paperBankroll : liveBankroll;
-  if (!(bankroll > 0)) {
-    return { sizeUsd: 0, kelly: null, limits: resolveDynamicLimits(cfg, 0), reason: 'no_bankroll' };
-  }
-
-  // Offline-trained duration/conf/price heuristics (when available)
-  const heur = heuristicForTrade({
-    duration: duration || (windowSec >= 3600 ? '1h' : windowSec >= 1800 ? '30m' : windowSec >= 900 ? '15m' : '5m'),
-    confidence: signal?.confidence,
-    entryPrice: price,
-    symbol: symbol || signal?.asset,
-  });
-  const kellyFraction = Number(
-    heur?.kellyFraction ?? cfg.kellyFraction ?? 0.50,
-  );
-  const maxPositionPct = Number(
-    heur?.maxPositionPct ?? cfg.maxPositionPct ?? 0.10,
-  );
-
-  const limits = resolveDynamicLimits(cfg, bankroll);
-  const { minUsd, maxUsd } = limits;
-  const cashFrac = Math.min(0.95, Math.max(0.01, maxPositionPct));
-  const hardCap = cfg.mode === 'paper'
-    ? Math.min(maxUsd, Math.max(0, paperBankroll * cashFrac))
-    : maxUsd;
-
-  if (!cfg.useKellySizing) {
-    return {
-      sizeUsd: Math.min(hardCap, maxUsd),
-      kelly: null,
-      limits,
-      heuristic: heur?.source || null,
-    };
-  }
-
-  const kelly = computeKellySize({
-    bankroll: limits.spendable || bankroll,
-    price,
-    signalConfidence: signal?.confidence ?? 0.35,
-    historicalWinRate: stats?.totalTrades > 0 ? stats.wins / stats.totalTrades : null,
-    tradeCount: stats?.totalTrades ?? 0,
-    minUsd,
-    maxUsd: hardCap,
-    kellyFraction,
-    maxPositionPct,
-  });
-
-  let sizeUsd = kelly.sizeUsd;
-  if (cfg.useAggressiveScaling && sizeUsd > 0) {
-    const mul = Number(cfg.aggScaleMultiplier ?? 1.0);
-    sizeUsd = Math.min(sizeUsd * mul, hardCap);
-  }
-  sizeUsd = Math.min(sizeUsd, hardCap);
-
-  // Certainty-aware upsizing: near-guaranteed favorites late in the window earn a
-  // bigger stake than flat historical Kelly allows. This runs its own, higher cap
-  // (certaintyMaxPct of bankroll) so a "10% away, 20s left" entry can be $10–30 on
-  // a $100 book instead of a $2 token bet — while ordinary trades stay conservative.
-  let certainty = null;
-  if (cfg.certaintySizing !== false && remaining != null) {
-    const certMaxPct = Number(cfg.certaintyMaxPct ?? 0.35);
-    const certCap = Math.min(
-      Math.max(maxUsd, bankroll * certMaxPct),
-      Number(cfg.certaintyMaxUsd ?? 40),
-      cfg.mode === 'paper' ? paperBankroll * cashFrac : bankroll,
-    );
-    certainty = computeCertaintyKelly({
-      price,
-      confidence: signal?.confidence,
-      remaining,
-      windowSec: Number(windowSec) || POLY_WINDOW_SECONDS,
-      bankroll: limits.spendable || bankroll,
-      kellyFraction,
-      minUsd,
-      maxUsd: certCap,
-      maxPct: certMaxPct,
-    });
-    if (certainty && certainty.sizeUsd > sizeUsd) {
-      sizeUsd = Math.min(certainty.sizeUsd, certCap);
-    }
-  }
-
-  // Paper directional recovery: if historical Kelly is negative, still allow tiny probes
-  // (live stays blocked by edge gate / zero size)
-  if ((!sizeUsd || sizeUsd <= 0) && cfg.mode === 'paper' && cfg.arbOnlyUntilEdge === false && hardCap >= minUsd) {
-    const conf = Math.min(0.65, Number(signal?.confidence || 0.35));
-    sizeUsd = Math.round(Math.max(minUsd, Math.min(hardCap, 1.2 + conf * 2.5)) * 100) / 100;
-    return {
-      sizeUsd,
-      kelly: { ...(kelly || {}), limits, method: 'paper_probe' },
-      limits,
-      reason: 'paper_probe',
-    };
-  }
-
-  if (!sizeUsd || sizeUsd <= 0) {
-    return { sizeUsd: 0, kelly: { ...kelly, limits }, limits, reason: kelly?.method || 'zero_size' };
-  }
-
-  const usedCertainty = certainty && Math.abs(sizeUsd - certainty.sizeUsd) < 0.005;
-  return {
-    sizeUsd,
-    kelly: {
-      ...kelly,
-      ...(usedCertainty ? { method: 'certainty_kelly' } : {}),
-      certainty: certainty || null,
-      limits,
-      heuristic: heur?.source || null,
-    },
-    limits,
-    heuristic: heur,
-  };
-}
-
-function buildDecision({
-  cfg,
-  market,
-  outcome,
-  price,
-  remaining,
-  signal,
-  existingPosition,
-  readiness,
-  depth = null,
-  prices = null,
-}) {
-  const reasons = [];
-  let eligible = true;
-  let score = 0;
-
-  if (cfg.tradeCurrentWindowOnly && !market.isCurrent) {
-    eligible = false;
-    reasons.push('next window — watch only');
-  }
-
-  if (!market.acceptingOrders) {
-    eligible = false;
-    reasons.push('not accepting orders');
-  }
-
-  if (!price || price === 0) {
-    eligible = false;
-    reasons.push('no price');
-  }
-
-  if (eligible && price < cfg.minPrice) {
-    eligible = false;
-    reasons.push(`below min $${cfg.minPrice.toFixed(2)}`);
-  }
-
-  if (eligible && price > cfg.maxPrice) {
-    eligible = false;
-    reasons.push(`above max $${cfg.maxPrice.toFixed(2)}`);
-  }
-
-  const entryWin = resolveEntryWindows(market?.duration || '5m', cfg);
-  if (eligible && remaining < entryWin.minRemainingSec) {
-    eligible = false;
-    reasons.push(`${remaining}s left < ${entryWin.minRemainingSec}s min (${entryWin.duration})`);
-  }
-
-  // Hard stop on expired / resolved windows (slug clock can lag a few seconds)
-  if (eligible && remaining <= 0) {
-    eligible = false;
-    reasons.push('window expired');
-  }
-
-  if (
-    eligible
-    && cfg.requireDataAssurance !== false
-    && botState._dataAssurance
-    && !botState._dataAssurance.canBuy
-  ) {
-    eligible = false;
-    reasons.push(dataAssuranceBuyBlockReason(botState._dataAssurance) || 'data assurance blocked');
-  }
-
-  const maxEntry = entryWin.maxEntryRemainingSec ?? cfg.maxEntryRemainingSec ?? 298;
-  if (eligible && remaining > maxEntry) {
-    eligible = false;
-    reasons.push(`${remaining}s left > ${maxEntry}s entry window (${entryWin.duration})`);
-  }
-
-  if (eligible && remaining >= 180) {
-    const earlyBoost = Math.min(18, ((remaining - 180) / 120) * 18);
-    score += earlyBoost;
-    reasons.push(`early entry +${earlyBoost.toFixed(0)} (${remaining}s left)`);
-  } else if (eligible && remaining >= 120) {
-    score += 6;
-    reasons.push(`mid-early ${remaining}s`);
-  }
-
-  if (eligible && cfg.minPositionSize != null && cfg.maxPositionSize < cfg.minPositionSize) {
-    eligible = false;
-    reasons.push(`max $${cfg.maxPositionSize} < min $${cfg.minPositionSize}`);
-  }
-
-  const minBet = Number(cfg.minPositionSize ?? POLY_MIN_ORDER_USD);
-  if (eligible && (readiness?.spendableBalance ?? 0) < minBet && cfg.mode === 'live') {
-    eligible = false;
-    reasons.push(`bankroll $${(readiness?.spendableBalance ?? 0).toFixed(2)} < min bet $${minBet}`);
-  }
-
-  const maxConcurrent = cfg.maxConcurrentPerSlug ?? 1;
-  const allowScaleIn = cfg.allowScaleIn !== false && maxConcurrent > 1;
-  if (eligible && existingPosition && !allowScaleIn) {
-    eligible = false;
-    reasons.push('position already open');
-  }
-  if (eligible && existingPosition && allowScaleIn) {
-    reasons.push('scale-in allowed');
-    score += 4;
-  }
-
-  if (eligible && hasOpenOnSlug(market.slug)) {
-    eligible = false;
-    reasons.push('already in this window');
-  }
-
-  if (cfg.mode === 'live' && readiness && !readiness.liveReady) {
-    eligible = false;
-    reasons.push('live not ready — fund CLOB USDC');
-  }
-
-  // Order book / arb: YES+NO ask sum < 1 → free edge; imbalance biases direction
-  let bookMeta = null;
-  if (cfg.useOrderBookBias !== false && depth) {
-    const side = depth[outcome];
-    const upAsk = depth.up?.bestAsk || prices?.up;
-    const downAsk = depth.down?.bestAsk || prices?.down;
-    const arbGap = (upAsk > 0 && downAsk > 0) ? (1 - upAsk - downAsk) : null;
-    const imbalance = side?.imbalance ?? 0;
-    const spreadPct = side?.spreadPct ?? null;
-    bookMeta = { arbGap, imbalance, spreadPct, bestBid: side?.bestBid, bestAsk: side?.bestAsk };
-
-    if (arbGap != null && arbGap > 0.01) {
-      score += arbGap * 160;
-      reasons.push(`arb gap +${(arbGap * 100).toFixed(1)}c`);
-    }
-    // Absolute cents also matter — mid-% can look fine while book is untradeable
-    const spreadCents = side?.bestBid > 0 && side?.bestAsk > 0
-      ? (side.bestAsk - side.bestBid) * 100
-      : null;
-    if (spreadPct != null && spreadPct < 0.8) {
-      score += 12;
-      reasons.push(`ultra-tight spread ${spreadPct.toFixed(2)}%`);
-    } else if (spreadPct != null && spreadPct < 1.5) {
-      score += 7;
-      reasons.push(`tight spread ${spreadPct.toFixed(2)}%`);
-    } else if (spreadPct != null && spreadPct > 3) {
-      score -= 14;
-      reasons.push(`wide spread ${spreadPct.toFixed(2)}%`);
-      const blockPct = cfg.mode === 'paper' ? 12 : 6;
-      if (spreadPct > blockPct && cfg.requireTightSpread !== false) {
-        eligible = false;
-        reasons.push('spread too wide — blocked');
-      }
-    }
-    if (spreadCents != null && spreadCents > 8 && cfg.requireTightSpread !== false && cfg.mode !== 'paper') {
-      eligible = false;
-      reasons.push(`spread ${spreadCents.toFixed(1)}c too wide`);
-    }
-    const imbHelps = (outcome === 'up' && imbalance > 0.15) || (outcome === 'down' && imbalance < -0.15);
-    const imbHurts = (outcome === 'up' && imbalance < -0.25) || (outcome === 'down' && imbalance > 0.25);
-    if (imbHelps) {
-      score += Math.abs(imbalance) * 18;
-      reasons.push(`book ${imbalance > 0 ? 'bid' : 'ask'} heavy`);
-    } else if (imbHurts) {
-      score -= Math.abs(imbalance) * 12;
-      reasons.push('book against');
-    }
-  }
-
-  if (cfg.useSignals) {
-    if (!signal) {
-      eligible = false;
-      reasons.push('signal unavailable');
-    } else if (signal.tooVolatile || signal.skipTrade) {
-      eligible = false;
-      reasons.push(`volatility high (${signal.volatility?.atrPct?.toFixed?.(2) || 'n/a'}% ATR)`);
-    } else if (signal.direction === 'neutral') {
-      // Neutral: still allow book/arb-driven trades on either side
-      const edge = Math.max(0, 0.55 - price);
-      score += edge * 35;
-      reasons.push('signal neutral — book/arb may lead');
-      if (edge < 0.02 && !(bookMeta?.arbGap > 0.012)) {
-        eligible = false;
-        reasons.push('neutral + no edge');
-      }
-    } else {
-      const expectedDirection = outcome === 'up' ? 'up' : 'down';
-      const agrees = signal.direction === expectedDirection;
-      const edge = Math.max(0, 0.55 - price);
-      const balPre = sideBalanceStats(cfg);
-      const skewSoft = cfg.sideBalanceEnabled !== false && balPre.upShare >= 0.68;
-      if (!agrees) {
-        // Soft mismatch ONLY — never hard-lock; explore lightly when skewed
-        const arbRescue = bookMeta?.arbGap != null && bookMeta.arbGap >= Number(cfg.minArbGap ?? 0.015);
-        const explore = (cfg.arbExploreRate > 0 && Math.random() < Number(cfg.arbExploreRate));
-        score -= 22;
-        reasons.push(`signal says ${signal.direction.toUpperCase()} (counter)`);
-        if (arbRescue) {
-          score += bookMeta.arbGap * 200;
-          reasons.push('arb overrides mismatch');
-        } else if (explore || skewSoft) {
-          score += skewSoft ? 8 : 6;
-          reasons.push(skewSoft ? 'soft skew explore' : 'explore opposite side');
-        }
-        // Counter without arb/edge stays eligible only if price is a clear underdog
-        if (!arbRescue && !(price > 0 && price <= Number(cfg.underdogMaxPrice ?? 0.42))) {
-          eligible = false;
-          reasons.push('counter needs arb or underdog price');
-        }
-      } else if (signal.confidence < entryWin.minConfidence && !skewSoft) {
-        eligible = false;
-        reasons.push(
-          `confidence ${(signal.confidence * 100).toFixed(0)}% < ${(entryWin.minConfidence * 100).toFixed(0)}% (${entryWin.source})`,
-        );
-      } else {
-        // Cap signal score contribution so soft balance can still nudge
-        const confCap = Math.min(Number(signal.confidence || 0), 0.65);
-        score += (confCap * 40) + (edge * 45) + Math.min(Number(signal.score || 0), 6);
-        reasons.push(`signal ${signal.direction.toUpperCase()} ${(confCap * 100).toFixed(0)}%`);
-        if (edge > 0) reasons.push(`price edge +${(edge * 100).toFixed(1)}c`);
-        if (price > 0 && price <= Number(cfg.underdogMaxPrice ?? 0.42)) {
-          score += 12;
-          reasons.push('underdog hold-to-settle candidate');
-        }
-        if (signal.confidenceBiasUsed && signal.confidenceBias?.traceAgree === true) {
-          score += 3;
-          reasons.push('ML short-trace agrees');
-        } else if (signal.confidenceBias?.traceAgree === false) {
-          score -= 8;
-          reasons.push('ML short-trace disagrees');
-        }
-      }
-    }
-  } else {
-    score += Math.max(0, 0.55 - price) * 40;
-    reasons.push('signals disabled');
-  }
-
-  // Break chronic single-side bias
-  const bal = sideBalanceBonus(outcome, cfg);
-  if (bal.bonus) {
-    score += bal.bonus;
-    if (bal.note) reasons.push(bal.note);
-  }
-
-  if (eligible) reasons.push('tradable now');
-
-  return {
-    outcome,
-    price,
-    eligible,
-    score,
-    reasons,
-    book: bookMeta,
   };
 }
 
@@ -1870,11 +1584,54 @@ export function getState(opts = {}) {
     },
     audit,
     portfolio,
-    packages: (() => {
-      syncPackageSettlements(botState.trades, mode);
-      return loadPackages().filter((p) => p.mode === mode);
+    // Read-only (backlog item 10). This used to call `syncPackageSettlements`
+    // inline, making a *state transition* a side effect of a *read* — and the
+    // only caller of that transition. Nothing calls getState() on a timer, so
+    // with no dashboard open packages stayed LOCKED forever, capacity never
+    // drained and arb halted once maxArbPackages filled. Settlement now runs
+    // from arbHousekeeping() in the scan loop, where it belongs.
+    packages: loadPackages().filter((p) => p.mode === mode),
+    arbMetrics: getArbPackageMetrics(mode, botState.trades),
+    // Per-engine capacity, so "why didn't it trade?" is answerable without
+    // reading the code (objective 1). The two budgets are independent (D5):
+    // directional slots are the risk dial, arb capacity is a package count.
+    slots: (() => {
+      const maxDirectional = Number(botState.config.maxOpenPositions ?? 6);
+      const maxArbPackages = Number(botState.config.maxArbPackages ?? 4);
+      const openDirectional = countOpenPositions(mode, 'directional');
+      const openArbLegs = countOpenPositions(mode, 'arb');
+      return {
+        directional: {
+          open: openDirectional,
+          max: maxDirectional,
+          full: openDirectional >= maxDirectional,
+          note: 'Directional trades held now, out of the maximum allowed at once.',
+        },
+        arb: {
+          openLegs: openArbLegs,
+          maxLegs: maxArbPackages * 2,
+          maxPackages: maxArbPackages,
+          full: openArbLegs >= maxArbPackages * 2,
+          note: 'Arbitrage buys two sides per trade, so each package uses two of these.',
+        },
+      };
     })(),
-    arbMetrics: getArbPackageMetrics(mode),
+    // Who last changed each setting, and what changed recently (D3).
+    //
+    // Read-only. The counts are the useful part: they say how much of the
+    // active profile the operator actually chose, versus how much the governor
+    // and optimizer wrote. Before this existed the answer was unknowable — the
+    // stored profile mixed overlays from regimes that were never both active.
+    settingWriters: (() => {
+      const summary = writerSummary(botState.configStore, mode);
+      return {
+        ...summary,
+        note: summary.total
+          ? 'Counts settings on this profile by who set them. "unattributed" means it was already there before changes were tracked.'
+          : 'Nothing recorded yet — this fills in as settings change.',
+      };
+    })(),
+    settingChanges: recentChanges(botState.configStore, { limit: 20 }),
   };
   const narrative = buildSystemNarrative(stateCore);
   const liveScoreCards = buildLiveScoreCards(stateCore);
@@ -1961,6 +1718,13 @@ export function getState(opts = {}) {
     signals: botState.signals,
     stats: isolatedStats,
     audit,
+    // These three live on `stateCore` because the narrative and score-card
+    // builders read it — but `stateCore` is an ARGUMENT to those builders, never
+    // spread into this return. Adding a field there does not expose it, which is
+    // how `slots` shipped invisible in the D5 work. See backlog item 31.
+    slots: stateCore.slots,
+    settingWriters: stateCore.settingWriters,
+    settingChanges: stateCore.settingChanges,
     telemetry: {
       uptime: botState.running ? Math.floor((Date.now() - botState._startTime) / 1000) : 0,
       uptimeMs: botState.running ? Date.now() - botState._startTime : 0,
@@ -2013,7 +1777,7 @@ export function getState(opts = {}) {
     spotPrices: botState.spotPrices,
     models: getModelStates(),
     modelHealth: getModelHealth(),
-    sideMix: (() => { const b = sideBalanceBonus('up', botState.config); return { up: b.up || 0, down: b.down || 0 }; })(),
+    sideMix: (() => { const b = sideBalanceBonus('up', botState.config, sideBalanceStats(botState.config)); return { up: b.up || 0, down: b.down || 0 }; })(),
     traces: lean
       ? {
           events: (botState.traces?.events || []).slice(0, 25),
@@ -2079,7 +1843,7 @@ export async function optimizeNow({ apply = true, useLlm = true } = {}) {
   const state = getState();
   return runOptimizer({
     state,
-    saveConfig,
+    saveConfig: (patch) => saveConfig(patch, { tier: 'automation', source: 'optimizer' }),
     log,
     apply,
     useLlm: useLlm && botState.config.llmOptimize !== false,
@@ -2092,7 +1856,7 @@ export async function governorNow({ useLlm = true } = {}) {
     signals: botState.signals,
     portfolio: buildPortfolio(botState.readiness, botState.config.mode || 'paper'),
     trades: botState.trades,
-    saveConfig,
+    saveConfig: (patch) => saveConfig(patch, { tier: 'automation', source: 'governor' }),
     log,
     useLlm: useLlm && botState.config.llmOptimize !== false,
   });
@@ -2101,7 +1865,7 @@ export async function governorNow({ useLlm = true } = {}) {
 export async function applyLlmPrimitives(actions) {
   const { runPrimitives } = await import('../ai/primitives.js');
   return runPrimitives(actions, {
-    saveConfig,
+    saveConfig: (patch) => saveConfig(patch, { tier: 'automation', source: 'llm-primitives' }),
     startBot,
     stopBot,
     optimizeNow,
@@ -2139,7 +1903,7 @@ async function scanOpenExitsFast() {
     const prices = await getPricesForMarket(market).catch(() => ({}));
     const depth = await getDepthForMarket(market).catch(() => null);
     for (const pos of positions) {
-      if (pos.closed || pos.packageId || pos.isArbLeg) continue;
+      if (pos.closed || holdsToSettlement(pos)) continue;
       const mark = exitMarkPrice(pos.outcome, prices, depth);
       if (!mark) continue;
       markPosition(pos, mark);
@@ -2211,7 +1975,7 @@ async function scanOpenExitsFast() {
   saveState();
 }
 
-async function scan() {
+export async function scan() {
   const cfg = botState.config;
   if (!cfg.enabled) return;
   if (botState._scanning) {
@@ -2224,47 +1988,20 @@ async function scan() {
   try {
     maybeFinalizeCycle();
     prunePendingTrades();
+    // Arb capacity has to drain without anyone watching (items 9 and 10).
+    await arbHousekeeping('scan');
     botState.stats.scansDone = (botState.stats.scansDone || 0) + 1;
     const readiness = await refreshTelemetry();
 
-    if (cfg.useSignals) {
-      botState.signals = await getSignalForBoth();
-      // Prefer cached ML ladder from background refresh; only force a light signal nudge
-      const mlOverride = cfg.useML
-        ? await getMLSignalForBoth('5m', 1).catch(() => ({ btc: null, eth: null }))
-        : null;
-      if (mlOverride) {
-        for (const asset of ['btc', 'eth']) {
-          const raw = botState.signals[asset];
-          const ml = mlOverride[asset];
-          if (!raw || !ml || ml.error || ml.direction === 'neutral' || ml.direction === 0) continue;
-          addMLPrediction(asset, ml);
-          const rawIsBull = raw.direction === 'up';
-          const mlIsBull = ml.direction === 1 || ml.direction === 'up';
-          const mlConf = Number(ml.confidence || 0);
-          // Paper: let a clear ML call fill neutral/weak technicals so scans actually fire
-          const paperLoose = cfg.mode === 'paper' && mlConf >= 0.58;
-          const liveStrong = mlConf >= 0.62;
-          if ((paperLoose || liveStrong) && (raw.direction === 'neutral' || rawIsBull !== mlIsBull)) {
-            raw.direction = mlIsBull ? 'up' : 'down';
-            raw.confidence = Math.min(0.65, Math.max(raw.confidence || 0, mlConf * 0.75));
-            raw.score = Math.min(6, mlConf * 6);
-            raw.mlOverride = true;
-            raw.mlConfidence = mlConf;
-          } else if ((paperLoose || liveStrong) && rawIsBull === mlIsBull) {
-            raw.confidence = Math.min(0.65, (raw.confidence || 0) + mlConf * 0.12);
-            raw.mlConfirmed = true;
-            raw.mlConfidence = mlConf;
-          }
-          const bias = getConfidenceBias(asset, raw);
-          if (bias.bias !== 0) {
-            raw.confidence = Math.min(0.65, bias.adjusted);
-            raw.confidenceBias = bias;
-            raw.confidenceBiasUsed = true;
-          }
-        }
-      }
-    }
+    await collectSignals({
+      cfg,
+      botState,
+      getSignalForBoth,
+      getMLSignalForBoth,
+      addMLPrediction,
+      getConfidenceBias,
+      log,
+    });
 
     const { markets, diagnostics } = await findMarkets(resolveMarketDurations(cfg));
     botState.diagnostics = diagnostics;
@@ -2283,10 +2020,7 @@ async function scan() {
       const nowMs = Date.now();
       for (const pos of [...botState.positions]) {
         if (pos.closed || pos.mode !== 'paper') continue;
-        const slugTs = Number(String(pos.slug || '').split('-').pop());
-        const windowEndMs = Number.isFinite(slugTs) && slugTs > 1e9
-          ? (slugTs + POLY_WINDOW_SECONDS) * 1000
-          : null;
+        const windowEndMs = positionWindowEndMs(pos);
         if (windowEndMs == null || nowMs < windowEndMs + 5000) continue;
         try {
           const result = await executeSell(pos, 'settle');
@@ -2305,21 +2039,7 @@ async function scan() {
     }
 
     // Restore window open clock + Chainlink to-beat before decisions (bounded).
-    await Promise.all(tradableMarkets.map(async (market) => {
-      const windowSec = Number(market.windowSeconds || POLY_WINDOW_SECONDS) || POLY_WINDOW_SECONDS;
-      if (!market.eventStartTime && market.endTime) {
-        market.eventStartTime = new Date((Number(market.endTime) - windowSec) * 1000).toISOString();
-      }
-      if (!market.endDate && market.endTime) {
-        market.endDate = new Date(Number(market.endTime) * 1000).toISOString();
-      }
-      const ptb = await Promise.race([
-        fetchPriceToBeat(market).catch(() => null),
-        new Promise((resolve) => setTimeout(() => resolve(null), 3500)),
-      ]);
-      market.priceToBeat = ptb?.openPrice ?? market.priceToBeat ?? null;
-      market.priceToBeatMeta = ptb || market.priceToBeatMeta || null;
-    }));
+    await enrichMarketsWithOracle(tradableMarkets, { fetchPriceToBeat, timeoutMs: 3500 });
 
     const signalTs = Math.max(
       Number(botState.signals?.btc?.timestamp || 0),
@@ -2501,7 +2221,12 @@ async function scan() {
       }
 
       const edgeGateNow = evaluateEdgeGate(botState.trades, cfg);
-      const isArbOnlyMode = cfg.forceArbOnly === true || (cfg.arbOnlyUntilEdge !== false && !edgeGateNow.edgeOk);
+      const tradingPerms = resolveTradingPermissions({
+        cfg,
+        edgeState: edgeGateNow,
+        governorDecision: getGovernorStatus(),
+      });
+      const isArbOnlyMode = tradingPerms.arbOnly;
 
       // Atomic Arb Engine Execution: Execute ArbPackage and bypass directional evaluation when arb-only mode or gap is active
       if (cfg.clobArbEnabled !== false && (isArbOnlyMode || arb)) {
@@ -2550,6 +2275,7 @@ async function scan() {
           readiness,
           depth,
           prices,
+          portfolio: portfolioView(market.slug, cfg),
         });
 
         candidates.push(candidate);
@@ -2596,8 +2322,12 @@ async function scan() {
       }
 
       if (action === 'buy' && buyOutcome) {
+        // Directional positions only (D5). manageEnvironment derives heat and a
+        // per-duration open cap (maxOpensFor: 2 for 5m/15m, 1 for 30m/1h), so
+        // counting arb legs here meant a single hedged pair on a 5m market
+        // exhausted that duration's directional budget outright.
         const env = manageEnvironment({
-          opens: botState.positions,
+          opens: exitManagedPositions(botState.positions),
           mode: cfg.mode,
           maxOpenPositions: Number(cfg.maxOpenPositions ?? 6),
           cash: readiness?.spendableBalance ?? cfg.paperBankroll,
@@ -2608,7 +2338,7 @@ async function scan() {
           buyOutcome = null;
         } else if (hasOpenOnSlug(market.slug)) {
           action = 'hold';
-        } else if (countOpenPositions(cfg.mode) >= Number(cfg.maxOpenPositions ?? 6)) {
+        } else if (countOpenPositions(cfg.mode, 'directional') >= Number(cfg.maxOpenPositions ?? 6)) {
           action = 'hold';
         } else {
         botState._buyLocks.add(market.slug);
@@ -2691,6 +2421,9 @@ async function scan() {
             log(`🔴 MAX DRAWDOWN ${cfg.mode.toUpperCase()} · ${ddPct}% off cost (limit ${(maxDd * 100)}%) — closing all positions`, 'system', { totalCost, totalUnrealized, ddPct, limit: maxDd });
             botState._ddTriggered = true;
             for (const op of modePositions) {
+              // Arb legs are hedged to $1.00 at settlement — force-closing mid-window
+              // forfeits the locked edge and books the spread. Keep them immune.
+              if (holdsToSettlement(op)) continue;
               if (op.mode === 'live' && op.tokenId && op.shares > 0) {
                 try {
                   const sellRes = await placeMarketSell({
@@ -2978,7 +2711,7 @@ async function scan() {
         }
 
         // Package legs are immune from mid-window exits — hold strictly to settlement
-        if (pos.packageId || pos.isArbLeg) {
+        if (holdsToSettlement(pos)) {
           continue;
         }
 
@@ -3202,11 +2935,7 @@ async function scan() {
       botRunning: true,
     });
 
-    const t = botState.trades;
-    botState.stats.totalTrades = t.length;
-    botState.stats.totalPnl = Math.round(t.reduce((s, x) => s + (x.pnl || 0), 0) * 100) / 100;
-    botState.stats.wins = t.filter(x => (x.pnl || 0) > 0).length;
-    botState.stats.losses = t.filter(x => (x.pnl || 0) <= 0).length;
+    updateBotTradeStats(botState);
 
     saveState();
 
@@ -3643,16 +3372,23 @@ export function startBot() {
   // Enforce paper lock before enabling
   const gate = evaluateEdgeGate(botState.trades, botState.config);
   if (botState.config.mode === 'live' && !gate.liveAllowed) {
-    saveConfig({ mode: 'paper', enabled: true });
+    saveConfig({ mode: 'paper', enabled: true }, { tier: 'operator', source: 'bot-start' });
     log(`🔒 LIVE → PAPER on start — ${gate.reason}`, 'system', { edgeGate: gate });
   } else {
-    saveConfig({ enabled: true });
+    saveConfig({ enabled: true }, { tier: 'operator', source: 'bot-start' });
   }
   botState.running = true;
   botState._startTime = Date.now();
   botState.stopRequest = null;
   reconcilePaperCash('bot start');
   repairPaperOverdraft('bot start');
+  // A package stranded PENDING_FILL by a restart is exactly what this catches,
+  // and a restart is precisely when we are here.
+  // startBot is synchronous and nothing downstream here needs the result — the
+  // first scan re-runs this anyway. Surfaced rather than swallowed.
+  void arbHousekeeping('bot start').catch((err) => {
+    log(`⚠️ Arb housekeeping failed at boot: ${String(err?.message || err).slice(0, 120)}`, 'error');
+  });
   const modeTrades = dedupeTrades(botState.trades).filter((trade) => trade.mode === botState.config.mode);
   const startPortfolio = buildPortfolio(botState.readiness, botState.config.mode);
   botState.session = {
@@ -3800,7 +3536,7 @@ export function stopBot(options = {}) {
     };
   }
   botState.running = false;
-  saveConfig({ enabled: false });
+  saveConfig({ enabled: false }, { tier: 'operator', source: 'bot-stop' });
   if (botState.interval) { clearInterval(botState.interval); botState.interval = null; }
   const session = completeSession(options?.reason || (immediate ? 'immediate' : 'stopped'));
   botState.stopRequest = null;
@@ -3835,7 +3571,7 @@ export function restoreConfigSession(id) {
   });
   botState.configStore = normalizeConfigStore(row.configStore, flatDefaults());
   syncConfigFromStore();
-  saveConfig({});
+  saveConfig({}, { tier: 'system', source: 'persist-touch' });
   log(`↩️ CONFIG RESTORED · ${row.label} · ${row.mode}`, 'system', { configSessionId: id });
   return { ok: true, restored: row, config: botState.config };
 }
@@ -3852,10 +3588,32 @@ export function resetPaperData({ initialDeposit = 100 } = {}) {
     label: 'Before paper reset',
     source: 'paper_reset_backup',
   });
+
+  const paperTrades = botState.trades.filter((trade) => trade.mode === 'paper');
+  const paperPositions = botState.positions.filter((position) => position.mode === 'paper');
+  const paperPackages = loadPackages().filter((pkg) => pkg.mode === 'paper');
+
+  if (paperPackages.length > 0 || paperTrades.length > 0 || paperPositions.length > 0) {
+    const archiveFile = dataPath('poly_paper_archive.json');
+    const prev = load(archiveFile, []) || [];
+    persistSync(archiveFile, [
+      ...prev.slice(-20),
+      {
+        archivedAt: Date.now(),
+        reason: 'paper_reset_clean_slate',
+        packages: paperPackages,
+        trades: paperTrades,
+        positions: paperPositions,
+      },
+    ]);
+  }
+
+  const { removed: removedPackages } = resetPackages('paper');
   const removed = {
-    trades: botState.trades.filter((trade) => trade.mode === 'paper').length,
-    positions: botState.positions.filter((position) => position.mode === 'paper').length,
+    trades: paperTrades.length,
+    positions: paperPositions.length,
     actions: botState.actions.filter((action) => action.mode === 'paper').length,
+    packages: removedPackages,
   };
   botState.trades = botState.trades.filter((trade) => trade.mode !== 'paper');
   botState.positions = botState.positions.filter((position) => position.mode !== 'paper');
@@ -3869,9 +3627,11 @@ export function resetPaperData({ initialDeposit = 100 } = {}) {
   persistSync(FILES.TRADES, botState.trades);
   persistSync(FILES.POSITIONS, botState.positions);
   persistSync(FILES.ACTIONS, botState.actions);
-  saveConfig({ mode: 'paper', enabled: false, paperBankroll: amount, paperInitialDeposit: amount });
+  resetGovernorPeak('paper');
+  saveConfig({ mode: 'paper', enabled: false, paperBankroll: amount, paperInitialDeposit: amount },
+    { tier: 'operator', source: 'reset-paper' });
   refreshKellyHistory();
-  log(`♻️ PAPER DATA RESET · $${amount.toFixed(2)} initial · removed ${removed.trades} trades`, 'system', removed);
+  log(`♻️ PAPER DATA RESET · $${amount.toFixed(2)} initial · removed ${removed.trades} trades, ${removed.packages} packages`, 'system', removed);
   notifyStateChange();
   return { ok: true, removed, paperBankroll: amount };
 }
@@ -3891,6 +3651,7 @@ export function resetLiveData({ baselineUsd = null } = {}) {
 
   const liveTrades = botState.trades.filter((trade) => trade.mode === 'live');
   const livePositions = botState.positions.filter((position) => position.mode === 'live');
+  const livePackages = loadPackages().filter((pkg) => pkg.mode === 'live');
   const phantomTrades = liveTrades.filter((t) => !t.orderId);
   const phantomOpen = livePositions.filter((p) => !p.closed && !p.orderId);
 
@@ -3901,6 +3662,7 @@ export function resetLiveData({ baselineUsd = null } = {}) {
     {
       archivedAt: Date.now(),
       reason: 'live_reset_clean_slate',
+      packages: livePackages,
       trades: liveTrades,
       positions: livePositions,
       phantomTradeCount: phantomTrades.length,
@@ -3908,9 +3670,11 @@ export function resetLiveData({ baselineUsd = null } = {}) {
     },
   ]);
 
+  const { removed: removedLivePackages } = resetPackages('live');
   const removed = {
     trades: liveTrades.length,
     positions: livePositions.length,
+    packages: removedLivePackages,
     actions: botState.actions.filter((action) => action.mode === 'live').length,
     phantomTrades: phantomTrades.length,
     phantomOpen: phantomOpen.length,
@@ -3929,6 +3693,7 @@ export function resetLiveData({ baselineUsd = null } = {}) {
   persistSync(FILES.TRADES, botState.trades);
   persistSync(FILES.POSITIONS, botState.positions);
   persistSync(FILES.ACTIONS, botState.actions);
+  resetGovernorPeak('live');
 
   const cash = Number(
     baselineUsd
@@ -3938,7 +3703,7 @@ export function resetLiveData({ baselineUsd = null } = {}) {
     ?? 0,
   );
   const baseline = saveBaseline(cash, 'Live account normalized — clean slate');
-  saveConfig({ mode: 'live', enabled: false });
+  saveConfig({ mode: 'live', enabled: false }, { tier: 'operator', source: 'reset-live' });
   refreshKellyHistory();
   log(
     `♻️ LIVE DATA RESET · baseline $${Number(baseline.balanceUsd).toFixed(2)} · removed ${removed.trades} trades (${removed.phantomTrades} phantom)`,
@@ -3953,8 +3718,17 @@ async function executeSell(pos, reason = 'manual') {
   if (!pos || pos.closed) return { ok: false, error: 'Position not found or already closed' };
 
   let price = pos.currentPrice || pos.entryPrice;
-  if (reason === 'settle' && pos.mode === 'paper' && pos.isArbLeg) {
-    price = 0.50; // Guaranteed $1.00 payout distributed evenly across the 2 hedge legs
+  if (reason === 'settle' && pos.mode === 'paper') {
+    const market = (botState.markets || []).find((m) => m.slug === pos.slug || m.conditionId === pos.conditionId);
+    const ptb = market?.priceToBeatMeta;
+    const res = resolveSettlementPrice({
+      pos,
+      openPositions: botState.positions,
+      market,
+      ptb,
+      finalPrice: pos.currentPrice,
+    });
+    price = res.price;
   }
 
   markPosition(pos, price);
@@ -3977,7 +3751,23 @@ async function executeSell(pos, reason = 'manual') {
   pos.closed = true;
   pos.exitReason = reason;
   if (pos.mode === 'paper') {
-    const proceeds = Math.round(positionShares(pos) * price * 100) / 100;
+    // Fees on the way out (backlog item 23). This path used to credit the raw
+    // premium and never set an exit fee, so its trades booked P/L gross while
+    // the in-scan TP/SL path booked net — two conventions in one ledger.
+    // `closeProceedsWithFee` returns fee 0 for settle/redeem, which is correct:
+    // redeeming a resolved token is not a taker CLOB sell.
+    const feeOn = botState.config.simulateClobFees !== false;
+    const shares = positionShares(pos);
+    const pack = closeProceedsWithFee(shares, price, botState.config.feeCategory || 'crypto', reason);
+    const exitFee = feeOn ? pack.fee : 0;
+    const proceeds = Math.round((pack.premium - exitFee) * 100) / 100;
+
+    pos.exitFee = exitFee;
+    pos.feesPaid = Math.round((Number(pos.entryFee || 0) + exitFee) * 1e5) / 1e5;
+    pos.pnl = Math.round(
+      ((price - pos.entryPrice) * shares - Number(pos.entryFee || 0) - exitFee) * 100,
+    ) / 100;
+
     adjustPaperCash(proceeds, `${reason.toUpperCase()} ${pos.symbol} ${pos.outcome?.toUpperCase()}`);
   }
   saveTrade({ ...pos, timestamp: Date.now(), orderId: pos.orderId });
@@ -4021,3 +3811,5 @@ export async function rapidSellPmAsset({ assetId, size }) {
 
 // Model state changes trigger SSE push
 onModelChange(() => notifyStateChange());
+
+export { queryTelemetryEvents, getLatestTelemetryEvent };

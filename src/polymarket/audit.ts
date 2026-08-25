@@ -1,26 +1,21 @@
 // @ts-nocheck
-import fs from 'fs';
-import path from 'path';
+import { loadFileOrStore, saveFileOrStore } from './sqliteStore.js';
+import { dataPath } from './dataDir.js';
 
-const BASELINE_FILE = path.resolve(import.meta.dirname, '../../data/poly_baseline.json');
+const BASELINE_FILE = dataPath('poly_baseline.json');
 
 let _baselineCache = undefined;
 
 export function loadBaseline() {
   if (_baselineCache !== undefined) return _baselineCache;
-  try {
-    const data = JSON.parse(fs.readFileSync(BASELINE_FILE, 'utf-8'));
-    _baselineCache = Number(data.balanceUsd) || null;
-    return _baselineCache;
-  } catch {
-    _baselineCache = null;
-    return null;
-  }
+  const data = loadFileOrStore(BASELINE_FILE, null);
+  _baselineCache = data ? Number(data.balanceUsd) || null : null;
+  return _baselineCache;
 }
 
 export function saveBaseline(balanceUsd, note = '') {
   const payload = { balanceUsd: Number(balanceUsd), setAt: Date.now(), note };
-  fs.writeFileSync(BASELINE_FILE, JSON.stringify(payload, null, 2));
+  saveFileOrStore(BASELINE_FILE, payload);
   _baselineCache = payload.balanceUsd;
   return payload;
 }
@@ -41,12 +36,58 @@ export function tradeRealizedPnl(trade) {
   return Math.round((trade.exitPrice - trade.entryPrice) * shares * 100) / 100;
 }
 
+/**
+ * Total fees recorded against a position/trade.
+ *
+ * `feesPaid` is the canonical running total (entry fee, plus any exit fee once
+ * the position closes). The component fields are a fallback for records written
+ * before it existed.
+ */
+export function tradeFeesPaid(trade) {
+  const total = Number(trade?.feesPaid);
+  if (Number.isFinite(total)) return total;
+  return Number(trade?.entryFee || 0) + Number(trade?.exitFee || 0);
+}
+
+/**
+ * Realized P/L **net of fees** — the only convention paper cash reconciles
+ * against (backlog item 23).
+ *
+ * Derived from primitives (entry, exit, shares, fees) rather than from the
+ * stored `pnl` field on purpose: records written before the fix carry a *gross*
+ * `pnl`, and nothing distinguishes them from net ones. Recomputing means the
+ * ledger is correct for historical trades too, with no migration.
+ */
+export function tradeNetPnl(trade) {
+  return Math.round((tradeRealizedPnl(trade) - tradeFeesPaid(trade)) * 100) / 100;
+}
+
+/**
+ * Which engine produced this trade — the D5 tag that lets per-engine P/L be
+ * read off without segregating capital (backlog item 6).
+ *
+ * Records written before the tag existed are classified from the fields that
+ * were always there. That is exact, not a guess: `arbEngine.ts:189` is the only
+ * writer of `isArbLeg` / `packageId`, and the directional plan builder never
+ * sets `arb` (`detectClobArb` only annotates `market.arb` for display — the
+ * package path executes through `executeArbLeg`). So an untagged trade with no
+ * arb marker came from the directional path.
+ *
+ * Kept here with the other trade primitives on purpose: one owner for "what a
+ * trade is", derived from the record rather than stored twice.
+ */
+export function tradeEngine(trade) {
+  const tagged = trade?.engine;
+  if (tagged === 'arb' || tagged === 'directional') return tagged;
+  return (trade?.isArbLeg || trade?.packageId || trade?.arb) ? 'arb' : 'directional';
+}
+
 export function normalizeTrade(trade) {
   const cost = tradeCostBasis(trade);
   const pnl = tradeRealizedPnl(trade);
   // Live is only verified when CLOB returned a real orderId (phantom fills had none).
   const verified = trade.mode === 'paper' ? false : !!trade.orderId;
-  return { ...trade, costBasis: cost, pnl, verified };
+  return { ...trade, costBasis: cost, pnl, verified, engine: tradeEngine(trade) };
 }
 
 export function dedupeTrades(trades) {

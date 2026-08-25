@@ -50,6 +50,11 @@ deno.lock
 # Optional local overrides
 *.local.json
 *.local.js
+docs/research/
+docs/*.md
+docs/*.png
+docs/*.excalidraw
+CLAUDE.md
 *.local.ts
 ZINGER_STRATEGY_NOTES.md
 

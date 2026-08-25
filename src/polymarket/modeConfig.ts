@@ -5,12 +5,20 @@
  * Everything else lives under profiles.paper / profiles.live.
  */
 
+import { normalizeAttribution } from './config/attribution.js';
 export const SHARED_KEYS = new Set([
   'mode',
   'enabled',
   'paperBankroll',
   'paperInitialDeposit',
 ]);
+
+/** Default paper bankroll from environment variable (ZINGER_DEFAULT_PAPER_BANKROLL / PAPER_BANKROLL) defaulting to 100 */
+export function getDefaultPaperBankroll(): number {
+  const envVal = process.env.ZINGER_DEFAULT_PAPER_BANKROLL || process.env.PAPER_BANKROLL;
+  const parsed = Number(envVal);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 100;
+}
 
 /** Strategy knobs that must NOT leak across modes */
 export const STRATEGY_KEYS = [
@@ -22,7 +30,7 @@ export const STRATEGY_KEYS = [
   'certaintySizing', 'certaintyMaxPct', 'certaintyMaxUsd',
   'arbBankrollFrac', 'arbMaxUsd',
   'useAggressiveScaling', 'aggScaleMultiplier',
-  'minRemainingSec', 'maxEntryRemainingSec',
+  'minRemainingSec', 'maxEntryRemainingSec', 'entryWindowFrac',
   'assets', 'use15m', 'enabledDurations',
   'maxConcurrentPerSlug', 'maxOpenPositions',
   'minConfidence',
@@ -37,7 +45,7 @@ export const STRATEGY_KEYS = [
   'governorDrawdownPct', 'governorRevertTrades',
   'evalBothSides', 'sideBalanceEnabled', 'sideBalanceWeight',
   'preferShortTf', 'shortTfWeight',
-  'clobArbEnabled', 'minArbGap', 'arbExploreRate', 'maxArbPackages',
+  'clobArbEnabled', 'minArbGap', 'arbMinMarginPct', 'arbExploreRate', 'maxArbPackages',
   'arbOnlyUntilEdge', 'forceArbOnly', 'requireEdgeForLive',
   'edgeLookback', 'edgeMinTrades', 'edgeMinExpectancy',
   'holdToSettleUnderdogs', 'underdogMaxPrice', 'holdToSettleDisasterSlPct',
@@ -50,6 +58,7 @@ export const STRATEGY_KEYS = [
   'feeCategory',
   'minTpUsd',
   'requireDataAssurance',
+  'instantCtfMerge',
 ];
 
 export function defaultPaperStrategy() {
@@ -75,9 +84,10 @@ export function defaultPaperStrategy() {
     aggScaleMultiplier: 1.0,
     minRemainingSec: 30,
     maxEntryRemainingSec: 270,
+    entryWindowFrac: 0.90,
     assets: ['BTC', 'ETH'],
     use15m: true,
-    enabledDurations: ['5m', '15m', '30m', '1h'],
+    enabledDurations: ['5m', '15m', '4h'],
     maxConcurrentPerSlug: 1,
     maxOpenPositions: 4,
     minConfidence: 0.38,
@@ -117,7 +127,13 @@ export function defaultPaperStrategy() {
     preferShortTf: true,
     shortTfWeight: 2.0,
     clobArbEnabled: true,
+    // Absolute floor: "how big a dislocation is worth the trouble". Profitability
+    // is no longer this field's job — the fee-aware break-even gate owns that
+    // (item 7), and it cannot be turned off. Safe to lower to capture skewed
+    // books, which need far less gap than a 50/50 one.
     minArbGap: 0.015,
+    // Required profit *above* break-even, in gap terms. Profit = shares x this.
+    arbMinMarginPct: 0.005,
     arbExploreRate: 0.08,
     arbOnlyUntilEdge: false,
     forceArbOnly: false,
@@ -129,6 +145,7 @@ export function defaultPaperStrategy() {
     underdogMaxPrice: 0.42,
     holdToSettleDisasterSlPct: 42,
     allowScaleIn: false,
+    instantCtfMerge: true,
   };
 }
 
@@ -145,8 +162,11 @@ export function defaultLiveStrategy() {
     certaintyMaxUsd: 2.0,
     arbBankrollFrac: 0.03,
     arbMaxUsd: 1,
-    autoApprovePaper: false,
-    autoApproveLive: true,
+    // Wider than paper on purpose: a quoted ask is not a fill price, and this
+    // margin is what absorbs the difference when real money is at stake.
+    arbMinMarginPct: 0.010,
+    autoApprovePaper: true,
+    autoApproveLive: false,
     slPct: 8,
     adaptiveSl: true,
     minAdaptiveSlPct: 6,
@@ -162,6 +182,7 @@ export function defaultLiveStrategy() {
     requireTightSpread: true,
     useAggressiveScaling: false,
     maxOpenDrawdownPct: 0.05,
+    instantCtfMerge: true,
   };
 }
 
@@ -199,7 +220,8 @@ function normalizeSizing(strategy = {}) {
 
 /**
  * Migrate legacy flat config → dual-profile shape.
- * Flat strategy keys become both paper + live seeds (then live overrides applied).
+ * Flat strategy keys seed the paper profile; live profile strictly preserves
+ * conservative safety caps (Items 19 & 28).
  */
 export function normalizeConfigStore(raw, defaultsFlat = {}) {
   const base = { ...defaultsFlat, ...(raw || {}) };
@@ -212,21 +234,23 @@ export function normalizeConfigStore(raw, defaultsFlat = {}) {
   };
   const live = {
     ...defaultLiveStrategy(),
-    ...pickStrategy(defaultsFlat),
-    ...(hasProfiles ? pickStrategy(raw.profiles.live || {}) : pickStrategy(base)),
+    ...(hasProfiles ? pickStrategy(raw.profiles.live || {}) : {}),
     // Always keep live gate strict even if migrating from flat paper-ish config
     arbOnlyUntilEdge: hasProfiles
       ? (raw.profiles.live?.arbOnlyUntilEdge !== false)
       : true,
     requireEdgeForLive: true,
+    autoApproveLive: hasProfiles ? (raw.profiles.live?.autoApproveLive === true) : false,
   };
 
   return {
     mode: base.mode === 'live' ? 'live' : 'paper',
     enabled: !!base.enabled,
-    paperBankroll: Number(base.paperBankroll ?? base.paperInitialDeposit ?? 100),
-    paperInitialDeposit: Number(base.paperInitialDeposit ?? 100),
+    paperBankroll: Number(base.paperBankroll ?? base.paperInitialDeposit ?? getDefaultPaperBankroll()),
+    paperInitialDeposit: Number(base.paperInitialDeposit ?? getDefaultPaperBankroll()),
     profiles: { paper, live },
+    // Carried through load, or this record resets on every restart (D3 · C).
+    attribution: normalizeAttribution(raw?.attribution),
   };
 }
 
@@ -234,12 +258,13 @@ export function normalizeConfigStore(raw, defaultsFlat = {}) {
 export function resolveActiveConfig(store) {
   const mode = store?.mode === 'live' ? 'live' : 'paper';
   const strat = store?.profiles?.[mode] || (mode === 'live' ? defaultLiveStrategy() : defaultPaperStrategy());
+  const defaultBankroll = getDefaultPaperBankroll();
   return {
     ...strat,
     mode,
     enabled: !!store?.enabled,
-    paperBankroll: Number(store?.paperBankroll ?? store?.paperInitialDeposit ?? 100),
-    paperInitialDeposit: Number(store?.paperInitialDeposit ?? 100),
+    paperBankroll: Number(store?.paperBankroll ?? store?.paperInitialDeposit ?? defaultBankroll),
+    paperInitialDeposit: Number(store?.paperInitialDeposit ?? defaultBankroll),
   };
 }
 
@@ -253,6 +278,8 @@ export function applyConfigPatch(store, patch = {}, opts = {}) {
     enabled: !!store.enabled,
     paperBankroll: store.paperBankroll,
     paperInitialDeposit: store.paperInitialDeposit,
+    // Preserved, never written here — saveConfig stamps it from the diff.
+    attribution: store.attribution,
     profiles: {
       paper: { ...(store.profiles?.paper || defaultPaperStrategy()) },
       live: { ...(store.profiles?.live || defaultLiveStrategy()) },
@@ -296,3 +323,52 @@ export function profilesSummary(store) {
     live: pickStrategy(store?.profiles?.live || {}),
   };
 }
+
+/**
+ * Declarative validation of strategy configurations (Item 5).
+ * Enforces valid combinations and bounds dangerous settings.
+ */
+export function validateConfig(cfg = {}) {
+  const next = { ...cfg };
+  // Can't force pure arb while turning off the arb engine
+  if (next.forceArbOnly === true && next.clobArbEnabled === false) {
+    next.clobArbEnabled = true;
+  }
+  if (typeof next.entryWindowFrac === 'number') {
+    next.entryWindowFrac = Math.max(0.1, Math.min(1.0, next.entryWindowFrac));
+  }
+  if (typeof next.minArbGap === 'number') {
+    next.minArbGap = Math.max(0.005, next.minArbGap);
+  }
+  return next;
+}
+
+/**
+ * Continuous live risk cap assertion (D11 Dimension 4 & Item 19/28).
+ * Ensures live blast radius does not exceed safety ceilings without explicit authorization.
+ */
+export function assertLiveSafetyCaps(liveCfg = {}) {
+  const violations = [];
+  const maxCap = Number(liveCfg.maxPositionCap ?? 1);
+  if (maxCap > 50) {
+    violations.push(`maxPositionCap $${maxCap} exceeds safety ceiling ($50)`);
+  }
+  const maxUsd = Number(liveCfg.certaintyMaxUsd ?? 2);
+  if (maxUsd > 100) {
+    violations.push(`certaintyMaxUsd $${maxUsd} exceeds safety ceiling ($100)`);
+  }
+  const maxArb = Number(liveCfg.arbMaxUsd ?? 1);
+  if (maxArb > 50) {
+    violations.push(`arbMaxUsd $${maxArb} exceeds safety ceiling ($50)`);
+  }
+  const maxOpen = Number(liveCfg.maxOpenPositions ?? 1);
+  if (maxOpen > 5) {
+    violations.push(`maxOpenPositions ${maxOpen} exceeds safety ceiling (5)`);
+  }
+  return {
+    ok: violations.length === 0,
+    violations,
+  };
+}
+
+

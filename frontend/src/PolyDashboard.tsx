@@ -534,6 +534,7 @@ function BehaviorForm({
           {numField('arbBankrollFrac', 'Arb bankroll frac', '0.05')}
           {numField('arbMaxUsd', 'Arb max $', '1')}
           {numField('maxArbPackages', 'Max arb packages')}
+          {numField('minArbGap', 'Min arb gap', '0.001')}
           {numField('governorDrawdownPct', 'Governor breaker %', '0.01')}
           {numField('governorRevertTrades', 'Governor revert trades')}
           {numField('edgeMinTrades', 'Edge min paper trades')}
@@ -594,7 +595,19 @@ function BehaviorForm({
             </FieldContent>
             <Switch
               checked={!!draft.forceArbOnly}
-              onCheckedChange={(forceArbOnly) => patch({ forceArbOnly })}
+              onCheckedChange={(forceArbOnly) =>
+                patch(forceArbOnly ? { forceArbOnly, clobArbEnabled: true } : { forceArbOnly })
+              }
+            />
+          </Field>
+          <Field orientation="horizontal">
+            <FieldContent>
+              <FieldTitle>CLOB arb</FieldTitle>
+              <FieldDescription>Master switch — detect and lock orderbook gap packages</FieldDescription>
+            </FieldContent>
+            <Switch
+              checked={draft.clobArbEnabled !== false}
+              onCheckedChange={(clobArbEnabled) => patch({ clobArbEnabled })}
             />
           </Field>
           <Field orientation="horizontal">
