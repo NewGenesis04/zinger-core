@@ -35,11 +35,15 @@ export function isHedgeIntact(pos, openPositions = []) {
   const siblingOutcome = outcome === 'up' ? 'down' : outcome === 'down' ? 'up' : null;
   if (!siblingOutcome) return false;
 
-  return openPositions.some((p) => (
-    !p.closed
-    && p.packageId === pkgId
-    && String(p.outcome || '').toLowerCase() === siblingOutcome
-  ));
+  return openPositions.some((p) => {
+    if (p.packageId !== pkgId) return false;
+    if (String(p.outcome || '').toLowerCase() !== siblingOutcome) return false;
+    // Sibling is currently open
+    if (!p.closed) return true;
+    // Sibling was settled as part of the hedged pair settlement pass ($0.50 per share)
+    if (p.exitReason === 'settle' || p.exitPrice === 0.50) return true;
+    return false;
+  });
 }
 
 /**

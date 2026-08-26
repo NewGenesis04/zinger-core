@@ -15,9 +15,14 @@ describe('isHedgeIntact', () => {
     expect(isHedgeIntact(downLeg, [upLeg, downLeg])).toBe(true);
   });
 
-  it('returns false when the sibling leg is closed', () => {
-    const closedDown = { ...downLeg, closed: true };
+  it('returns false when the sibling leg was closed via manual / sl / panic', () => {
+    const closedDown = { ...downLeg, closed: true, exitReason: 'manual' };
     expect(isHedgeIntact(upLeg, [upLeg, closedDown])).toBe(false);
+  });
+
+  it('returns true when the sibling leg was settled as part of the pair settlement pass', () => {
+    const settledDown = { ...downLeg, closed: true, exitReason: 'settle', exitPrice: 0.50 };
+    expect(isHedgeIntact(upLeg, [upLeg, settledDown])).toBe(true);
   });
 
   it('returns false when only the single leg exists (naked leg)', () => {
@@ -28,6 +33,28 @@ describe('isHedgeIntact', () => {
   it('returns false for directional positions without a packageId', () => {
     const directionalPos = { id: 'p-3', outcome: 'up', isArbLeg: false, closed: false };
     expect(isHedgeIntact(directionalPos, [directionalPos])).toBe(false);
+  });
+
+  it('correctly settles both legs sequentially at $0.50 in a paper settlement loop', () => {
+    const leg1 = { id: 'p-1', packageId: 'pkg-seq', outcome: 'up', isArbLeg: true, entryPrice: 0.73, closed: false };
+    const leg2 = { id: 'p-2', packageId: 'pkg-seq', outcome: 'down', isArbLeg: true, entryPrice: 0.22, closed: false };
+    const positions = [leg1, leg2];
+
+    // Settle leg1 first
+    const res1 = resolveSettlementPrice({ pos: leg1, openPositions: positions });
+    expect(res1.price).toBe(0.50);
+    expect(res1.isPairSettled).toBe(true);
+    leg1.closed = true;
+    leg1.exitPrice = res1.price;
+    leg1.exitReason = 'settle';
+
+    // Settle leg2 second
+    const res2 = resolveSettlementPrice({ pos: leg2, openPositions: positions });
+    expect(res2.price).toBe(0.50);
+    expect(res2.isPairSettled).toBe(true);
+    leg2.closed = true;
+    leg2.exitPrice = res2.price;
+    leg2.exitReason = 'settle';
   });
 });
 
