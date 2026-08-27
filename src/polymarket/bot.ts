@@ -837,7 +837,9 @@ async function executePendingTrade(pending) {
         log(`⛔ LIVE SKIP ${pending.symbol} — min order $${realCost.toFixed(2)} (${minSh} sh) > spendable $${spendable.toFixed(2)}`, 'error');
         return { ok: false, error: 'min order exceeds spendable' };
       }
-      const capUsd = Number(cfg.maxPositionCap ?? cfg.maxPositionSize ?? 14);
+      const capUsd = plan.isArbLeg
+        ? Number(cfg.arbMaxUsd ?? 25)
+        : Number(cfg.maxPositionCap ?? cfg.maxPositionSize ?? 14);
       if (realCost > Math.max(capUsd * 1.6, 4.5)) {
         pending.status = 'failed';
         botState._buyLocks.delete(pending.slug);
