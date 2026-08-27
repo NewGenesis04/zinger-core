@@ -177,27 +177,29 @@ export async function detectAndExecuteArbPackage({
   // Execution: Dispatch both legs concurrently.
   // Both legs share the same slug, so raise the per-slug concurrency cap for
   // the duration of the atomic dispatch and restore it once — doing this inside
-  // each leg races under Promise.allSettled (one leg can restore while the
-  // other still executes).
+  // Execute legs sequentially with monotonic nonces to prevent CLOB 400 nonce collisions
   const prevMax = botState?.config?.maxConcurrentPerSlug;
   if (botState?.config) botState.config.maxConcurrentPerSlug = 2;
-  let results;
+  let upSuccess = false;
+  let downSuccess = false;
+
   try {
-    results = await Promise.allSettled([
-      executeArbLeg({ outcome: 'up', price: upAsk, cost: costUp, shares, pkg, market, executeTrade }),
-      executeArbLeg({ outcome: 'down', price: downAsk, cost: costDown, shares, pkg, market, executeTrade }),
-    ]);
+    const upRes = await executeArbLeg({ outcome: 'up', price: upAsk, cost: costUp, shares, pkg, market, executeTrade });
+    upSuccess = !!upRes;
+
+    if (upSuccess) {
+      // 40ms interval ensures distinct millisecond timestamps and strictly increasing nonces on CLOB
+      await new Promise((r) => setTimeout(r, 40));
+      const downRes = await executeArbLeg({ outcome: 'down', price: downAsk, cost: costDown, shares, pkg, market, executeTrade });
+      downSuccess = !!downRes;
+    }
+  } catch (err) {
+    if (log) log(`⚠️ Arb leg execution error: ${err.message}`, 'error', { packageId, error: err.message });
   } finally {
     if (botState?.config && prevMax != null) botState.config.maxConcurrentPerSlug = prevMax;
   }
 
   try {
-    const upRes = results[0];
-    const downRes = results[1];
-
-    const upSuccess = upRes.status === 'fulfilled' && upRes.value;
-    const downSuccess = downRes.status === 'fulfilled' && downRes.value;
-
     if (upSuccess && downSuccess) {
       pkg.legs.up.filled = true;
       pkg.legs.down.filled = true;
@@ -357,12 +359,31 @@ async function unwindLeg({ outcome, pkg, market, mode, cfg, botState, log, adjus
   const exitFee = feeOn ? pack.fee : 0;
   const entryFee = Number(pos.entryFee || 0);
 
+  // Live Mode: Execute an immediate Market Sell on CLOB so capital is returned to cash
+  if (mode === 'live' && pos.tokenId) {
+    try {
+      const { placeMarketSell } = await import('./trade.js');
+      const sellRes = await placeMarketSell({
+        tokenId: pos.tokenId,
+        shares,
+        negRisk: !!pos.negRisk,
+        tickSize: pos.tickSize || '0.01',
+      });
+      if (log) {
+        log(`⚡ LIVE ARB UNWIND: Sold ${shares}sh back to CLOB cash (order: ${sellRes?.id || 'ok'})`, 'system', { orderId: sellRes?.id });
+      }
+    } catch (err) {
+      if (log) {
+        log(`⚠️ LIVE ARB UNWIND FAILED: ${err.message}`, 'error', { err: err.message });
+      }
+    }
+  }
+
   pos.closed = true;
   pos.exitPrice = price;
   pos.exitReason = 'arb_rollback';
   pos.exitFee = exitFee;
   pos.feesPaid = Math.round((entryFee + exitFee) * 1e5) / 1e5;
-  // Sold back at the price it was bought at, so the only loss is the two fees.
   pos.pnl = Math.round(-(entryFee + exitFee) * 100) / 100;
 
   if (mode === 'paper' && typeof adjustPaperCash === 'function') {
