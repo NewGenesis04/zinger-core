@@ -1,9 +1,10 @@
 // @ts-nocheck
+import 'dotenv/config';
 import { createApp } from './src/server.js';
 import { describeBackend } from './src/polymarket/persistence.js';
-import dotenv from 'dotenv';
+import { getWallet } from './src/lib/wallet.js';
+import { getClobProxyUrl, redactProxy } from './src/polymarket/proxyEnv.js';
 import os from 'os';
-dotenv.config();
 
 // Perf tuning
 process.env.UV_THREADPOOL_SIZE = String(Math.min(32, Math.max(8, os.cpus().length * 2)));
@@ -30,8 +31,21 @@ const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(
     `     Store: ${store.backend.toUpperCase()} · ${store.reason}` +
       (store.docCount != null ? ` · ${store.docCount} docs` : '') +
-      `\n     Data dir: ${store.dataDir}\n`,
+      `\n     Data dir: ${store.dataDir}`,
   );
+  try {
+    const w = getWallet();
+    const proxyUrl = getClobProxyUrl();
+    console.log(`     Signer:  ${w.address ? w.address.slice(0, 6) + '…' + w.address.slice(-4) : 'None'} (${w.instance || 'live'})`);
+    console.log(`     Deposit: ${w.polymarketDepositWallet || '(Signer EOA)'}`);
+    if (proxyUrl) {
+      console.log(`     Proxy:   ${redactProxy(proxyUrl)} (Active)\n`);
+    } else {
+      console.log(`     Proxy:   Direct egress (No proxy configured)\n`);
+    }
+  } catch (err) {
+    console.log(`     Wallet info error: ${err.message}\n`);
+  }
 });
 
 server.keepAliveTimeout = 30000;

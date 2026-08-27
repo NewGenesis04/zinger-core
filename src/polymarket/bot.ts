@@ -283,17 +283,21 @@ export function saveConfig(cfg, origin = { tier: 'system', source: 'unattributed
     const liveFlat = resolveActiveConfig({ ...store, mode: 'live' });
     const gate = evaluateEdgeGate(botState.trades, liveFlat);
     if (!gate.liveAllowed) {
-      const beforeLock = store;
-      store = { ...store, mode: 'paper' };
-      log(`🔒 LIVE blocked — ${gate.reason} (paper WR ${(gate.wr * 100).toFixed(1)}% · E $${gate.expectancy})`, 'system', { edgeGate: gate });
-      store = {
-        ...store,
-        attribution: recordAttribution(beforeLock, store, {
-          tier: 'guardrail',
-          source: 'edge-gate',
-          reason: gate.reason,
-        }, now),
-      };
+      if (liveFlat.clobArbEnabled !== false || liveFlat.forceArbOnly === true) {
+        log(`🛡️ LIVE directional gated (${gate.reason}) — pure arbitrage active`, 'system', { edgeGate: gate });
+      } else {
+        const beforeLock = store;
+        store = { ...store, mode: 'paper' };
+        log(`🔒 LIVE blocked — ${gate.reason} (paper WR ${(gate.wr * 100).toFixed(1)}% · E $${gate.expectancy})`, 'system', { edgeGate: gate });
+        store = {
+          ...store,
+          attribution: recordAttribution(beforeLock, store, {
+            tier: 'guardrail',
+            source: 'edge-gate',
+            reason: gate.reason,
+          }, now),
+        };
+      }
     }
   }
 

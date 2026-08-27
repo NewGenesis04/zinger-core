@@ -105,10 +105,10 @@ export function evaluateEdgeGate(trades, cfg = {}) {
   const arbOnlyUntilEdge = cfg.arbOnlyUntilEdge !== false;
   const arbOnly = arbOnlyForced || (arbOnlyUntilEdge && !edgeOk);
   const requireEdgeForLive = cfg.requireEdgeForLive !== false;
-  const liveAllowed = !requireEdgeForLive || edgeOk;
+  const liveAllowed = !requireEdgeForLive || edgeOk || arbOnlyForced;
 
   let reason = 'edge ok — directional + live unlocked';
-  if (arbOnlyForced) reason = 'forceArbOnly';
+  if (arbOnlyForced) reason = 'forceArbOnly — live arb active';
   // Say "directional" out loud: the count dropped when item 6 stopped arb legs
   // padding the sample, and an operator watching the number needs to know why.
   else if (!sampleOk) reason = `need ${minTrades} directional paper closes (have ${stats.n}) — arb-only`;

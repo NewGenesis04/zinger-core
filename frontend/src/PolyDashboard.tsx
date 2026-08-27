@@ -138,11 +138,11 @@ function marketBook(m) {
 
 function spendableCash(readiness = {}, portfolio = {}) {
   const spend = readiness.spendableBalance
-  if (spend != null && Number.isFinite(Number(spend))) return Number(spend)
-  if (portfolio.cash != null && Number.isFinite(Number(portfolio.cash))) return Number(portfolio.cash)
+  if (spend != null && Number.isFinite(Number(spend)) && Number(spend) > 0) return Number(spend)
   const deposit = readiness.depositPusd
-  if (deposit != null && Number.isFinite(Number(deposit))) return Number(deposit)
-  return Number(readiness.clobBalance || 0)
+  if (deposit != null && Number.isFinite(Number(deposit)) && Number(deposit) > 0) return Number(deposit)
+  if (portfolio.cash != null && Number.isFinite(Number(portfolio.cash)) && Number(portfolio.cash) > 0) return Number(portfolio.cash)
+  return Number(readiness.spendableBalance ?? readiness.depositPusd ?? readiness.clobBalance ?? portfolio.cash ?? 0)
 }
 
 function ModeRail({ mode, onChange, disabled }) {
@@ -1205,13 +1205,13 @@ function PolyShell({
     && Number(readiness.spendableBalance ?? readiness.clobBalance ?? 0) >= 0.4
   )
   const liveOk = mode === 'paper' || inferredLiveReady
-  const cash = portfolio.cash ?? 0
+  const isPaper = mode === 'paper'
+  const cash = isPaper ? (portfolio.cash ?? 0) : spendableCash(readiness, portfolio)
   const livePnl = portfolio.netPnl ?? portfolio.cashPnl ?? portfolio.sessionPnl ?? 0
   const realizedPnl = portfolio.realizedPnl ?? 0
   const unrealizedPnl = portfolio.unrealizedPnl ?? 0
   const botPnl = mode === 'paper' ? portfolio.realizedPnlPaper ?? realizedPnl : portfolio.realizedPnl ?? 0
   const limits = portfolio.limits || {}
-  const isPaper = mode === 'paper'
   const paperBankroll = portfolio.paperBankroll
   const [bookMarket, setBookMarket] = useState(null)
   const [chartPack, setChartPack] = useState({ charts: {}, mlTraces: {} })

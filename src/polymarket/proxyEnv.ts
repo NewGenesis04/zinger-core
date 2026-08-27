@@ -25,7 +25,14 @@ let _proxyUrl = null;
 let _agent = null;
 
 export function getClobProxyUrl() {
-  return String(process.env.CLOB_PROXY_URL || process.env.HTTPS_PROXY || process.env.HTTP_PROXY || '').trim() || null;
+  return String(
+    process.env.CLOB_PROXY_URL ||
+    process.env.PROXY_URL ||
+    process.env.PROXY ||
+    process.env.HTTPS_PROXY ||
+    process.env.HTTP_PROXY ||
+    ''
+  ).trim() || null;
 }
 
 export function getClobProxyAgent() {
