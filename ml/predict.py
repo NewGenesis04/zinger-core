@@ -252,15 +252,12 @@ def quick_ml_signal(
     feat_dim = feats_c.shape[1]
     meta_dim = meta_c.shape[1]
 
-    # Load model
+    # Load model (Dual-path: PyTorch .pt or ONNX .onnx)
     label = f'{asset}_{timeframe}_h{horizon}'.replace('/', '_')
-    model_path = os.path.join(MODEL_DIR, f'{label}.pt')
-    if not os.path.isfile(model_path):
-        return {'direction': 0, 'confidence': 0, 'error': f'no model: {label}'}
-
-    lstm = ZingerLSTM(feat_dim=feat_dim, meta_dim=meta_dim)
-    lstm.load_state_dict(torch.load(model_path, map_location='cpu', weights_only=True))
-    lstm.eval()
+    pt_path = os.path.join(MODEL_DIR, f'{label}.pt')
+    onnx_path = os.path.join(MODEL_DIR, 'onnx', f'{label}.onnx')
+    if not os.path.isfile(onnx_path):
+        onnx_path = os.path.join(MODEL_DIR, f'{label}.onnx')
 
     # Get latest sequence
     seq_feats = feats_c.values[-seq_len:].astype(np.float32)
@@ -269,16 +266,39 @@ def quick_ml_signal(
     if np.isnan(seq_feats).any() or np.isnan(latest_meta).any():
         return {'direction': 0, 'confidence': 0, 'error': 'NaN in input'}
 
-    with torch.no_grad():
-        f = torch.from_numpy(seq_feats).float().unsqueeze(0)
-        m = torch.from_numpy(latest_meta).float()
-        logits, conf, ret, _ = lstm(f, m)
-        probs = torch.softmax(logits, dim=-1).squeeze(0).numpy()
+    if os.path.isfile(pt_path):
+        lstm = ZingerLSTM(feat_dim=feat_dim, meta_dim=meta_dim)
+        lstm.load_state_dict(torch.load(pt_path, map_location='cpu', weights_only=True))
+        lstm.eval()
 
-    direction_map = {0: -1, 1: 0, 2: 1}
-    direction = direction_map[int(np.argmax(probs))]
-    confidence = float(torch.sigmoid(conf).squeeze().numpy())
-    expected_return = float(ret.squeeze().numpy())
+        with torch.no_grad():
+            f = torch.from_numpy(seq_feats).float().unsqueeze(0)
+            m = torch.from_numpy(latest_meta).float()
+            logits, conf, ret, _ = lstm(f, m)
+            probs = torch.softmax(logits, dim=-1).squeeze(0).numpy()
+
+        confidence = float(torch.sigmoid(conf).squeeze().numpy())
+        expected_return = float(ret.squeeze().numpy())
+    elif os.path.isfile(onnx_path):
+        try:
+            import onnxruntime as ort
+            session = ort.InferenceSession(onnx_path, providers=['CPUExecutionProvider'])
+            f = seq_feats[np.newaxis, ...].astype(np.float32)
+            m = latest_meta.astype(np.float32)
+            outputs = session.run(None, {'feat_seq': f, 'meta': m})
+            logits = outputs[0]
+            if hasattr(logits, 'shape') and len(logits.shape) > 1:
+                e_x = np.exp(logits - np.max(logits, axis=-1, keepdims=True))
+                probs = (e_x / e_x.sum(axis=-1, keepdims=True)).squeeze(0)
+            else:
+                probs = logits.flatten()
+            conf_val = float(outputs[1].flatten()[0]) if len(outputs) > 1 else 0.5
+            confidence = float(1.0 / (1.0 + np.exp(-conf_val)))
+            expected_return = float(outputs[2].flatten()[0]) if len(outputs) > 2 else 0.0
+        except Exception as e:
+            return {'direction': 0, 'confidence': 0, 'error': f'onnx error: {e}'}
+    else:
+        return {'direction': 0, 'confidence': 0, 'error': f'no model: {label}'}
 
     return {
         'direction': direction,

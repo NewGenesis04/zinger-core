@@ -4,10 +4,28 @@ import { polygon } from 'viem/chains';
 import { getWallet } from '../src/lib/wallet.js';
 import { getTradingClient } from '../src/polymarket/trade.js';
 
+import 'dotenv/config';
+import { checkReadiness } from '../src/polymarket/readiness.js';
+
 const conditionId = process.argv[2];
-if (!conditionId) {
-  console.error('Usage: node scripts/check-settlement.mjs <conditionId>');
-  process.exit(1);
+if (conditionId === 'auth' || !conditionId) {
+  const w = getWallet();
+  console.log('==========================================');
+  console.log('  🔍 LOCAL AUTHENTICATION & READINESS AUDIT');
+  console.log('==========================================\n');
+  console.log('• Signer Address:       ', w.address);
+  console.log('• Deposit Safe:         ', w.polymarketDepositWallet || '(none)');
+  console.log('• Instance:             ', w.instance);
+
+  const res = await checkReadiness();
+  console.log('\n• Spendable Balance:     $' + (res.spendableBalance || 0).toFixed(2));
+  console.log('• Deposit pUSD:          $' + (res.depositPusd || 0).toFixed(2));
+  console.log('\nIndividual Security Checks:');
+  for (const c of res.checks || []) {
+    console.log(`  [${c.ok ? '✅ PASS' : '❌ FAIL'}] ${c.id.padEnd(16)}: ${c.detail}`);
+  }
+  console.log('\n==========================================\n');
+  process.exit(0);
 }
 
 const client = createPublicClient({

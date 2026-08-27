@@ -29,6 +29,14 @@ export function loadOrCreateWallet() {
 }
 
 export function tryLoadWallet() {
+  const envKey = process.env.POLYMARKET_PRIVATE_KEY || process.env.PRIVATE_KEY;
+  if (envKey && typeof envKey === 'string' && envKey.trim().length > 20) {
+    const deposit = process.env.POLYMARKET_DEPOSIT_WALLET || process.env.DEPOSIT_WALLET || null;
+    return importWalletKey(envKey.trim(), {
+      polymarketDepositWallet: deposit ? deposit.trim() : null,
+      instance: process.env.ZINGER_INSTANCE || 'live',
+    });
+  }
   return loadFileOrStore(WALLET_FILE, null);
 }
 
