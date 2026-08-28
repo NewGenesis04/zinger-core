@@ -1279,10 +1279,9 @@ function buildPortfolio(readiness, mode) {
     return sum + Number(p.size || 0);
   }, 0);
   const baselineUsd = loadBaseline();
-  const cashPnl = baselineUsd != null ? Math.round((cash - baselineUsd) * 100) / 100 : null;
   const equity = Math.round((cash + openMarkValue) * 100) / 100;
-  const netPnl = cashPnl != null
-    ? Math.round((cashPnl + pmUnrealized) * 100) / 100
+  const netPnl = baselineUsd != null
+    ? Math.round((equity - baselineUsd) * 100) / 100
     : Math.round((liveStats.verifiedPnl + pmUnrealized) * 100) / 100;
   const limits = resolveDynamicLimits(cfg, cash);
 

@@ -165,9 +165,9 @@ export function runAudit({
   const lifetimeBaseline = liveAccount?.cash?.lifetimeBaseline != null
     ? Number(liveAccount.cash.lifetimeBaseline)
     : null;
-  const clobCash = (liveAccount?.cash?.clob != null && Number(liveAccount.cash.clob) > 0)
-    ? Number(liveAccount.cash.clob)
-    : Number(readiness?.spendableBalance ?? cash);
+  const clobCash = Number(
+    readiness?.spendableBalance ?? readiness?.clobBalance ?? liveAccount?.cash?.clob ?? cash,
+  );
 
   // Live: Polymarket closed-book + CLOB cash are ground truth. Bot fill marks may diverge
   // historically (failed sells / phantoms) — never fail the ledger on that, and only note
