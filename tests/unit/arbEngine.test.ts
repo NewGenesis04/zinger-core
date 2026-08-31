@@ -225,3 +225,141 @@ describe('Atomic Arb Engine', () => {
     expect(getArbPackageMetrics('live').totalPackages).toBe(0);
   });
 });
+
+/**
+ * Invariants for the fill-or-kill entry path.
+ *
+ * These assert *properties* rather than a snapshot of current behaviour. The
+ * property that matters is share parity: a package is arbitrage only to the
+ * extent that both legs hold the same number of shares, because it is the
+ * complementary *set* — one token paying $1, the other $0 — that redeems to
+ * exactly $1.00. Dollars bought are not the invariant; shares held are.
+ */
+describe('Arb entry invariants — fill-or-kill share parity', () => {
+  const market = {
+    symbol: 'BTC',
+    slug: 'btc-updown-5m-parity',
+    conditionId: '0xparity',
+    outcomes: ['Up', 'Down'],
+    tokenIds: { up: 'token-up-p', down: 'token-down-p' },
+    acceptingOrders: true,
+  };
+  const depth = { up: { bestAsk: 0.33 }, down: { bestAsk: 0.487 } };
+  const cfg = {
+    clobArbEnabled: true,
+    minArbGap: 0.01,
+    maxArbPackages: 4,
+    paperBankroll: 100,
+    arbBankrollFrac: 0.2,
+    arbMaxUsd: 50,
+    minPositionSize: 0.5,
+    instantCtfMerge: false,
+  };
+
+  const run = (executeTrade, mode: 'paper' | 'live' = 'live') => detectAndExecuteArbPackage({
+    market,
+    depth,
+    prices: { up: 0.33, down: 0.487 },
+    cfg,
+    mode,
+    readiness: { spendableBalance: 500 },
+    log: () => {},
+    executeTrade,
+    adjustPaperCash: () => {},
+    saveTrade: () => {},
+    botState: { config: { maxConcurrentPerSlug: 1 }, positions: [] },
+  });
+
+  beforeEach(() => {
+    saveAllPackages([]);
+  });
+
+  it('sizes the second leg from what the first leg actually matched, not from the plan', async () => {
+    // A market buy is denominated in dollars, so the first leg's share count is
+    // only known from its receipt. Here it comes back 12% under plan.
+    const seen: any[] = [];
+    const executeTrade = async (pending) => {
+      seen.push({ outcome: pending.outcome, requestedShares: pending.plan.shares, sizeUsd: pending.plan.sizeUsd });
+      const shares = pending.outcome === 'up' ? pending.plan.shares * 0.88 : pending.plan.shares;
+      return { ok: true, position: { shares } };
+    };
+
+    const pkg = await run(executeTrade);
+
+    expect(pkg?.status).toBe('LOCKED');
+    const [up, down] = seen;
+    // The DOWN leg must be asked for exactly the shares UP actually got — had it
+    // been sized from the plan it would still be asking for `up.requestedShares`.
+    expect(down.requestedShares).toBeCloseTo(up.requestedShares * 0.88, 3);
+    expect(down.requestedShares).toBeLessThan(up.requestedShares);
+    // ...and its budget must follow the shares at the quoted ask.
+    expect(down.sizeUsd).toBeCloseTo(down.requestedShares * 0.487, 2);
+  });
+
+  it('holds equal shares on both legs, and a locked package redeems its share count to $1.00 each', async () => {
+    // Leg 1's fill is unknown until its receipt, so let it land 12% under plan.
+    // Leg 2 then delivers exactly what it is asked for — which is what
+    // fill-or-kill guarantees: the full signed amount, or nothing at all.
+    const executeTrade = async (pending) => ({
+      ok: true,
+      position: { shares: pending.outcome === 'up' ? pending.plan.shares * 0.88 : pending.plan.shares },
+    });
+
+    const pkg = await run(executeTrade);
+
+    expect(pkg?.status).toBe('LOCKED');
+    // The invariant: both legs hold the same quantity.
+    expect(pkg!.legs.up.shares).toBeCloseTo(pkg!.legs.down.shares!, 3);
+    // The package records the matched pair, and a full set pays exactly $1.00.
+    expect(pkg!.shares).toBeCloseTo(pkg!.legs.down.shares!, 3);
+    expect(pkg!.expectedPayout).toBeCloseTo(pkg!.shares * 1.0, 2);
+    // No residual: nothing is unhedged.
+    expect(pkg!.residualShares).toBeUndefined();
+  });
+
+  it('records a residual when the legs come back unequal, and never counts it as arbitrage', async () => {
+    // Should be unreachable with both legs FOK — asserted so that if the model
+    // of FOK is ever wrong, the surplus is visible rather than silently treated
+    // as part of the hedge.
+    const executeTrade = async (pending) => ({
+      ok: true,
+      position: { shares: pending.outcome === 'up' ? 30 : 20 },
+    });
+
+    const pkg = await run(executeTrade);
+
+    expect(pkg?.status).toBe('LOCKED');
+    expect(pkg!.residualShares).toBeCloseTo(10, 3);
+    expect(pkg!.residualOutcome).toBe('up');
+    // Only the matched 20 are a hedge; payout must not count the naked 10.
+    expect(pkg!.shares).toBe(20);
+    expect(pkg!.expectedPayout).toBeCloseTo(20, 2);
+  });
+
+  it('refuses to hedge against a live leg that reports success without a confirmed share count', async () => {
+    // `ok: true` with no verified quantity is a contradiction in live mode.
+    // Buying the second leg here is precisely how an unhedged position is born.
+    const seen: string[] = [];
+    const executeTrade = async (pending) => {
+      seen.push(pending.outcome);
+      return { ok: true };
+    };
+
+    const pkg = await run(executeTrade, 'live');
+
+    expect(pkg?.status).toBe('ABORTED');
+    expect(seen).toEqual(['up']); // the DOWN leg was never dispatched
+  });
+
+  it('unwinds the first leg when the second is killed, leaving nothing naked', async () => {
+    const executeTrade = async (pending) => (pending.outcome === 'up'
+      ? { ok: true, position: { shares: 25 } }
+      : { ok: false, error: 'FOK killed' });
+
+    const pkg = await run(executeTrade);
+
+    expect(pkg?.status).toBe('ABORTED');
+    expect(pkg?.unwoundAt).toBeDefined();
+    expect(pkg?.abortReason).toMatch(/UP=OK, DOWN=FAIL/);
+  });
+});

@@ -13,7 +13,7 @@ import { getWallet } from '../lib/wallet.js';
 import { POLY, durationFromSlug } from '../polymarket/config.js';
 import { checkPusdBalance } from '../polymarket/swap.js';
 import { startDepositScanner, stopDepositScanner, getLastScannedBlock } from '../polymarket/deposits.js';
-import { placeOrder, placeMarketSell, syncClobBalance, getClobBalance } from '../polymarket/trade.js';
+import { placeOrder, placeMarketSell, sellFloor, syncClobBalance, getClobBalance } from '../polymarket/trade.js';
 import {
   ensureAccount,
   getAccount,
@@ -248,6 +248,7 @@ async function executeLiveExit(asset, reason) {
     await placeMarketSell({
       tokenId: pos.tokenId,
       shares: pos.shares,
+      minPrice: sellFloor(pos.currentPrice || pos.entryPrice, { tickSize: '0.01' }),
       negRisk: false,
       tickSize: '0.01',
     });

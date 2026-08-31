@@ -39,6 +39,16 @@ export interface ArbPackage {
   mergeTxHash?: string;
   unwoundAt?: number;
   abortReason?: string;
+  /**
+   * Shares held on one side beyond the matched pair. Only `shares` of each leg
+   * form complementary sets that redeem to $1.00; this remainder is unhedged
+   * directional exposure and is recorded so it cannot go unnoticed. Absent on a
+   * clean package, which is the normal case — both entry legs are fill-or-kill,
+   * so a partial cannot arise.
+   */
+  residualShares?: number;
+  /** Which side carries `residualShares`. */
+  residualOutcome?: 'up' | 'down';
   legs: {
     up: ArbLegInfo;
     down: ArbLegInfo;

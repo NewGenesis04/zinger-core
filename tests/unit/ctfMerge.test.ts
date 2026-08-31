@@ -61,7 +61,13 @@ describe('Feature: Instant On-Chain CTF Merge (mergePositions)', () => {
         acceptingOrders: true,
       };
 
-      const executeTrade = vi.fn().mockResolvedValue({ ok: true, position: {} });
+      // Models a full live fill: executePendingTrade always returns a position
+      // carrying the matched share count, because the arb path proves that count
+      // against the order receipt before building one. Echoing the requested
+      // size is what "both legs filled completely" looks like.
+      const executeTrade = vi.fn().mockImplementation(
+        async (pending) => ({ ok: true, position: { shares: pending.plan.shares } }),
+      );
       const adjustPaperCash = vi.fn();
       const saveTrade = vi.fn();
       const mockWalletClient = {

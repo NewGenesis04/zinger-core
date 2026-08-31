@@ -1315,6 +1315,130 @@ refusal, so it may deserve to jump the queue.
 An invariant in `tests/unit/invariants.test.ts` asserts that `arbEngine.ts` contains
 zero dynamic imports of `bot.js`.
 
+### 31. A leg-parity residual is recorded but never trimmed
+
+`arbEngine.ts:215-244` detects when the two entry legs come back holding
+different share counts, records `residualShares` / `residualOutcome`, logs, and
+locks the package on `min(up, down)`. It does not *sell* the surplus, so a
+breach leaves a small unhedged directional position open to settlement.
+
+Should be unreachable today — both entry legs are fill-or-kill as of the
+`placeMarketBuy` change, and FOK cannot partially fill, so the only drift
+sources are tick rounding and price improvement. The gap is that the handler
+exists to catch the case where that reasoning is wrong, and in that case it only
+reports. Trimming needs a position-level sell path that does not exist yet;
+`unwindLeg` (`arbEngine.ts:402`) closes a whole leg, not a fraction of one.
+
+### 32. The live order path has type checking disabled
+
+`src/polymarket/trade.ts:1` is `// @ts-nocheck`. Every function that signs and
+posts a real order — `placeOrder`, `placeMarketBuy`, `placeMarketSell`,
+`cancelOrder` — is exempt from `tsc`, including the arithmetic that converts
+dollars to shares. The SDK ships full types (`UserMarketOrderV2`,
+`OrderResponse`), so the checking is available and simply switched off. This is
+the module where a units error costs money directly.
+
+### 33. The CLOB order-response wire format is inferred, not verified
+
+`OrderResponse.makingAmount` / `takingAmount` are typed bare `string` in
+`clob-client-v2/dist/types/clob.d.ts:57-58` with no documented units or scale.
+The *signed* order is unambiguous — `buildMarketOrderCreationArgs.js:9` runs
+both through `parseUnits(..., 6)`, and for a BUY `getMarketOrderRawAmounts.js`
+sets `rawTakerAmt = rawMakerAmt / rawPrice`, so taker = shares — but nothing
+pins down what the API echoes back.
+
+`verifyFilledShares` (`trade.ts`) works around this by resolving the value
+against an independently derived expected share count and refusing to answer
+when neither scale fits, falling back to `getOrder().size_matched`. That is
+safe but it is still an inference. One live fill, with the raw response logged,
+would settle it and belongs in `docs/research/polymarket-domain-facts.md`.
+
+**Capture is now in place (2026-09-01).** `src/polymarket/clobReceipts.ts`
+records every CLOB request/response pair whole and unmodified — both outcomes,
+success and throw — to `data/clob_receipts.jsonl`, and echoes each to stdout
+tagged `📼 CLOB RECEIPT` so a VPS run is greppable in journalctl. Wired into all
+four call points in `trade.ts`: `placeOrder`, `placeMarketBuy`,
+`placeMarketSell`, and the `getOrder` verification rung. `placeMarketBuy`
+additionally records a `derived` block placing `expectedShares` (our own
+arithmetic) beside both readings of `takingAmount`, so the wire scale identifies
+itself from a single fill. Read back with `readReceipts(n)`; disable with
+`ZINGER_CAPTURE_RECEIPTS=0`, silence the echo with `ZINGER_RECEIPT_ECHO=0`.
+**The next live trade closes this item, and open question 7, and informs 34.**
+Nothing gates on `status` anywhere in this path, deliberately — its vocabulary
+is likewise unrecorded, and that is the `negRisk` failure shape.
+
+### 34. A rejected live unwind sell still marks the position closed
+
+`unwindLeg` (`arbEngine.ts:402`) dispatches a real `placeMarketSell` in live mode
+(`:416-433`) — that was item 27's phantom-rollback fix. But the `catch` at `:428`
+only logs, and control falls through to `pos.closed = true` at `:435`. When the
+sell is rejected, the local book records the leg as closed while the shares are
+still on-chain: the same orphan item 27 was written to prevent, relocated into
+the failure branch.
+
+Nothing downstream catches it:
+
+- `reconcileLiveGhostPosition` (`bot.ts:1156`) returns early on `position.closed`
+  (`:1157`). It clears positions open locally but absent on-chain — the opposite
+  direction to this one.
+- `reconcilePendingPackages` (`arbEngine.ts:479`) filters on
+  `status === 'PENDING_FILL'` (`:493`). A package that reached unwind is
+  `ABORTED`.
+- `bot.ts:1306` — "Only count PM inventory that matches bot opens — ignore
+  redeemable junk / orphans in equity." The stranded shares are excluded from
+  equity by design, so a capital-conservation check would not flag them either.
+
+Invisible to the reconciler, to the package sweep, and to equity.
+
+Not fixed inline because the remedy is a policy choice: retry the sell, leave the
+position open and let normal exit logic own it, or mark it `unwind_failed` in a
+state the reconciler can see. They differ in what happens when the sell actually
+landed and only the response was lost — which is item 33's open question again,
+so the two are best settled together.
+
+**Superseded in part by item 35.** Item 34 assumed a failed unwind sell was an
+edge case. It was the default: `placeMarketSell` could not fill at all. Item 34
+is still real — a sell can fail for ordinary reasons — but it is no longer the
+first thing to fix.
+
+### 35. Every live sell was signed at $1.00/share ✅ FIXED
+
+`placeMarketSell` passed no `price` to `createAndPostMarketOrder`. The SDK
+substitutes `userMarketOrder.price || 1`
+(`buildMarketOrderCreationArgs.js:8`), and for a SELL
+`getMarketOrderRawAmounts.js` computes `taker = maker × price` — so every sell
+this bot signed demanded **$1.00 per share**, for shares the book valued at
+$0.20–$0.65. The amounts are signed into the EIP-712 order, so the server cannot
+improve them. `price` is a worst-price limit, not a hint: ceiling for a BUY,
+floor for a SELL (verified both in the vendored SDK and by the operator against
+Polymarket's official SDK and docs — now recorded in
+`docs/research/polymarket-domain-facts.md` §7).
+
+This is the same `|| 1` trap that motivated `placeMarketBuy`'s mandatory
+`maxPrice`. The buy side was fixed 2026-08-30; the sell side was not checked at
+the same time.
+
+Blast radius — every live exit, all ten call sites: arb unwind
+(`arbEngine.ts:419`), fast stop-loss, early stop-loss, drawdown close, partial
+sell, TP/SL exit, `closePosition`, the `UNVERIFIED_FILL` flatten, the wallet dump
+`rapidSellPmAsset`, and the API exit in `publicPredictions.ts:248`. It shipped in
+`72c27ac` (2026-08-27), one day before the live canary.
+
+Worse than a hard failure: `assertOrderAccepted` (`trade.ts:139`) passes on
+orderID presence alone, so a killed order still returns an id and the caller logs
+`⚡ LIVE ARB UNWIND: Sold 26sh back to CLOB cash`. It fails silently, looking
+successful. Whether a slippage-rejected order returns `success:false` or an
+orderID with a killed status is **not yet verified** — open question 7 in the
+research doc, answerable by the same live capture as item 33.
+
+Fix: `minPrice` is now required and guarded exactly like `maxPrice`, and
+`sellFloor(mark, { tickSize, slippagePct })` derives the floor from the
+**current mark, never the entry price** — an exit fires because the mark moved
+against the position, so an entry-anchored floor (`entryPrice * 0.90`) would sit
+above the book and fail to fill precisely during a crash. Default slippage 25%,
+tick-rounded downward, falling back to the minimum tick when no mark exists.
+Covered by `tests/unit/invariants.orderRouting.test.ts`, including a check that
+no call site can omit `minPrice` again.
 
 ---
 

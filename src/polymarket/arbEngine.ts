@@ -180,18 +180,29 @@ export async function detectAndExecuteArbPackage({
   // Execute legs sequentially with monotonic nonces to prevent CLOB 400 nonce collisions
   const prevMax = botState?.config?.maxConcurrentPerSlug;
   if (botState?.config) botState.config.maxConcurrentPerSlug = 2;
-  let upSuccess = false;
-  let downSuccess = false;
+  let upShares = 0;
+  let downShares = 0;
 
   try {
-    const upRes = await executeArbLeg({ outcome: 'up', price: upAsk, cost: costUp, shares, pkg, market, executeTrade });
-    upSuccess = !!upRes;
+    upShares = await executeArbLeg({ outcome: 'up', price: upAsk, cost: costUp, shares, pkg, market, executeTrade, mode });
 
-    if (upSuccess) {
+    if (upShares > 0) {
       // 40ms interval ensures distinct millisecond timestamps and strictly increasing nonces on CLOB
       await new Promise((r) => setTimeout(r, 40));
-      const downRes = await executeArbLeg({ outcome: 'down', price: downAsk, cost: costDown, shares, pkg, market, executeTrade });
-      downSuccess = !!downRes;
+      // Size leg 2 from what leg 1 ACTUALLY matched, not from the plan.
+      //
+      // A CLOB market buy is denominated in dollars, not shares
+      // (`UserMarketOrderV2.amount` — "BUY orders: $$$ Amount to buy"). Equal
+      // budgets therefore do not buy equal share counts. And it is *share
+      // parity* that makes this strategy work: a full set redeems to exactly
+      // $1.00 because one token pays $1 and its complement pays $0. Shares held
+      // on one side beyond the matched pair are not arbitrage at all — they are
+      // an unhedged directional bet, which is the position that expired at zero
+      // on 2026-08-28.
+      const downCostActual = Math.round(upShares * downAsk * 100) / 100;
+      downShares = await executeArbLeg({
+        outcome: 'down', price: downAsk, cost: downCostActual, shares: upShares, pkg, market, executeTrade, mode,
+      });
     }
   } catch (err) {
     if (log) log(`⚠️ Arb leg execution error: ${err.message}`, 'error', { packageId, error: err.message });
@@ -200,9 +211,36 @@ export async function detectAndExecuteArbPackage({
   }
 
   try {
-    if (upSuccess && downSuccess) {
+    if (upShares > 0 && downShares > 0) {
+      // Share-parity invariant. With both legs fill-or-kill a partial cannot
+      // happen — each leg matches its full signed amount or is killed outright —
+      // so the only expected sources of drift are tick rounding and price
+      // improvement, both sub-share. This should never fire. If it does, the
+      // model of FOK encoded here is wrong, and that is worth knowing loudly
+      // rather than discovering it in a settlement statement.
+      const matched = Math.min(upShares, downShares);
+      const residual = Math.round(Math.abs(upShares - downShares) * 1000) / 1000;
+      const legTolerance = Math.max(0.05, matched * 0.02);
+
+      if (residual > legTolerance) {
+        pkg.residualShares = residual;
+        pkg.residualOutcome = upShares > downShares ? 'up' : 'down';
+        if (log) {
+          log(
+            `⚠️ ARB LEG PARITY BREACH ${market.symbol} — UP ${upShares}sh vs DOWN ${downShares}sh · ${residual}sh unhedged ${pkg.residualOutcome.toUpperCase()} (backlog: trim residual)`,
+            'error',
+            { packageId, slug: market.slug, upShares, downShares, residual, tolerance: legTolerance },
+          );
+        }
+      }
+
+      // Only the matched pair is arbitrage, so that is what the package records.
+      pkg.shares = matched;
+      pkg.expectedPayout = Math.round(matched * 1.00 * 100) / 100;
       pkg.legs.up.filled = true;
+      pkg.legs.up.shares = upShares;
       pkg.legs.down.filled = true;
+      pkg.legs.down.shares = downShares;
       pkg.status = 'LOCKED';
       savePackage(pkg);
 
@@ -218,7 +256,9 @@ export async function detectAndExecuteArbPackage({
       if (cfg?.instantCtfMerge !== false && mode === 'live' && (botState?.walletClient || botState?.signer)) {
         const mergeRes = await executeCtfMerge({
           conditionId: market.conditionId,
-          shares,
+          // Only the matched pair can be merged back to collateral; any residual
+          // on one side has no complement to burn against.
+          shares: matched,
           collateralToken: market.collateralToken,
           walletClient: botState.walletClient || botState.signer,
           publicClient: botState.publicClient,
@@ -257,11 +297,11 @@ export async function detectAndExecuteArbPackage({
     // Emergency Rollback Handler if one leg failed
     pkg.status = 'ABORTED';
     pkg.unwoundAt = Date.now();
-    pkg.abortReason = `Leg execution mismatch: UP=${upSuccess ? 'OK' : 'FAIL'}, DOWN=${downSuccess ? 'OK' : 'FAIL'}`;
+    pkg.abortReason = `Leg execution mismatch: UP=${upShares > 0 ? 'OK' : 'FAIL'}, DOWN=${downShares > 0 ? 'OK' : 'FAIL'}`;
 
-    if (upSuccess && !downSuccess) {
+    if (upShares > 0 && downShares <= 0) {
       await unwindLeg({ outcome: 'up', pkg, market, mode, cfg, botState, log, adjustPaperCash, saveTrade });
-    } else if (downSuccess && !upSuccess) {
+    } else if (downShares > 0 && upShares <= 0) {
       await unwindLeg({ outcome: 'down', pkg, market, mode, cfg, botState, log, adjustPaperCash, saveTrade });
     }
 
@@ -279,7 +319,7 @@ export async function detectAndExecuteArbPackage({
   }
 }
 
-async function executeArbLeg({ outcome, price, cost, shares, pkg, market, executeTrade }) {
+async function executeArbLeg({ outcome, price, cost, shares, pkg, market, executeTrade, mode = 'paper' }) {
   const plan = {
     symbol: market.symbol,
     slug: market.slug,
@@ -322,7 +362,20 @@ async function executeArbLeg({ outcome, price, cost, shares, pkg, market, execut
   //
   // Read `ok` explicitly. A refusal is not a result.
   const res = await executeTrade(pending);
-  return res?.ok === true;
+  if (res?.ok !== true) return 0;
+
+  // Returns *matched shares*, not a boolean, because the sibling leg has to be
+  // sized against this number rather than against the plan (see the call site).
+  const reported = Number(res?.position?.shares);
+  if (Number.isFinite(reported) && reported > 0) return reported;
+
+  // A live fill always carries a position whose share count `placeMarketBuy`
+  // proved against the receipt, so a live `ok` with no share count is a
+  // contradiction — refuse it rather than substituting the planned size and
+  // hedging against a quantity nobody confirmed. Paper mode and the test doubles
+  // legitimately report `{ ok: true }` with no position; there the planned size
+  // is exact by construction.
+  return mode === 'live' ? 0 : Number(shares) || 0;
 }
 
 /**
@@ -362,10 +415,14 @@ async function unwindLeg({ outcome, pkg, market, mode, cfg, botState, log, adjus
   // Live Mode: Execute an immediate Market Sell on CLOB so capital is returned to cash
   if (mode === 'live' && pos.tokenId) {
     try {
-      const { placeMarketSell } = await import('./trade.js');
+      const { placeMarketSell, sellFloor } = await import('./trade.js');
       const sellRes = await placeMarketSell({
         tokenId: pos.tokenId,
         shares,
+        // An unwind is a forced exit of an unhedged leg — the mark is what the
+        // book will pay now, not what we paid. `price` here is pos.entryPrice,
+        // used only as the fallback when the position was never marked.
+        minPrice: sellFloor(pos.currentPrice || price, { tickSize: pos.tickSize || '0.01' }),
         negRisk: !!pos.negRisk,
         tickSize: pos.tickSize || '0.01',
       });

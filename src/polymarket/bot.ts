@@ -48,7 +48,7 @@ import {
   resetPackages,
 } from './arbEngine.js';
 import { persist, persistSync, load, FILES, dataPath } from './persistence.js';
-import { placeOrder, placeMarketSell, syncClobBalance } from './trade.js';
+import { placeOrder, placeMarketBuy, placeMarketSell, sellFloor, syncClobBalance } from './trade.js';
 import { checkReadiness } from './readiness.js';
 import { resolveDynamicLimits, setKellyTradeHistory, getKellyStats, buildDynamicPlan, checkTrailingStop, checkPartialProfit, resolveAdaptiveSl } from './kelly.js';
 import {
@@ -850,15 +850,29 @@ async function executePendingTrade(pending) {
         market: pending.symbol, slug: pending.slug, outcome: pending.outcome,
         amount: plan.sizeUsd, price: entryPx, announceId: pending.id,
       });
-      const orderResult = await placeOrder({
-        tokenId: pending.tokenId,
-        side: 'buy',
-        amountUsd: plan.sizeUsd,
-        price: entryPx,
-        negRisk: pending.negRisk,
-        tickSize: pending.tickSize || '0.01',
-        minShares: pending.minShares || 5,
-      });
+      // Arb legs must match immediately or not at all. A GTC limit that rests on
+      // the book returns an orderID, which reads as success here and lets the
+      // engine hedge against a leg that never filled (the 2026-08-28 -$12.83
+      // orphan). Directional entries keep the limit path deliberately: they are
+      // single-sided, so a resting bid is a missed trade, not a naked position.
+      const orderResult = plan.isArbLeg
+        ? await placeMarketBuy({
+          tokenId: pending.tokenId,
+          amountUsd: plan.sizeUsd,
+          maxPrice: entryPx,
+          negRisk: pending.negRisk,
+          tickSize: pending.tickSize || '0.01',
+          minShares: pending.minShares || 5,
+        })
+        : await placeOrder({
+          tokenId: pending.tokenId,
+          side: 'buy',
+          amountUsd: plan.sizeUsd,
+          price: entryPx,
+          negRisk: pending.negRisk,
+          tickSize: pending.tickSize || '0.01',
+          minShares: pending.minShares || 5,
+        });
       pos.orderId = orderResult.id;
       pos.shares = orderResult.size;
       pos.entryPrice = orderResult.price;
@@ -885,6 +899,31 @@ async function executePendingTrade(pending) {
     } catch (err) {
       pending.status = 'failed';
       botState._buyLocks.delete(pending.slug);
+      // An accepted-but-unverifiable arb fill is the one error we cannot simply
+      // report and walk away from — the shares may already be in the wallet, and
+      // no position row exists yet for the rollback path to find. Flatten on the
+      // spot. The payoff is asymmetric: selling shares we do not hold is
+      // rejected harmlessly, while not selling shares we do hold expires them at
+      // zero. Scoped to arb legs so it can never touch a directional position.
+      if (err?.code === 'UNVERIFIED_FILL' && plan.isArbLeg && err.expectedShares > 0) {
+        try {
+          const flat = await placeMarketSell({
+            tokenId: err.tokenId,
+            shares: err.expectedShares,
+            minPrice: sellFloor(entryPx, { tickSize: pending.tickSize || '0.01' }),
+            negRisk: pending.negRisk,
+            tickSize: pending.tickSize || '0.01',
+          });
+          log(`🩹 UNVERIFIED FILL FLATTENED ${pending.symbol} ${pending.outcome.toUpperCase()} · ${err.expectedShares}sh (order: ${flat?.id || 'ok'})`, 'sl', {
+            market: pending.symbol, slug: pending.slug, outcome: pending.outcome,
+            orderId: err.orderId, shares: err.expectedShares,
+          });
+        } catch (flatErr) {
+          log(`⚠️ UNVERIFIED FILL — FLATTEN REJECTED ${pending.symbol} ${pending.outcome.toUpperCase()} (likely never filled): ${String(flatErr?.message || flatErr).slice(0, 120)}`, 'error', {
+            market: pending.symbol, slug: pending.slug, outcome: pending.outcome, orderId: err.orderId,
+          });
+        }
+      }
       log(`❌ LIVE BUY FAILED ${pending.symbol}: ${err.message.slice(0, 160)}`, 'error', {
         market: pending.symbol, slug: pending.slug, outcome: pending.outcome,
       });
@@ -1943,6 +1982,7 @@ async function scanOpenExitsFast() {
           const sellRes = await placeMarketSell({
             tokenId: pos.tokenId,
             shares: sellShares,
+            minPrice: sellFloor(pos.currentPrice, { tickSize: pos.tickSize }),
             negRisk: pos.negRisk,
             tickSize: pos.tickSize,
           });
@@ -2161,6 +2201,7 @@ export async function scan() {
               const sellRes = await placeMarketSell({
                 tokenId: openPos.tokenId,
                 shares: sellShares,
+                minPrice: sellFloor(openPos.currentPrice, { tickSize: openPos.tickSize }),
                 negRisk: openPos.negRisk,
                 tickSize: openPos.tickSize,
               });
@@ -2434,6 +2475,7 @@ export async function scan() {
                   const sellRes = await placeMarketSell({
                     tokenId: op.tokenId,
                     shares: Number(op.shares),
+                    minPrice: sellFloor(op.currentPrice, { tickSize: op.tickSize || '0.01' }),
                     negRisk: !!op.negRisk,
                     tickSize: op.tickSize || '0.01',
                   });
@@ -2520,6 +2562,7 @@ export async function scan() {
                 const sellRes = await placeMarketSell({
                   tokenId: pos.tokenId,
                   shares: sellShares,
+                  minPrice: sellFloor(pos.currentPrice, { tickSize: pos.tickSize }),
                   negRisk: pos.negRisk,
                   tickSize: pos.tickSize,
                 });
@@ -2592,6 +2635,7 @@ export async function scan() {
               const sellRes = await placeMarketSell({
                 tokenId: pos.tokenId,
                 shares: sellShares,
+                minPrice: sellFloor(pos.currentPrice, { tickSize: pos.tickSize }),
                 negRisk: pos.negRisk,
                 tickSize: pos.tickSize,
               });
@@ -3743,6 +3787,7 @@ async function executeSell(pos, reason = 'manual') {
       const result = await placeMarketSell({
         tokenId: pos.tokenId,
         shares: positionShares(pos),
+        minPrice: sellFloor(price, { tickSize: pos.tickSize }),
         negRisk: pos.negRisk,
         tickSize: pos.tickSize,
       });
@@ -3806,6 +3851,9 @@ export async function rapidSellPmAsset({ assetId, size }) {
   const result = await placeMarketSell({
     tokenId: assetId,
     shares: Number(size),
+    // A raw wallet asset carries no mark, so this sweeps to the minimum tick.
+    // It is a manual operator dump of inventory the bot does not track.
+    minPrice: sellFloor(null),
     negRisk: false,
     tickSize: '0.01',
   });
