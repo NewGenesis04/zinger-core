@@ -210,6 +210,17 @@ export async function detectAndExecuteArbPackage({
     if (botState?.config && prevMax != null) botState.config.maxConcurrentPerSlug = prevMax;
   }
 
+  // Record what actually matched *before* branching. `abortReason` below is
+  // built from `upShares > 0`, so if the flags are only written on the LOCKED
+  // path the two disagree on exactly the case that matters: package
+  // pkg-btc-mtbtgyzj (2026-08-27) carried `abortReason: "UP=OK, DOWN=FAIL"`
+  // beside `legs.up.filled: false`, and 25.99 real UP shares expired worthless
+  // because every reconciler that reads the flag saw nothing to unwind.
+  pkg.legs.up.filled = upShares > 0;
+  pkg.legs.up.shares = upShares;
+  pkg.legs.down.filled = downShares > 0;
+  pkg.legs.down.shares = downShares;
+
   try {
     if (upShares > 0 && downShares > 0) {
       // Share-parity invariant. With both legs fill-or-kill a partial cannot
@@ -237,10 +248,6 @@ export async function detectAndExecuteArbPackage({
       // Only the matched pair is arbitrage, so that is what the package records.
       pkg.shares = matched;
       pkg.expectedPayout = Math.round(matched * 1.00 * 100) / 100;
-      pkg.legs.up.filled = true;
-      pkg.legs.up.shares = upShares;
-      pkg.legs.down.filled = true;
-      pkg.legs.down.shares = downShares;
       pkg.status = 'LOCKED';
       savePackage(pkg);
 
@@ -401,7 +408,7 @@ async function executeArbLeg({ outcome, price, cost, shares, pkg, market, execut
  */
 async function unwindLeg({ outcome, pkg, market, mode, cfg, botState, log, adjustPaperCash, saveTrade }) {
   const pos = botState.positions.find((p) => p.packageId === pkg.packageId && p.outcome === outcome && !p.closed);
-  if (!pos) return;
+  if (!pos) return { ok: false, closed: false, missing: true };
 
   const shares = Number(pos.shares || 0);
   const price = Number(pos.entryPrice || 0);
@@ -426,13 +433,35 @@ async function unwindLeg({ outcome, pkg, market, mode, cfg, botState, log, adjus
         negRisk: !!pos.negRisk,
         tickSize: pos.tickSize || '0.01',
       });
+      pos.unwindAttempts = 0;
       if (log) {
         log(`⚡ LIVE ARB UNWIND: Sold ${shares}sh back to CLOB cash (order: ${sellRes?.id || 'ok'})`, 'system', { orderId: sellRes?.id });
       }
     } catch (err) {
+      // Backlog 34. The sell did not happen, so the shares are still held and
+      // the position is still open — closing it here would book a rollback that
+      // never occurred, at a price nobody paid, and hide a live exposure.
+      // Leave it open and let the orphan sweep retry on the next housekeeping
+      // tick. That is only safe because the retry is bounded: an unsellable leg
+      // (no bid at any price, an expired window) would otherwise emit a live
+      // order every tick forever.
+      const maxAttempts = Math.max(1, Number(cfg?.arbUnwindMaxAttempts ?? 3));
+      pos.unwindAttempts = Number(pos.unwindAttempts || 0) + 1;
+      pos.lastUnwindError = String(err?.message || err).slice(0, 200);
+      pos.lastUnwindAt = Date.now();
+      pos.unwindBlocked = pos.unwindAttempts >= maxAttempts;
+
       if (log) {
-        log(`⚠️ LIVE ARB UNWIND FAILED: ${err.message}`, 'error', { err: err.message });
+        log(
+          pos.unwindBlocked
+            ? `🛑 LIVE ARB UNWIND GAVE UP after ${pos.unwindAttempts} attempts — ${pos.symbol} ${outcome.toUpperCase()} ${shares}sh STILL HELD and will settle at expiry · ${pos.lastUnwindError}`
+            : `⚠️ LIVE ARB UNWIND FAILED (attempt ${pos.unwindAttempts}/${maxAttempts}) — position left open for retry: ${pos.lastUnwindError}`,
+          'error',
+          { packageId: pkg.packageId, slug: market?.slug, outcome, attempts: pos.unwindAttempts, blocked: pos.unwindBlocked, err: pos.lastUnwindError },
+        );
       }
+      // Not closed, no trade written, no fees booked — nothing happened.
+      return { ok: false, closed: false, attempts: pos.unwindAttempts, blocked: pos.unwindBlocked };
     }
   }
 
@@ -459,10 +488,13 @@ async function unwindLeg({ outcome, pkg, market, mode, cfg, botState, log, adjus
       { packageId: pkg.packageId, slug: market?.slug, outcome, entryFee, exitFee, pnl: pos.pnl },
     );
   }
+
+  return { ok: true, closed: true };
 }
 
 /**
- * Reconcile packages stuck at PENDING_FILL (backlog item 9).
+ * Reconcile packages the dispatch path could not finish cleanly —
+ * PENDING_FILL (backlog item 9) and ABORTED-with-an-orphan-leg (backlog 43).
  *
  * A package is written PENDING_FILL, both legs are dispatched, and the block
  * after `Promise.allSettled` promotes it to LOCKED or ABORTED. A process
@@ -492,19 +524,77 @@ export async function reconcilePendingPackages({
   saveTrade = null,
 }: any = {}) {
   const now = Date.now();
-  const stuck = loadPackages().filter((p) => (
-    p.mode === mode
-    && p.status === 'PENDING_FILL'
-    && (now - Number(p.createdAt || 0)) > minAgeMs
+  const all = loadPackages().filter((p) => (
+    p.mode === mode && (now - Number(p.createdAt || 0)) > minAgeMs
   ));
-  if (!stuck.length) return { checked: 0, locked: 0, aborted: 0, discarded: 0 };
+  const stuck = all.filter((p) => p.status === 'PENDING_FILL');
+
+  // Driven from open positions, not from the package list. An orphan is by
+  // definition a position still on the book, and there are at most a handful of
+  // those — whereas ABORTED packages accumulate forever, and scanning all of
+  // them on every housekeeping tick would grow without bound for no new signal.
+  const orphanCandidates = new Map();
+  for (const pos of positions) {
+    if (pos.closed || !pos.packageId || !(Number(pos.shares || 0) > 0)) continue;
+    // Retries exhausted (backlog 34): the leg is genuinely stuck, so stop
+    // issuing live orders for it. It stays open because it is still held, and
+    // will settle at expiry like any other position.
+    if (pos.unwindBlocked) continue;
+    const pkg = all.find((p) => p.packageId === pos.packageId && p.status === 'ABORTED');
+    if (!pkg) continue;
+    const seen = orphanCandidates.get(pkg.packageId) || { pkg, outcomes: new Set() };
+    seen.outcomes.add(pos.outcome);
+    orphanCandidates.set(pkg.packageId, seen);
+  }
+
+  if (!stuck.length && !orphanCandidates.size) {
+    return { checked: 0, locked: 0, aborted: 0, discarded: 0, orphansUnwound: 0 };
+  }
 
   const present = (pkg, outcome) => (
     positions.some((p) => p.packageId === pkg.packageId && p.outcome === outcome)
     || trades.some((t) => t.packageId === pkg.packageId && t.outcome === outcome)
   );
 
-  const result = { checked: stuck.length, locked: 0, aborted: 0, discarded: 0 };
+  const result = { checked: stuck.length, locked: 0, aborted: 0, discarded: 0, orphansUnwound: 0 };
+
+  // ── ABORTED packages holding exactly one open leg (backlog 43) ────────────
+  // `closed` is the idempotence latch: `unwindLeg` sets it, so a leg is swept at
+  // most once and a live sell can never be issued twice for the same shares.
+  // (A weak latch — backlog 34 lets a *failed* unwind set it too — but
+  // re-selling shares we no longer hold is the worse error, so this under-acts.)
+  // The abort path unwinds inline, but that unwind could not fill for the whole
+  // of the live canary: it wrote local state only until 72c27ac, then issued an
+  // unpriced sell (backlog 35) until 2026-09-01. Nothing swept the leftovers,
+  // because the only reconciler here filtered on PENDING_FILL. This is that
+  // sweep. Both legs open is deliberately left alone — that is a hedge that was
+  // mislabelled, not an orphan, and selling both would realise a loss.
+  for (const { pkg, outcomes } of orphanCandidates.values()) {
+    if (outcomes.size !== 1) {
+      if (log) log(`⚠️ ARB RECONCILE ${pkg.symbol} ${pkg.packageId} — ABORTED but both legs still open · left intact for review`, 'error', { packageId: pkg.packageId, slug: pkg.slug });
+      continue;
+    }
+    const orphan = [...outcomes][0];
+    const ageH = ((now - Number(pkg.createdAt || 0)) / 3_600_000).toFixed(1);
+    if (log) log(`🔧 ARB RECONCILE ${pkg.symbol} ${pkg.packageId} → naked ${orphan.toUpperCase()} leg still open ${ageH}h after abort — unwinding`, 'sl', { packageId: pkg.packageId, slug: pkg.slug });
+    try {
+      const unwound = await unwindLeg({ outcome: orphan, pkg, market: { slug: pkg.slug }, mode, cfg, botState, log, adjustPaperCash, saveTrade });
+      // The leg was real either way — that is backlog 43, and it must be
+      // recorded even when the sell fails, or the next pass forgets again.
+      pkg.legs[orphan].filled = true;
+      // But only claim it was swept if it actually closed. Counting a refused
+      // sell as a sweep is the same lie backlog 34 was about, one level up.
+      if (unwound?.closed) {
+        result.orphansUnwound += 1;
+        pkg.abortReason = `${pkg.abortReason || 'aborted'} · orphan ${orphan.toUpperCase()} swept after ${ageH}h`;
+      }
+      savePackage(pkg);
+    } catch (err) {
+      if (log) log(`⚠️ ARB RECONCILE orphan unwind failed ${pkg.packageId}: ${err?.message}`, 'error');
+    }
+  }
+
+  if (!stuck.length) return result;
 
   for (const pkg of stuck) {
     const upOk = present(pkg, 'up');

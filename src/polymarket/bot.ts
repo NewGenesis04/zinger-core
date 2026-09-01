@@ -551,7 +551,7 @@ async function arbHousekeeping(reason = 'scan') {
       saveTrade,
     });
 
-    if (settled || rec.locked || rec.aborted || rec.discarded) {
+    if (settled || rec.locked || rec.aborted || rec.discarded || rec.orphansUnwound) {
       saveState();
       notifyStateChange();
     }

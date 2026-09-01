@@ -976,6 +976,143 @@ describe('INVARIANT: arb capacity drains without anyone watching', () => {
     expect(res.locked).toBe(1);
   });
 
+  /**
+   * INVARIANT: an ABORTED package never leaves a naked leg on the book.
+   *
+   * Backlog 43. The abort path unwinds inline, but that unwind could not fill
+   * for the whole of the live canary — it wrote local state only until 72c27ac,
+   * then issued an unpriced sell (backlog 35) until 2026-09-01. Nothing swept
+   * the leftovers, because the only reconciler here filtered on PENDING_FILL.
+   * Package pkg-btc-mtbtgyzj held 25.99 real UP shares until they expired.
+   */
+  it('sweeps a naked leg left open by a failed abort-time unwind', async () => {
+    savePackage(stuck({ status: 'ABORTED', abortReason: 'Leg execution mismatch: UP=OK, DOWN=FAIL' }) as any);
+    const positions = [leg('up')];   // the inline unwind never actually sold it
+
+    const { res, saved } = await reconcile(positions, []);
+
+    expect(res.orphansUnwound).toBe(1);
+    expect(positions[0].closed).toBe(true);
+    expect(positions[0].exitReason).toBe('arb_rollback');
+    expect(saved).toHaveLength(1);
+    // The package must now agree that the leg was real.
+    expect(loadPackages()[0].legs.up.filled).toBe(true);
+    expect(loadPackages()[0].abortReason).toMatch(/orphan UP swept/);
+  });
+
+  it('is idempotent — a swept leg is not sold twice', async () => {
+    // `closed` is the only latch. Selling shares we no longer hold is the one
+    // error worse than leaving them, so a second pass must be a no-op.
+    savePackage(stuck({ status: 'ABORTED' }) as any);
+    const positions = [leg('up')];
+    await reconcile(positions, []);
+    const { res, saved } = await reconcile(positions, []);
+    expect(res.orphansUnwound).toBe(0);
+    expect(saved).toHaveLength(0);
+  });
+
+  it('ignores an aborted package whose legs never filled', async () => {
+    // Nine of the twelve canary packages. Both legs refused, nothing on-chain —
+    // a sweep that treated these as orphans would sell shares never held.
+    savePackage(stuck({ status: 'ABORTED', abortReason: 'Leg execution mismatch: UP=FAIL, DOWN=FAIL' }) as any);
+    const { res, saved } = await reconcile([], []);
+    expect(res.orphansUnwound).toBe(0);
+    expect(saved).toHaveLength(0);
+  });
+
+  it('leaves an aborted package with both legs open intact', async () => {
+    // That is a mislabelled hedge, not an orphan. Unwinding both would realise
+    // a loss on a position that still redeems to $1.00 a pair.
+    savePackage(stuck({ status: 'ABORTED' }) as any);
+    const positions = [leg('up'), leg('down')];
+    const { res, saved } = await reconcile(positions, []);
+    expect(res.orphansUnwound).toBe(0);
+    expect(positions.every((p) => !p.closed)).toBe(true);
+    expect(saved).toHaveLength(0);
+  });
+
+  it('does not sweep an aborted package younger than the interlock', async () => {
+    savePackage(stuck({ status: 'ABORTED', createdAt: Date.now() - 1000 }) as any);
+    const positions = [leg('up')];
+    const { res } = await reconcile(positions, []);
+    expect(res.orphansUnwound).toBe(0);
+    expect(positions[0].closed).toBe(false);
+  });
+
+  /**
+   * INVARIANT: a live sell that did not happen never books a close.
+   *
+   * Backlog 34. The catch around the live `placeMarketSell` logged and fell
+   * through to `pos.closed = true`, so a refused sell was recorded as a
+   * completed rollback — closed at the entry price, PnL = fees only. That is
+   * how the canary's 25.99 orphan came to read as a $0.01 loss while it was
+   * really $2.86 of live exposure heading for expiry.
+   *
+   * No mocking: with no signer or credentials `placeMarketSell` throws for
+   * real, which is exactly the failure being tested.
+   */
+  const liveLeg = (over = {}) => leg('up', {
+    tokenId: 'token-up-live', mode: 'live', currentPrice: 0.25, tickSize: '0.01', ...over,
+  });
+  const liveReconcile = (positions, over = {}) => reconcile(positions, [], {
+    mode: 'live', ...over,
+  });
+
+  it('leaves the position open when the live unwind sell fails', async () => {
+    savePackage(stuck({ status: 'ABORTED', mode: 'live' }) as any);
+    const positions = [liveLeg()];
+
+    const { res, saved } = await liveReconcile(positions);
+
+    // The regression: this used to come back closed, with a trade written.
+    expect(positions[0].closed, 'booked a close for a sell that never happened').toBe(false);
+    expect(positions[0].exitReason).toBeUndefined();
+    expect(saved, 'wrote a trade for a rollback that did not occur').toHaveLength(0);
+    expect(res.orphansUnwound).toBe(0);
+    // …and it must say why, so the next pass and the operator both know.
+    expect(positions[0].unwindAttempts).toBe(1);
+    expect(positions[0].lastUnwindError).toBeTruthy();
+    expect(positions[0].unwindBlocked).toBe(false);
+  });
+
+  it('retries on the next pass, then stops after the attempt budget', async () => {
+    // Unbounded retry is the other failure mode: an unsellable leg would emit a
+    // live order every housekeeping tick, forever.
+    savePackage(stuck({ status: 'ABORTED', mode: 'live' }) as any);
+    const positions = [liveLeg()];
+
+    await liveReconcile(positions);
+    await liveReconcile(positions);
+    expect(positions[0].unwindAttempts).toBe(2);
+    expect(positions[0].unwindBlocked).toBe(false);
+
+    await liveReconcile(positions);
+    expect(positions[0].unwindAttempts).toBe(3);
+    expect(positions[0].unwindBlocked).toBe(true);
+
+    // Blocked means no more live orders — but the leg is still held, so it must
+    // stay open and settle at expiry rather than be quietly written off.
+    await liveReconcile(positions);
+    expect(positions[0].unwindAttempts, 'kept retrying after giving up').toBe(3);
+    expect(positions[0].closed, 'wrote off a position that is still held').toBe(false);
+  });
+
+  it('honours a configured attempt budget', async () => {
+    savePackage(stuck({ status: 'ABORTED', mode: 'live' }) as any);
+    const positions = [liveLeg()];
+    await liveReconcile(positions, { cfg: { arbUnwindMaxAttempts: 1 } });
+    expect(positions[0].unwindBlocked).toBe(true);
+  });
+
+  it('still closes cleanly in paper mode, where there is no sell to fail', async () => {
+    savePackage(stuck({ status: 'ABORTED' }) as any);
+    const positions = [leg('up')];
+    const { res, saved } = await reconcile(positions, []);
+    expect(res.orphansUnwound).toBe(1);
+    expect(positions[0].closed).toBe(true);
+    expect(saved).toHaveLength(1);
+  });
+
   it('never touches a package young enough to still be dispatching', async () => {
     // The safety interlock. Without an age floor this would abort packages whose
     // legs are mid-flight — a live CLOB round trip takes seconds.

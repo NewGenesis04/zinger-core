@@ -1,5 +1,11 @@
 import path from 'path';
 
+// The CLOB receipt capture is deliberately loud in production so a VPS run is
+// greppable in journalctl. In tests it drowns the reporter — the records are
+// still written to the worker's own data dir and can be read with
+// `readReceipts()`. Set before any module reads it.
+process.env.ZINGER_RECEIPT_ECHO ??= '0';
+
 /**
  * Runs in every test worker before any test file loads.
  *

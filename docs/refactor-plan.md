@@ -1367,7 +1367,7 @@ itself from a single fill. Read back with `readReceipts(n)`; disable with
 Nothing gates on `status` anywhere in this path, deliberately — its vocabulary
 is likewise unrecorded, and that is the `negRisk` failure shape.
 
-### 34. A rejected live unwind sell still marks the position closed
+### 34. A rejected live unwind sell still marks the position closed ✅ FIXED
 
 `unwindLeg` (`arbEngine.ts:402`) dispatches a real `placeMarketSell` in live mode
 (`:416-433`) — that was item 27's phantom-rollback fix. But the `catch` at `:428`
@@ -1400,6 +1400,30 @@ so the two are best settled together.
 edge case. It was the default: `placeMarketSell` could not fill at all. Item 34
 is still real — a sell can fail for ordinary reasons — but it is no longer the
 first thing to fix.
+
+
+
+**Fixed.** The catch no longer falls through to the close. On a failed live
+sell `unwindLeg` records `unwindAttempts`, `lastUnwindError`, `lastUnwindAt`,
+and returns `{ ok: false, closed: false }` — the position stays **open**,
+because the shares are still held. No trade is written and no fees are booked:
+nothing happened, so nothing is recorded.
+
+The retry is the backlog 43 orphan sweep, which now runs each housekeeping
+tick. That makes the retry bounded rather than infinite: after
+`cfg.arbUnwindMaxAttempts` (default 3) the leg is marked `unwindBlocked` and the
+sweep skips it, so an unsellable leg — no bid at any price, an expired window —
+cannot emit a live order every tick forever. It still stays open and settles at
+expiry like any other position, which is the truth about it.
+
+Writing the test for this found the same bug one level up in the new sweep: it
+incremented `orphansUnwound` and annotated the package as "swept" immediately
+after `await unwindLeg(...)`, without checking whether anything closed. It now
+checks the returned result. `legs.*.filled` is still set either way — the leg
+was real regardless of whether the sell worked, which is backlog 43's point.
+
+This also strengthens the sweep's idempotence latch. `closed` now means the sell
+actually succeeded, so it is no longer the weak signal noted in item 43.
 
 ### 35. Every live sell was signed at $1.00/share ✅ FIXED
 
@@ -1649,6 +1673,87 @@ import there would have created a cycle.
 
 Watch paper trading for a shift in entry rate and average confidence before this
 reaches live. That comparison is the point of keeping paper running.
+
+### 43. An aborted package never records which leg actually filled ✅ FIXED
+
+Proven from the live canary archive (`poly_live_archive.json`, package
+`pkg-btc-mtbtgyzj`, 2026-08-27 17:48:46 UTC). The same record says both:
+
+```
+abortReason : "Leg execution mismatch: UP=OK, DOWN=FAIL"
+legs.up.filled : false
+```
+
+`abortReason` is built from `upShares > 0` (`arbEngine.ts:300`), so the engine
+knew the UP leg had filled — 25.99 shares, $2.86, confirmed on-chain. But
+`pkg.legs.up.filled = true` is only assigned in the LOCKED branch
+(`arbEngine.ts:240-243`). The abort path at `:296-306` sets `status`,
+`unwoundAt` and `abortReason`, and never touches the flag.
+
+So the package's own machine-readable state says nothing filled, while its
+human-readable string says otherwise. Anything reconciling orphans by reading
+`legs.*.filled` sees nothing to unwind.
+
+There is no second line of defence: `reconcilePendingPackages` filters
+`status === 'PENDING_FILL'` (`:497`), and this package went straight to
+`ABORTED`, so nothing sweeps it. `resetLiveData`'s phantom detector also missed
+it — the archive records `phantomTradeCount: 0`.
+
+The immediate unwind did fire (`:302`), but at that commit `unwindLeg` only
+mutated local state: `pos.closed = true`, `pos.exitPrice = pos.entryPrice`,
+`pos.pnl = -(fees)`, with the cash refund gated behind `mode === 'paper'`. In
+live mode it wrote a fake closed record worth about -$0.01 while 25.99 real
+tokens stayed in the Safe and expired worthless. Two independent records —
+the position and the package — both said there was nothing to recover.
+
+**Fixed** in two parts.
+
+1. `legs.*.filled` and `legs.*.shares` are now written from the observed share
+   counts *before* any branch reads them, so they cannot disagree with
+   `abortReason` (which is derived from the same counts). The duplicate
+   assignments on the LOCKED path were removed — one writer, one place.
+
+2. `reconcilePendingPackages` now also sweeps ABORTED packages that still hold
+   exactly one open leg, and unwinds it. It is driven from the **open positions**
+   rather than the package list: an orphan is by definition a position still on
+   the book, and there are a handful of those, whereas ABORTED packages
+   accumulate forever — iterating them every housekeeping tick would grow
+   without bound for no new signal.
+
+   `closed` is the idempotence latch, so a leg is swept at most once and a live
+   sell is never issued twice for the same shares. A package with *both* legs
+   open is deliberately left alone and logged: that is a mislabelled hedge, not
+   an orphan, and selling both would realise a loss on a position that still
+   redeems to $1.00 a pair.
+
+Note for the record: an earlier draft of this item pointed at "the ABORTED sweep
+at `:588`". There is no sweep there — `:588` is `getArbPackageMetrics`, a
+dashboard KPI function. No sweep for ABORTED existed at all, which is the
+reason the orphan survived.
+
+Related:
+[[34]] (the unwind catch falls through to `pos.closed = true`) and [[35]]
+(the unwind sell was unpriced until 2026-09-01) — all three are the same
+orphan-leg blind spot seen from different sides.
+
+### 44. A live rollback books the entry price, not the fill price
+
+`unwindLeg` sets `pos.exitPrice = price` where `price = pos.entryPrice`, and
+`pos.pnl = -(entryFee + exitFee)` — on the success path too. So a live unwind
+that actually sold at $0.20 against a $0.50 entry is recorded as a break-even
+close costing only fees.
+
+The comment above it ("Sold back at the price it was bought at, so the only loss
+is the two fees") is true of paper, where `closeProceedsWithFee` models the
+refund. It is not true of live, where the CLOB fills at whatever the book pays.
+
+`placeMarketSell` already returns the accepted price, and the response body is
+now captured (`clobReceipts.ts`), so the fill price is available — it is simply
+not read. Until it is, every live rollback understates its loss, and the
+`realizedFor()` sum in `getArbPackageMetrics` inherits the error.
+
+Not fixed here: it changes live PnL accounting, which is beyond the scope of the
+backlog 34 fix it was found beside. Related: [[34]], [[43]].
 
 ---
 

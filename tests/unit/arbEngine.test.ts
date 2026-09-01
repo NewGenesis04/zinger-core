@@ -362,4 +362,65 @@ describe('Arb entry invariants — fill-or-kill share parity', () => {
     expect(pkg?.unwoundAt).toBeDefined();
     expect(pkg?.abortReason).toMatch(/UP=OK, DOWN=FAIL/);
   });
+
+  /**
+   * INVARIANT: `legs.*.filled` and `abortReason` describe the same reality.
+   *
+   * Backlog 43, taken straight from the live canary. Package pkg-btc-mtbtgyzj
+   * (2026-08-27 17:48:46 UTC) recorded:
+   *
+   *     abortReason    : "Leg execution mismatch: UP=OK, DOWN=FAIL"
+   *     legs.up.filled : false
+   *
+   * `abortReason` is built from `upShares > 0`, so the engine knew the UP leg
+   * had matched — 25.99 shares, $2.86, confirmed on-chain. But the flag was only
+   * written on the LOCKED path, so every reconciler that reads it saw nothing to
+   * unwind, and the shares expired worthless.
+   *
+   * Asserting the two agree is the point: either alone can be made green by a
+   * plausible edit, and it was their disagreement that hid a real loss.
+   */
+  it('records the filled leg on an aborted package, not just in the abort reason', async () => {
+    const executeTrade = async (pending) => (pending.outcome === 'up'
+      ? { ok: true, position: { shares: 25.99 } }
+      : { ok: false, error: 'blocked: min order exceeds risk cap' });
+
+    const pkg = await run(executeTrade);
+
+    expect(pkg?.status).toBe('ABORTED');
+    expect(pkg?.abortReason).toMatch(/UP=OK, DOWN=FAIL/);
+    // The regression: this was `false` while the reason above said OK.
+    expect(pkg?.legs.up.filled, 'aborted package forgot the leg that filled').toBe(true);
+    expect(pkg?.legs.up.shares).toBeCloseTo(25.99, 3);
+    expect(pkg?.legs.down.filled).toBe(false);
+
+    // Stated as an agreement, so neither side can drift alone.
+    const reasonSaysUpFilled = /UP=OK/.test(pkg!.abortReason);
+    expect(pkg!.legs.up.filled).toBe(reasonSaysUpFilled);
+    expect(pkg!.legs.down.filled).toBe(/DOWN=OK/.test(pkg!.abortReason));
+  });
+
+  it('records neither leg as filled when both are killed', () => {
+    // The other nine canary packages: both legs refused, nothing on-chain. A
+    // sweep that treats these as orphans would sell shares we never held.
+    const executeTrade = async () => ({ ok: false, error: 'blocked' });
+    return run(executeTrade).then((pkg) => {
+      expect(pkg?.status).toBe('ABORTED');
+      expect(pkg?.abortReason).toMatch(/UP=FAIL, DOWN=FAIL/);
+      expect(pkg?.legs.up.filled).toBe(false);
+      expect(pkg?.legs.down.filled).toBe(false);
+    });
+  });
+
+  it('still marks both legs filled on the locked path', () => {
+    // Moving the assignment earlier must not drop it for the success case.
+    const executeTrade = async () => ({ ok: true, position: { shares: 26 } });
+    return run(executeTrade).then((pkg) => {
+      expect(pkg?.status).toBe('LOCKED');
+      expect(pkg?.legs.up.filled).toBe(true);
+      expect(pkg?.legs.down.filled).toBe(true);
+      expect(pkg?.legs.up.shares).toBeCloseTo(26, 3);
+      expect(pkg?.legs.down.shares).toBeCloseTo(26, 3);
+    });
+  });
 });
