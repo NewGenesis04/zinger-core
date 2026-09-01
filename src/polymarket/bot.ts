@@ -48,7 +48,7 @@ import {
   resetPackages,
 } from './arbEngine.js';
 import { persist, persistSync, load, FILES, dataPath } from './persistence.js';
-import { placeOrder, placeMarketBuy, placeMarketSell, sellFloor, syncClobBalance } from './trade.js';
+import { placeOrder, placeMarketBuy, placeMarketSell, sellFloor, cancelOrder, syncClobBalance } from './trade.js';
 import { checkReadiness } from './readiness.js';
 import { resolveDynamicLimits, setKellyTradeHistory, getKellyStats, buildDynamicPlan, checkTrailingStop, checkPartialProfit, resolveAdaptiveSl } from './kelly.js';
 import {
@@ -840,7 +840,7 @@ async function executePendingTrade(pending) {
       const capUsd = plan.isArbLeg
         ? Number(cfg.arbMaxUsd ?? 25)
         : Number(cfg.maxPositionCap ?? cfg.maxPositionSize ?? 14);
-      if (realCost > Math.max(capUsd * 1.6, 4.5)) {
+      if (realCost > capUsd) {
         pending.status = 'failed';
         botState._buyLocks.delete(pending.slug);
         log(`⛔ LIVE SKIP ${pending.symbol} — min order $${realCost.toFixed(2)} (${minSh} sh @ $${entryPx}) blows cap $${capUsd}`, 'error');
@@ -874,14 +874,34 @@ async function executePendingTrade(pending) {
           minShares: pending.minShares || 5,
         });
       pos.orderId = orderResult.id;
-      pos.shares = orderResult.size;
+
+      // A GTC limit can be accepted and rest on the book with nothing matched.
+      // The CLOB returns an orderID either way, so an orderID has never meant
+      // shares in hand — that read cost the -$12.83 arb leg on 2026-08-28, and
+      // the same response shape reaches directional entries, which keep the
+      // limit path on purpose. Cancel rather than book a position we do not
+      // hold: an untracked resting bid can still fill later, unattended.
+      if (orderResult.resting) {
+        pending.status = 'failed';
+        botState._buyLocks.delete(pending.slug);
+        try { await cancelOrder(orderResult.id); } catch { /* best effort */ }
+        log(`⛔ LIVE ORDER RESTED ${pending.symbol} ${pending.outcome.toUpperCase()} @ $${orderResult.price.toFixed(3)} — nothing matched, order cancelled · no position opened`, 'error', {
+          market: pending.symbol, slug: pending.slug, outcome: pending.outcome,
+          orderId: orderResult.id, requested: orderResult.size, status: orderResult.status ?? null,
+        });
+        return { ok: false, error: 'order rested unfilled' };
+      }
+
+      // `size` is what was asked for; `filledShares` is what the book gave.
+      pos.shares = orderResult.filledShares ?? orderResult.size;
       pos.entryPrice = orderResult.price;
+      if (orderResult.fillSource === 'matched-unverified') pos.unverifiedFill = true;
       markPosition(pos, orderResult.price);
       try { await syncClobBalance(); await refreshTelemetry(); } catch {}
-      log(`✅ LIVE BUY ${pending.symbol} ${pending.outcome.toUpperCase()} @ $${orderResult.price.toFixed(3)} · ${orderResult.size} sh · TP $${Number(plan.tpPrice || 0).toFixed(3)} · SL $${Number(plan.slPrice || 0).toFixed(3)}`, 'buy', {
+      log(`✅ LIVE BUY ${pending.symbol} ${pending.outcome.toUpperCase()} @ $${orderResult.price.toFixed(3)} · ${pos.shares} sh · TP $${Number(plan.tpPrice || 0).toFixed(3)} · SL $${Number(plan.slPrice || 0).toFixed(3)}`, 'buy', {
         market: pending.symbol, slug: pending.slug, outcome: pending.outcome,
         orderId: pos.orderId, amount: plan.sizeUsd, price: orderResult.price,
-        shares: orderResult.size, targetTp: plan.targetTp, tpPrice: plan.tpPrice, slPrice: plan.slPrice,
+        shares: pos.shares, requested: orderResult.size, targetTp: plan.targetTp, tpPrice: plan.tpPrice, slPrice: plan.slPrice,
       });
       traceLiveFill({
         type: 'bot_entry',
@@ -1322,6 +1342,16 @@ function buildPortfolio(readiness, mode) {
   const netPnl = baselineUsd != null
     ? Math.round((equity - baselineUsd) * 100) / 100
     : Math.round((liveStats.verifiedPnl + pmUnrealized) * 100) / 100;
+  // `baselineUsd` is the CURRENT RUN's starting point and is rebased by
+  // resetLiveData. `lifetimeBaseline` is the account's first observed cash and
+  // is never rebased, so a reset can hide a session but not the whole history —
+  // after the Aug-27 canary these read $275.16 and $285.29, and only the second
+  // one still knew about the -$10.13 (backlog 45).
+  const lifetimeRaw = mode === 'live' ? getLiveAccount(0)?.cash?.lifetimeBaseline : null;
+  const lifetimeBaseline = lifetimeRaw != null ? Number(lifetimeRaw) : null;
+  const lifetimePnl = lifetimeBaseline != null
+    ? Math.round((equity - lifetimeBaseline) * 100) / 100
+    : null;
   const limits = resolveDynamicLimits(cfg, cash);
 
   return {
@@ -1332,6 +1362,8 @@ function buildPortfolio(readiness, mode) {
     pmUnrealized: Math.round(pmUnrealized * 100) / 100,
     pmOpenRaw: pmPositions.length,
     baselineUsd,
+    lifetimeBaseline,
+    lifetimePnl,
     cashPnl,
     netPnl,
     sessionPnl: liveStats.verifiedPnl,
