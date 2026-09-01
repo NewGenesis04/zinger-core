@@ -2131,6 +2131,32 @@ export async function scan() {
       const depth = (cfg.useOrderBookBias !== false || hasOpenHere)
         ? await getDepthForMarket(market).catch(() => null)
         : null;
+      // Feed the alpha fusion's ORDER_FLOW vote. Without this the modality has
+      // no book to read and stays silent — collectSignals picks it up next pass.
+      //
+      // Only the REST path (`normalizeLevels`) aggregates depth, so `imbalance`
+      // and `spreadPct` are absent whenever the live WS book is serving
+      // (`clob.ts:171-179` returns bestBid/bestAsk/mid/spread and nothing else).
+      // spreadPct is derivable from what the WS book does carry; imbalance is
+      // not, and is left null rather than defaulted to a neutral 0 — `source`
+      // records which book answered so a silent half-vote is diagnosable.
+      const sym = String(market.symbol).toLowerCase();
+      if (depth && ['btc', 'eth'].includes(sym)) {
+        const side = depth.up ?? depth.down ?? {};
+        const mid = Number(side.mid) || 0;
+        const spread = Number(side.spread) || 0;
+        botState.booksForFusion = botState.booksForFusion || {};
+        botState.booksForFusion[sym] = {
+          bestBid: side.bestBid ?? null,
+          bestAsk: side.bestAsk ?? null,
+          imbalance: Number.isFinite(side.imbalance) ? side.imbalance : null,
+          spreadPct: Number.isFinite(side.spreadPct) && side.spreadPct > 0
+            ? side.spreadPct
+            : (mid > 0 && spread > 0 ? (spread / mid) * 100 : null),
+          source: side.source || 'clob-rest',
+          at: Date.now(),
+        };
+      }
       const remainingMs = market.endTime
         ? Math.max(0, market.endTime * 1000 - Date.now())
         : getRemainingMs();

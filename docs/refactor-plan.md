@@ -1439,6 +1439,216 @@ above the book and fail to fill precisely during a crash. Default slippage 25%,
 tick-rounded downward, falling back to the minimum tick when no mark exists.
 Covered by `tests/unit/invariants.orderRouting.test.ts`, including a check that
 no call site can omit `minPrice` again.
+### 36. The fork's alpha fusion reads a Bollinger field nothing emits ✅ FIXED
+
+`alphaFusion.ts:65` reads `analysis.bb?.pos ?? analysis.bbPosition ?? 0.5`.
+Neither key exists. `bollinger()` returns `{ upper, mid, lower, width }`
+(`signal.ts:61-66`) and `analyze()` attaches that object bare as `bb`
+(`signal.ts:220`); the band position is computed as a **local**, `bbPos`
+(`signal.ts:122`), used for scoring at `:166-169`, and never attached to the
+returned analysis.
+
+So `bbPos` falls back to `0.5`, `bbVote = (0.5 - 0.5) * 2 = 0`, and 40% of the
+`TA_MEANREV` modality is permanently zero — the modality still fires, on RSI
+alone, at full weight. This is not a porting artifact: the fork's own
+`signal.ts` has the same local-only `bbPos` (`:155`, scoring at `:199-202`), so
+the vote is dead upstream too.
+
+Fix is one line — return `bb: { ...bb, pos: bbPos }` — but it *changes live
+directional signal output*, so it is not an inline fix. Do it with step 3, when
+the fusion is actually wired in, and not before.
+
+
+**Fixed.** `signal.ts` now returns `bb: { ...bb, pos }` with the position
+clamped to [0,1] and a 0.5 fallback for a zero-width band (an unclamped
+Infinity would saturate TA_MEANREV to -1 on every bar, which is worse than the
+neutral fallback it replaced). `tests/unit/invariants.alphaFusion.test.ts`
+asserts every modality moves with its own input, so a disconnected feed shows up
+as a dead vote rather than a plausible one.
+
+The same sweep found two more dead modalities and fixed both: ORDER_FLOW had no
+book in the fusion context, and POSITIONING reads `funding.fundingRate` while
+`analyze()` renames it to `funding.rate` on the way out — so passing the
+analysis's own funding object would have zeroed the vote. `getSignalForBoth`
+now passes the raw `fetchFunding` result, which already has the right shape.
+
+### 37. The two-state jump model is asked a three-state question ✅ FIXED
+
+`ml/regime_jump.py` `label_regime()` emits exactly two labels, `'high-vol'` and
+`'trend'` (`:179-186`) — the model is `n_states=2` and the calm state is simply
+*named* `'trend'`. `regimeSignal.ts:16-17` says so explicitly: "It is not a
+trend/chop classifier and must not be read as one."
+
+The fork's governor honours that: `detectRegimeFromModel` returns
+`regime: null` on a calm reading and leaves trend-vs-chop to ADX, and their
+`regimeReachability.test.ts` pins it ("a two-state model must not answer the
+trend/chop question").
+
+Their `loadFusionContext` does the opposite (`signal.ts:18-19`):
+
+```js
+const regime = raw.regime === 'high-vol' ? 'highvol'
+  : raw.regime === 'trend' ? 'trend' : 'chop';
+```
+
+A calm reading therefore hands the fusion `regime: 'trend'`, which (a) pushes a
+`REGIME +0.4` "trend regime — ride" vote and (b) selects
+`REGIME_WEIGHTS.trend`, the momentum-heavy profile (`TA_MOMENTUM` 0.45 vs chop's
+0.20). Every non-high-vol minute is treated as a trending market. `'chop'` is
+unreachable whenever the ML side is emitting, and the fusion is biased long-
+momentum by default.
+
+Their own test does not catch this: it asserts `ctx.btc.regime === 'highvol'`
+for the high-vol case and pins nothing for the calm case. Blocks step 3.
+
+
+**Fixed.** `resolveFusionRegime(mlSignal, adxRegime)` in `signal.ts` is now the
+single owner of the fusion's regime label, and it gives the model exactly the
+one answer a two-state model can give:
+
+```
+high-vol reading      → 'highvol'   (model wins over any ADX opinion)
+calm reading          → defers, contributes nothing
+ADX 'arb-only'        → 'highvol'
+ADX 'trend-ride'      → 'trend'
+otherwise             → 'chop'
+```
+
+That is the same split `detectRegimeFromModel` uses on the governor side, so the
+two consumers can no longer disagree. All three fusion weight profiles stay
+reachable, and a calm reading still carries `realizedVol`/`calmBaseline` — the
+label and the vol tilt are different axes, and deferring one must not discard
+the other.
+
+The ADX regime handed to `loadFusionContext` is last pass's, by necessity: it is
+resolved in `collectSignals` before the fresh signals exist. That lag only
+affects trend-vs-chop weighting; risk-on/risk-off is the model's, read fresh.
+
+### 38. The integration plan omits the only writer of `regime_signal.json` ✅ FIXED
+
+Step 5 of the plan copies `ml/regime_jump.py` (the model) and
+`ml/regime_refresh.py`. The single producer of the store key both new consumers
+read is `ml/regime_emit.py` (`:24`, `STORE_KEY = "regime_signal.json"`), which
+is not in the plan.
+
+Follow the plan literally and `loadRegimeSignal()` returns `null` forever:
+the governor overlay never fires, `loadFusionContext()` returns `null`, and the
+fusion runs permanently on `regime: 'chop'` with no vol tilt — green tests, no
+errors, feature inert. Precisely the negRisk shape. Add `regime_emit.py` to
+step 5, and have step 5 land *before* steps 3–4 are trusted in production.
+
+
+**Fixed.** All three scripts ported: `ml/regime_jump.py`, `ml/regime_emit.py`
+(the missing writer) and `ml/regime_refresh.py`.
+
+Verified by running them, not by reading them. On synthetic data — 300 calm bars
+followed by 200 violent ones — the model puts 98.5% of the violent tail in the
+high-vol state and 0% of the calm segment, with one flip. That check exists
+because the cluster labels are assigned by ordering on downside deviation and
+would invert silently if that ordering ever flipped; `_assign`'s docstring warns
+about the same failure mode for its minimisation.
+
+`regime_emit.py` then ran end to end against the local cache and wrote
+`regime_signal.json` to the shared store.
+
+### 39. `resolveIdioVolTilt`'s two branches disagree about units ✅ FIXED
+
+`kelly.ts` `resolveIdioVolTilt`: the ratio branch divides `realizedVol` by
+`calmBaseline`, so units cancel and any consistent scale works (the fork's own
+fixture uses `realizedVol: 0.012, calmBaseline: 0.008` — decimals). The
+no-baseline branch instead compares `realizedVol` against the absolute
+constants `1.5` and `0.8`, which are percent-scaled — `atrPct` territory.
+
+Fed decimal vol with no baseline, the absolute branch returns `volScale: 1` for
+every input short of a 150% move, so it silently never de-risks. Fed percent
+vol *with* a baseline, the ratio branch is fine. The bug only appears in the
+no-baseline path, which is exactly the cold-start path.
+
+Pinned, not fixed, in `tests/unit/invariants.volTilt.test.ts`. Resolve it when
+step 3 decides what actually feeds `realizedVol`, and record the chosen unit in
+the JSDoc.
+
+
+**Fixed.** The absolute thresholds are now `VOL_ELEVATED = 0.008` and
+`VOL_EXTREME = 0.015` — the fork's `0.8` and `1.5` converted to the canonical
+unit rather than reinvented.
+
+The unit is now measured, not assumed. `regime_emit.py` derives both numbers
+from the model's own downside-deviation feature and stamps
+`volUnit: "decimal_return"`; a real run on cached BTC 1h produced
+`realizedVol 0.0133, calmBaseline 0.0121`, and the synthetic calm state sits at
+`0.0061`. All decimals, confirming the fork's constants were percent-scaled and
+could never trip.
+
+`resolveIdioVolTilt` also returns `unitSuspect: true` when either input is ≥ 0.5,
+since a 50%-per-bar downside deviation is a unit error rather than a market. It
+is flagged, not corrected — guessing at the caller's scale is how the mismatch
+got in, and the flag lands in the trade record where it is diagnosable.
+
+### 40. The vol tilt is computed and discarded on the cold-start path ✅ FIXED
+
+`computeKellySize` resolves `volTilt` before the `tradeCount < 10` early
+return but the `confidence_scaling` branch does not apply it. So the path the
+live canary is on right now — fewer than 10 recorded trades — sizes exactly as
+if the tilt did not exist, while the mature path de-risks.
+
+Ported faithfully from the fork rather than fixed, because applying it there
+changes live sizing beyond what the integration plan asked for. Pinned by a test
+so the behaviour is deliberate and visible. If the tilt is meant to protect the
+canary, this is the first thing to change.
+
+
+**Fixed.** The `confidence_scaling` branch now applies `volTilt.volScale`.
+
+It shrinks the discretionary part *above* `minUsd` rather than the whole figure:
+scaling `size` outright and then flooring at `minUsd` would make the tilt a
+no-op for small accounts and put a step at the floor. This stays continuous and
+can never size below the exchange minimum — a guardrail that produces an
+unfillable order is not a guardrail. Pinned by a test at `realizedVol` up to 50.
+
+The identity property still holds on this path: with no vol reading, cold-start
+sizing is unchanged.
+
+---
+
+
+### 41. The live WS order book carries no depth aggregate
+
+`getDepthForMarket` (`clob.ts:165`) has two paths. The REST path returns
+`normalizeLevels(...)`, which computes `imbalance` and `spreadPct` from ten
+levels. The WS path (`clob.ts:171-179`) returns only
+`{ bestBid, bestAsk, mid, spread, source }` — and it is preferred whenever the
+socket book is fresh, which is the common case.
+
+So the alpha fusion's ORDER_FLOW vote reads `imbalance ?? 0` and votes zero
+exactly when the data is most current. `spreadPct` is derivable from what the WS
+book does carry and is now computed in the `booksForFusion` block
+(`bot.ts:2131`); `imbalance` is not derivable there and is left `null` rather
+than defaulted to a neutral `0`, with `source` recorded so a half-strength vote
+is visible instead of silent.
+
+The real fix is to aggregate depth in the WS book itself, which means keeping
+the level arrays the socket already delivers rather than collapsing them to top
+of book. Not done here — it touches the live price path that stop-losses mark
+against, which is out of scope for the fusion port.
+
+### 42. Alpha fusion replaces the numbers every directional gate reads
+
+Not a defect — the blast radius, recorded so it is not rediscovered.
+
+`applyAlphaFusion` does not annotate the analysis; it overwrites `direction`,
+`confidence`, `score` and `edge` (`alphaFusion.ts:163-177`). Every downstream
+entry gate, Kelly size and governor input therefore changes the moment fusion is
+wired in, and `getSignalForBoth` calls it unconditionally in the fork.
+
+Mitigated with a kill switch rather than a flag day: `cfg.useAlphaFusion === false`
+turns it off from config with no redeploy. It defaults **on**, because that is
+what steps 3–4 were asked to deliver. The switch rides on the fusion context
+because that is the only channel `signal.ts` already reads — adding a config
+import there would have created a cycle.
+
+Watch paper trading for a shift in entry rate and average confidence before this
+reaches live. That comparison is the point of keeping paper running.
 
 ---
 

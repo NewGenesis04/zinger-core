@@ -2,6 +2,85 @@
 const BINANCE = 'https://api.binance.com';
 const BINANCE_FUTURES = 'https://fapi.binance.com';
 
+import { applyAlphaFusion } from './alphaFusion.js';
+import { isHighVol, loadRegimeSignal } from './regimeSignal.js';
+
+/**
+ * Which regime label the alpha fusion should run under.
+ *
+ * Two sources can name one, and they see different axes:
+ *
+ *   jump model (ml/regime_emit.py)   ADX/ATR heuristic (ai/governor.js)
+ *   n_states=2 — high-vol or not     trend-ride / scalp / arb-only
+ *
+ * The model's calm state is *spelled* 'trend', but that is a state name, not a
+ * verdict: a two-state volatility model cannot see trend versus chop, and
+ * `regimeSignal.ts` says so outright. The fork's wiring mapped that label
+ * straight through, so every calm minute selected `REGIME_WEIGHTS.trend`
+ * (momentum 0.45 vs chop's 0.20) and added a +0.4 "ride" vote — leaving 'chop'
+ * unreachable whenever the ML side was emitting (backlog 37).
+ *
+ * So the model owns exactly one answer, high-vol, and defers the rest to ADX —
+ * the same split `detectRegimeFromModel` uses on the governor side.
+ */
+export function resolveFusionRegime(mlSignal, adxRegime = null) {
+  if (isHighVol(mlSignal)) return 'highvol';
+  if (adxRegime === 'arb-only') return 'highvol';
+  if (adxRegime === 'trend-ride') return 'trend';
+  return 'chop';
+}
+
+/**
+ * Pull jump-model regime + idio-vol context from the shared store (see
+ * `regimeSignal.ts`, the single owner of that reading) so the alpha fusion can
+ * de-risk during high-vol regimes. Called by the scan each pass.
+ * Falls back silently — fusion still works with base TA alone.
+ */
+export async function loadFusionContext({ adxRegime = null } = {}) {
+  try {
+    const raw = loadRegimeSignal();
+    // Nothing to say: no live model reading and no heuristic to fall back on.
+    if (!raw && !adxRegime) return null;
+
+    // The vol tilt is a separate axis from the regime label — it needs raw
+    // magnitudes, which only the model carries, and it stays meaningful on a
+    // calm reading. `highVol` is derived here rather than trusted off disk so
+    // there is one definition of the label.
+    const regimeSignal = raw
+      ? { highVol: isHighVol(raw), realizedVol: raw.realizedVol, calmBaseline: raw.calmBaseline }
+      : null;
+    const btc = { regime: resolveFusionRegime(raw, adxRegime), regimeSignal };
+    const eth = { ...btc };
+    globalThis.__zingerFusionCtx = { ...(globalThis.__zingerFusionCtx || {}), btc, eth };
+    return { btc, eth };
+  } catch { /* fusion context is best-effort; base TA still works */ }
+  return null;
+}
+
+/** Merge per-pass context (order book, funding, kill switch) into the fusion ctx. */
+export function refreshFusionContext(partialCtx) {
+  if (!partialCtx || typeof partialCtx !== 'object') return;
+  const prev = globalThis.__zingerFusionCtx || {};
+  const { enabled, ...perAsset } = partialCtx;
+  globalThis.__zingerFusionCtx = {
+    ...prev,
+    ...(enabled === undefined ? {} : { enabled }),
+    btc: { ...(prev.btc || {}), ...(perAsset.btc || {}) },
+    eth: { ...(prev.eth || {}), ...(perAsset.eth || {}) },
+  };
+}
+
+/**
+ * Fusion rewrites `direction`, `confidence`, `score` and `edge` on the analysis,
+ * so it changes every directional entry decision. `cfg.useAlphaFusion === false`
+ * turns it off from config without a redeploy; the switch lives on the context
+ * because that is the only channel `signal.ts` already reads.
+ */
+function fuseIfEnabled(analysis, ctx) {
+  if (!analysis || ctx?.enabled === false) return analysis;
+  return applyAlphaFusion(analysis, ctx || {});
+}
+
 export async function fetchCandles(symbol = 'BTCUSDT', interval = '1m', limit = 200) {
   const url = `${BINANCE}/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
   const res = await fetch(url, { signal: AbortSignal.timeout(5000) });
@@ -217,7 +296,14 @@ export function analyze(candles, extras = {}) {
     edge: Math.round(edge * 100) / 100,
     rsi: Math.round(rsiVal * 10) / 10,
     macd: macdData,
-    bb,
+    bb: {
+      ...bb,
+      // Band position, exported so the fusion's TA_MEANREV vote is not stuck at
+      // the 0.5 fallback — it was computed here and never attached (backlog 36).
+      // Guarded: a zero-width band divides by zero, and an unclamped position
+      // outside [0,1] would saturate the vote on a single wick.
+      pos: Number.isFinite(bbPos) ? Math.round(Math.max(0, Math.min(1, bbPos)) * 1000) / 1000 : 0.5,
+    },
     adx: adxData,
     momentum: mom,
     volatility: { atr: Math.round(atr * 100) / 100, atrPct: Math.round(atrPct * 100) / 100 },
@@ -243,7 +329,14 @@ export async function getSignal(asset = 'BTC', extras = {}) {
     fetchFunding(symbol),
   ]);
   if (!candles) return null;
-  return analyze(candles, { ...extras, funding });
+  const analysis = analyze(candles, { ...extras, funding });
+  const ctx = extras.fusionCtx || globalThis.__zingerFusionCtx?.[asset === 'BTC' ? 'btc' : 'eth'] || {};
+  return fuseIfEnabled(analysis, {
+    ...ctx,
+    funding,
+    isEth: asset !== 'BTC',
+    enabled: globalThis.__zingerFusionCtx?.enabled,
+  });
 }
 
 export async function getSignalForBoth() {
@@ -253,13 +346,32 @@ export async function getSignalForBoth() {
     fetchFunding('BTCUSDT'),
     fetchFunding('ETHUSDT'),
   ]);
-  const btc = btcCandles ? analyze(btcCandles, { funding: btcFund }) : null;
-  const eth = ethCandles
+  const btcBase = btcCandles ? analyze(btcCandles, { funding: btcFund }) : null;
+  const ethBase = ethCandles
     ? analyze(ethCandles, {
       funding: ethFund,
-      leadMom1: btc?.momentum?.m1 ?? null,
+      leadMom1: btcBase?.momentum?.m1 ?? null,
     })
     : null;
+
+  const fusionCtx = globalThis.__zingerFusionCtx || {};
+  // `funding` is passed explicitly: the fusion's POSITIONING vote reads
+  // `funding.fundingRate`, while `analyze()` renames it to `funding.rate` on the
+  // way out — so reading it off the analysis would zero the vote. `fetchFunding`
+  // returns { fundingRate, premium, ... }, which is the shape fuseAlpha wants.
+  const btc = fuseIfEnabled(btcBase, {
+    ...(fusionCtx.btc || {}),
+    funding: btcFund,
+    isEth: false,
+    enabled: fusionCtx.enabled,
+  });
+  const eth = fuseIfEnabled(ethBase, {
+    ...(fusionCtx.eth || {}),
+    funding: ethFund,
+    leadMom1: btcBase?.momentum?.m1 ?? null,
+    isEth: true,
+    enabled: fusionCtx.enabled,
+  });
   return { btc, eth };
 }
 

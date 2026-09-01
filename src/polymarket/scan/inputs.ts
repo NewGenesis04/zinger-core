@@ -1,5 +1,7 @@
 // @ts-nocheck
 import { POLY_WINDOW_SECONDS } from '../config.js';
+import { loadFusionContext, refreshFusionContext } from '../signal.js';
+import { detectRegime } from '../../ai/governor.js';
 
 export async function fetchSpotTicker(symbol: string) {
   try {
@@ -50,6 +52,22 @@ export async function collectSignals({
   log,
 }) {
   if (!cfg?.useSignals) return botState.signals || {};
+
+  // Alpha fusion context must be in place before the signals are analyzed: the
+  // jump-model regime comes off disk, the order book from last pass.
+  //
+  // The ADX regime is last pass's, by necessity — this runs before the fresh
+  // signals exist. That is the same lag the governor already accepts, and the
+  // heuristic only decides trend-vs-chop weighting, never risk-on/risk-off,
+  // which the model owns and reads fresh (see resolveFusionRegime).
+  await loadFusionContext({
+    adxRegime: botState.signals ? detectRegime({ signals: botState.signals }).regime : null,
+  });
+  refreshFusionContext({
+    enabled: cfg.useAlphaFusion !== false,
+    btc: { book: botState.booksForFusion?.btc || null },
+    eth: { book: botState.booksForFusion?.eth || null },
+  });
 
   // Outage-resilient: network timeouts must not abort scan pass
   const freshSignals = typeof getSignalForBoth === 'function'
