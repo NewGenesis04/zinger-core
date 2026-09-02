@@ -1,4 +1,3 @@
-// @ts-nocheck
 import { loadFileOrStore, saveFileOrStore } from './sqliteStore.js';
 import { dataPath } from './dataDir.js';
 
@@ -177,11 +176,16 @@ export function runAudit({
       `Portfolio cash $${Number(cash).toFixed(2)} ≠ CLOB $${clobCash.toFixed(2)} — sync live account`,
     );
   }
-  // Soft warning if baseline is wildly stale vs current CLOB (deposit/withdraw without rebase)
+  // Baseline diverging from the lifetime figure means one of two opposite
+  // things, and the direction says which. Reporting both as "rebase after
+  // deposits" is how a real drawdown got filed as a bookkeeping chore: after
+  // the Aug-27 canary the baseline was rebased from $285.29 to $275.16, so the
+  // header read $0.00 net while $10.13 had actually been lost.
   if (!isPaper && baseline != null && lifetimeBaseline != null && Math.abs(baseline - lifetimeBaseline) > 5) {
-    notes.push(
-      `Baseline $${Number(baseline).toFixed(2)} vs live lifetime $${lifetimeBaseline.toFixed(2)} — rebase baseline after deposits`,
-    );
+    const delta = Math.round((baseline - lifetimeBaseline) * 100) / 100;
+    notes.push(delta < 0
+      ? `Baseline $${Number(baseline).toFixed(2)} is $${Math.abs(delta).toFixed(2)} BELOW lifetime $${lifetimeBaseline.toFixed(2)} — a past drawdown was rebased over and is not in net PnL; lifetime PnL is the honest figure`
+      : `Baseline $${Number(baseline).toFixed(2)} is $${delta.toFixed(2)} above lifetime $${lifetimeBaseline.toFixed(2)} — rebase the lifetime baseline after a deposit`);
   }
 
   // Paper ledger: equity ≡ cash + open marks; net ≡ equity − initial (by construction).
@@ -211,6 +215,15 @@ export function runAudit({
     notes,
     mode,
     baselineUsd: baseline,
+    // Immutable starting capital, never rebased by resetLiveData — so a reset
+    // can hide the session, but never the account's whole history.
+    lifetimeBaseline,
+    lifetimePnl: (() => {
+      const eq = Number(portfolio?.equity ?? cash);
+      return lifetimeBaseline != null && Number.isFinite(eq)
+        ? Math.round((eq - lifetimeBaseline) * 100) / 100
+        : null;
+    })(),
     cashPnl: isPaper ? (portfolio?.netPnl ?? null) : cashPnl,
     botPnlVerified: liveStats.verifiedPnl,
     botPnlAll: liveStats.totalPnl,

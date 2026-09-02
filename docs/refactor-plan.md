@@ -1338,6 +1338,43 @@ dollars to shares. The SDK ships full types (`UserMarketOrderV2`,
 `OrderResponse`), so the checking is available and simply switched off. This is
 the module where a units error costs money directly.
 
+
+
+**Measured 2026-09-01**, by removing the directive file by file and counting
+what `tsc` then reports. 68 of 72 `src` files carry `@ts-nocheck`; the live path
+breaks down as:
+
+| file | lines | hidden errors |
+|---|---|---|
+| `audit.ts` | 268 | **0** |
+| `alphaFusion.ts` | 177 | **0** |
+| `regimeSignal.ts` | 50 | **0** |
+| `kelly.ts` | 406 | 6 |
+| `liveAccount.ts` | 363 | 7 |
+| `trade.ts` | 518 | 12 |
+| `signal.ts` | 380 | 15 |
+| `bot.ts` | 3926 | 71 |
+
+So this was never one problem. The three zero-error files had the directive for
+no reason at all — **removed, and the project still reports zero errors.**
+
+`trade.ts`'s twelve are a single cause: `captureClobCall<T>` infers `T` as
+`unknown` from the untyped SDK call, so every subsequent `.status`,
+`.takingAmount`, `.makingAmount` read is an error. Typing the CLOB response —
+the shape is already declared in `@polymarket/clob-client-v2/dist/types/clob.d.ts`
+— should clear most of them at once and would put the *order-signing* file under
+the compiler. That is the highest-value remaining piece and is a contained job.
+
+`bot.ts` at 3926 lines and 71 errors is the only genuine project, and it is the
+same file D4's position manager is meant to break up. Doing both at once is the
+efficient order; doing the type pass first would mean typing code that is about
+to move.
+
+**Why this matters concretely:** while fixing item 45, `cancelOrder` was used in
+`bot.ts` without being imported. `npx tsc --noEmit -p .` reported nothing. That
+is a `ReferenceError` in the live entry path, on the branch that runs when an
+order rests — caught only because a test asserted the import exists.
+
 ### 33. The CLOB order-response wire format is inferred, not verified
 
 `OrderResponse.makingAmount` / `takingAmount` are typed bare `string` in
@@ -1736,7 +1773,7 @@ Related:
 (the unwind sell was unpriced until 2026-09-01) — all three are the same
 orphan-leg blind spot seen from different sides.
 
-### 44. A live rollback books the entry price, not the fill price
+### 44. A live rollback books the entry price, not the fill price ✅ FIXED
 
 `unwindLeg` sets `pos.exitPrice = price` where `price = pos.entryPrice`, and
 `pos.pnl = -(entryFee + exitFee)` — on the success path too. So a live unwind
@@ -1752,8 +1789,96 @@ now captured (`clobReceipts.ts`), so the fill price is available — it is simpl
 not read. Until it is, every live rollback understates its loss, and the
 `realizedFor()` sum in `getArbPackageMetrics` inherits the error.
 
-Not fixed here: it changes live PnL accounting, which is beyond the scope of the
-backlog 34 fix it was found beside. Related: [[34]], [[43]].
+**Fixed.** `readSellFill` (`trade.ts`) derives the realised price from the
+receipt as `takingAmount / makingAmount`. That is a **ratio**, so it is
+scale-invariant — correct whether the wire units are raw or 1e6-scaled, and
+therefore not blocked on backlog 33. Absolute share and proceeds figures do need
+the scale, so they are resolved against the requested size and returned as
+`null` when neither reading matches, rather than guessed.
+
+`placeMarketSell` now returns `fillPrice`, `filledShares`, `proceedsUsd` and
+`fillSource` alongside `floorPrice`. Note the trap: its existing `price` field
+is the **slippage floor it signed**, not the fill — booking that would overstate
+the loss as badly as the entry price understated it. `unwindLeg` books
+`sellRes.fillPrice`, falls back to the entry price only when no receipt is
+usable, and marks that case `exitPriceUnverified` instead of presenting a
+fabricated break-even as a measurement. PnL is now
+`(exitPx - entryPx) * shares - fees`.
+
+Related: [[34]], [[43]], [[33]].
+
+### 45. `assertOrderAccepted` treats an orderID as a fill ✅ FIXED (directional)
+
+`assertOrderAccepted` (`trade.ts:139`) passes on orderID presence alone, and the
+CLOB returns an orderID for a **resting** GTC order exactly as it does for a
+matched one. That read is what recorded the 2026-08-28 UP leg as filled while it
+sat unmatched on the book, and it still reached directional entries, which keep
+GTC deliberately (a resting bid is a missed trade, not a naked position — but a
+phantom position is neither).
+
+**Fixed** with `readGtcFill`, which decides quantitatively rather than by status
+string: the exact status vocabulary is still an open question in the research
+doc, whereas "no collateral moved" is unambiguous in any vocabulary.
+`makingAmount`/`takingAmount` both zero, or an empty `tradeIDs`, means resting.
+A matched order whose size cannot be resolved against the request is reported
+`filledShares: null` — never the requested size.
+
+The live entry path now refuses to open a position on a resting order, cancels
+it (an untracked resting bid can still fill later, unattended), and fails the
+pending trade. Filled positions record `orderResult.filledShares`, not the size
+that was asked for.
+
+`assertOrderAccepted` itself is unchanged and still passes on orderID presence.
+That is deliberate: it is the shared gate for every order path, and tightening
+it is a separate change. The fill question is now answered by the caller, which
+is the layer that knows what a fill should look like for its order type.
+
+Found while fixing this: `cancelOrder` was used in `bot.ts` without being
+imported, and `npx tsc --noEmit` reported nothing, because `bot.ts` carries
+`// @ts-nocheck` ([[32]]). A runtime crash in the live entry path, invisible to
+the type checker. There is now a test asserting the import exists.
+
+### 46. A reset rebases over a loss and erases live P&L ✅ FIXED
+
+`resetLiveData` calls `saveBaseline(cash)`, and `netPnl = equity - baselineUsd`.
+So after the 2026-08-28 20:04 reset the header read **$0.00 net** while the
+account had really lost **$10.13** — baseline and cash were both $275.16. The
+audit's own note called it "rebase baseline after deposits"; there had been no
+deposit.
+
+**Fixed** by surfacing the number that already existed but was never shown.
+`liveAccount.cash.lifetimeBaseline` is written once, on first observed cash
+(`liveAccount.ts:170`), and `resetLiveData` never touches it — it still holds
+$285.29. `buildPortfolio` now reports `lifetimeBaseline` and
+`lifetimePnl = equity - lifetimeBaseline` beside the session `netPnl`, so a
+reset can hide a session but not the account's history.
+
+The audit note now reads the *direction* of the divergence: below lifetime means
+a drawdown was rebased over and lifetime PnL is the honest figure; above means a
+deposit needs rebasing. Filing a loss as a bookkeeping chore is how it stayed
+invisible for four days.
+
+Not addressed: `lifetimeBaseline` is first-observed cash, not a deposit ledger.
+A second deposit still requires a manual rebase, and there is no running
+record of deposits and withdrawals. That is the real fix, and it is larger.
+
+Also not addressed — the number is computed but never displayed. The
+`cashAudit` object in `bot.ts:1534` is an explicit field picker and does not
+copy `lifetimeBaseline` / `lifetimePnl`, so neither reaches `/api/poly/state`
+(`server.ts:692`) or the UI; nothing reads `portfolio.lifetimePnl`. What *does*
+surface is the audit note, via `cashAudit.notes` → the "Live cash audit" card
+on the **History** tab (`PolyDashboard.tsx:2290`, first 4 notes).
+
+A KPI tile was considered and rejected: a value labelled "Lifetime PnL" reads as
+ground truth and goes silently wrong on the next deposit, since the field is
+write-once. The note is phrased as a caveat and degrades honestly. Promote it
+once a deposit ledger exists.
+
+Related display bug, deferred by the operator (2026-09-01): the Account nav
+badge counts `notes.length + issues.length` (`PolyDashboard.tsx:1194`) but
+`AccountPage.tsx:220` renders `issues` only. A note therefore increments a badge
+on a tab that will not show it. ~8 lines to mirror the `issues` block; no logic
+change.
 
 ---
 

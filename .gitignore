@@ -52,6 +52,7 @@ deno.lock
 *.local.js
 docs/research/
 docs/*.md
+docs/*.html
 docs/*.png
 docs/*.excalidraw
 CLAUDE.md

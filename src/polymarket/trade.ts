@@ -147,6 +147,49 @@ function assertOrderAccepted(result, context) {
   return id;
 }
 
+/**
+ * Did a GTC limit order actually match, or is it resting on the book?
+ *
+ * `assertOrderAccepted` passes on orderID presence alone, and the CLOB returns
+ * an orderID for a resting order just as it does for a matched one. That is how
+ * the 2026-08-28 arb leg was recorded as filled while it sat unmatched as a bid
+ * — and the same read still applies to directional entries, which use GTC
+ * deliberately (a resting bid is a missed trade, not a naked position).
+ *
+ * Detection is quantitative, not status-string based: the exact status vocabulary
+ * is still an open question in the research doc, but "no collateral moved" is
+ * unambiguous in any vocabulary. `tradeIDs` is the SDK's own documented signal
+ * ("IDs of the trades created when the order matched"), used as corroboration.
+ *
+ * BUY:  makingAmount = collateral paid, takingAmount = tokens received.
+ * SELL: makingAmount = tokens given up, takingAmount = collateral received.
+ */
+export function readGtcFill(result, side, requestedSize) {
+  const maker = Number(result?.makingAmount);
+  const taker = Number(result?.takingAmount);
+  const tradeCount = Array.isArray(result?.tradeIDs) ? result.tradeIDs.length : null;
+  const moved = Number.isFinite(maker) && maker > 0 && Number.isFinite(taker) && taker > 0;
+  const matched = moved || (tradeCount != null && tradeCount > 0);
+
+  if (!matched) {
+    return { filledShares: 0, resting: true, fillSource: tradeCount === 0 || moved === false ? 'no-fill' : 'unknown' };
+  }
+
+  const rawShares = String(side).toLowerCase() === 'buy' ? taker : maker;
+  const want = Number(requestedSize);
+  const tolerance = Math.max(0.05, Math.abs(want) * 0.02);
+  const shares = [rawShares, rawShares / 1e6]
+    .find((c) => Number.isFinite(want) && want > 0 && Math.abs(c - want) <= tolerance) ?? null;
+
+  return {
+    // A matched order whose size cannot be resolved is reported as unverified
+    // rather than assumed complete — null, never the requested size.
+    filledShares: shares,
+    resting: false,
+    fillSource: shares == null ? 'matched-unverified' : 'receipt',
+  };
+}
+
 export async function placeOrder({ tokenId, side, amountUsd, price, negRisk = false, tickSize = '0.01', minShares = 5 }) {
   const client = await getProxyTradingClient();
   const px = roundPrice(price, Number(tickSize));
@@ -163,12 +206,24 @@ export async function placeOrder({ tokenId, side, amountUsd, price, negRisk = fa
   );
 
   const id = assertOrderAccepted(result, `CLOB ${side} ${size}sh @ ${px}`);
+  const fill = readGtcFill(result, side, size);
+  captureReceipt({
+    fn: 'placeOrder/verified',
+    phase: 'response',
+    request: { tokenId: String(tokenId), side, price: px, size },
+    raw: result,
+    derived: { orderId: id, requestedSize: size, ...fill, statusString: result?.status ?? null },
+  });
 
   return {
     id,
     order: result,
     price: px,
+    // `size` is what was ASKED for. `filledShares` is what the book gave, and
+    // `resting` says the order is live on the book with nothing matched — an
+    // orderID alone never meant shares in hand (backlog: assertOrderAccepted).
     size,
+    ...fill,
     side: orderSide,
     status: result?.status || null,
   };
@@ -356,6 +411,41 @@ export function sellFloor(mark, { tickSize = 0.01, slippagePct = 0.25 } = {}) {
   return Math.max(tick, Math.floor(floor / tick) * tick);
 }
 
+/**
+ * The realised price of a market SELL, read from its receipt.
+ *
+ * For a SELL the CLOB reports `makingAmount` = tokens given up and
+ * `takingAmount` = collateral received. Their **ratio** is the fill price, and
+ * a ratio is scale-invariant: it is correct whether those fields are raw units
+ * or 1e6-scaled, so this does not depend on backlog 33 being settled.
+ *
+ * Absolute share/proceeds figures do need the scale, so they are resolved
+ * against the share count we asked for and returned only when one reading
+ * matches — the same approach `verifyFilledShares` takes, and for the same
+ * reason: guessing the scale on a live sell is how ledgers drift.
+ */
+export function readSellFill(result, requestedShares) {
+  const maker = Number(result?.makingAmount);
+  const taker = Number(result?.takingAmount);
+  const none = { fillPrice: null, filledShares: null, proceedsUsd: null, fillSource: 'unavailable' };
+  if (!(Number.isFinite(maker) && maker > 0 && Number.isFinite(taker) && taker > 0)) return none;
+
+  const fillPrice = Math.round((taker / maker) * 1e6) / 1e6;
+  if (!(fillPrice > 0) || fillPrice > 1) return { ...none, fillPrice: null, fillSource: 'implausible' };
+
+  const want = Number(requestedShares);
+  const tolerance = Math.max(0.05, Math.abs(want) * 0.02);
+  const candidates = [maker, maker / 1e6];
+  const shares = candidates.find((c) => Number.isFinite(want) && want > 0 && Math.abs(c - want) <= tolerance) ?? null;
+
+  return {
+    fillPrice,
+    filledShares: shares,
+    proceedsUsd: shares == null ? null : Math.round(shares * fillPrice * 100) / 100,
+    fillSource: 'receipt',
+  };
+}
+
 export async function placeMarketSell({
   tokenId, shares, minPrice, negRisk = false, tickSize = '0.01',
 }) {
@@ -379,11 +469,25 @@ export async function placeMarketSell({
     ),
   );
   const id = assertOrderAccepted(result, `CLOB market sell ${shares}sh @>=${px}`);
+  const fill = readSellFill(result, shares);
+  captureReceipt({
+    fn: 'placeMarketSell/verified',
+    phase: 'response',
+    request: { tokenId: String(tokenId), shares, minPrice: px },
+    raw: result,
+    derived: { orderId: id, ...fill, floorPrice: px },
+  });
   return {
     id,
     order: result,
     size: shares,
+    // `price` is the slippage FLOOR we signed, not what the book paid. Callers
+    // booking a realised exit must use `fillPrice` — recording the floor would
+    // overstate the loss exactly as copying the entry price understated it
+    // (backlog 44).
     price: px,
+    floorPrice: px,
+    ...fill,
     status: result?.status || null,
   };
 }

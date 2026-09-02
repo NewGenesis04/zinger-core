@@ -412,12 +412,10 @@ async function unwindLeg({ outcome, pkg, market, mode, cfg, botState, log, adjus
 
   const shares = Number(pos.shares || 0);
   const price = Number(pos.entryPrice || 0);
+  // The price the close is actually booked at. Stays null until a live receipt
+  // says otherwise; paper has no receipt and models the refund at entry.
+  let realisedExit = null;
   const feeOn = cfg?.simulateClobFees !== false;
-  // 'arb_rollback' is deliberately not in FEE_FREE_EXIT_REASONS — unwinding is
-  // a real mid-window sell, unlike settlement/redemption which is fee-free.
-  const pack = closeProceedsWithFee(shares, price, cfg?.feeCategory || 'crypto', 'arb_rollback');
-  const exitFee = feeOn ? pack.fee : 0;
-  const entryFee = Number(pos.entryFee || 0);
 
   // Live Mode: Execute an immediate Market Sell on CLOB so capital is returned to cash
   if (mode === 'live' && pos.tokenId) {
@@ -434,8 +432,21 @@ async function unwindLeg({ outcome, pkg, market, mode, cfg, botState, log, adjus
         tickSize: pos.tickSize || '0.01',
       });
       pos.unwindAttempts = 0;
+      // Backlog 44. The book pays what it pays; copying the entry price here
+      // booked every live rollback as break-even-minus-fees. `fillPrice` comes
+      // from the receipt (`readSellFill`); `sellRes.price` is the slippage
+      // floor we signed and would overstate the loss just as badly.
+      if (Number(sellRes?.fillPrice) > 0) {
+        realisedExit = Number(sellRes.fillPrice);
+        pos.exitFillSource = 'receipt';
+      } else {
+        // No usable receipt: fall back to the entry price, but say so rather
+        // than presenting a fabricated break-even as a measurement.
+        pos.exitFillSource = 'unverified';
+        pos.exitPriceUnverified = true;
+      }
       if (log) {
-        log(`⚡ LIVE ARB UNWIND: Sold ${shares}sh back to CLOB cash (order: ${sellRes?.id || 'ok'})`, 'system', { orderId: sellRes?.id });
+        log(`⚡ LIVE ARB UNWIND: Sold ${shares}sh back to CLOB cash @ ${realisedExit != null ? `$${realisedExit.toFixed(4)}` : 'unverified price'} (order: ${sellRes?.id || 'ok'})`, 'system', { orderId: sellRes?.id, fillPrice: sellRes?.fillPrice ?? null, floorPrice: sellRes?.floorPrice ?? null });
       }
     } catch (err) {
       // Backlog 34. The sell did not happen, so the shares are still held and
@@ -465,12 +476,22 @@ async function unwindLeg({ outcome, pkg, market, mode, cfg, botState, log, adjus
     }
   }
 
+  // Priced from the receipt when there is one, from the entry otherwise.
+  // 'arb_rollback' is deliberately not in FEE_FREE_EXIT_REASONS — unwinding is
+  // a real mid-window sell, unlike settlement/redemption which is fee-free.
+  const exitPx = realisedExit != null ? realisedExit : price;
+  const pack = closeProceedsWithFee(shares, exitPx, cfg?.feeCategory || 'crypto', 'arb_rollback');
+  const exitFee = feeOn ? pack.fee : 0;
+  const entryFee = Number(pos.entryFee || 0);
+
   pos.closed = true;
-  pos.exitPrice = price;
+  pos.exitPrice = exitPx;
   pos.exitReason = 'arb_rollback';
   pos.exitFee = exitFee;
   pos.feesPaid = Math.round((entryFee + exitFee) * 1e5) / 1e5;
-  pos.pnl = Math.round(-(entryFee + exitFee) * 100) / 100;
+  // The spread between entry and exit is a real loss, not a rounding artefact:
+  // 26 shares bought at $0.33 and sold at $0.32 is -$0.26 before either fee.
+  pos.pnl = Math.round(((exitPx - price) * shares - entryFee - exitFee) * 100) / 100;
 
   if (mode === 'paper' && typeof adjustPaperCash === 'function') {
     const refund = Math.round((pack.premium - exitFee) * 100) / 100;

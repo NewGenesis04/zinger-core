@@ -1,4 +1,3 @@
-// @ts-nocheck
 /**
  * Alpha fusion engine — combines multiple independent alpha modalities into a
  * single calibrated signal for the 5m–1h BTC/ETH up/down windows.

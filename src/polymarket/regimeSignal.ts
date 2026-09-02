@@ -1,4 +1,3 @@
-// @ts-nocheck
 /**
  * The one owner of the jump-model regime signal.
  *
