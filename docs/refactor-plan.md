@@ -2102,8 +2102,8 @@ later nicety.
 
 | Step | Content | Gate |
 |---|---|---|
-| 0 | measure M and S for (c); size the buffer against (iv) | operator sign-off |
-| A | `events.ts` scaffolding: new union members, payload interfaces under rule (iii), `formatEventAsLog` cases | one paper cycle, events inert |
+| 0 | ~~measure M and S~~ — done 2026-09-04, see *Buffer sizing* below; **not a gate**, the cap is an env var tuned against (d)'s gap signal | operator sign-off on (i)-(v) |
+| A | ✅ **done 2026-09-04.** Four new union members, a payload interface per event type under rule (iii), `formatEventAsLog` cases for all four plus `config.attributed` (which had none and fell through to raw JSON), `TELEMETRY_SCHEMA_VERSION` 1 → 2. `EventType` is now `keyof TelemetryEventPayloads`, so the union cannot drift from the registry. **`// @ts-nocheck` removed** — the file is type-checked, without which the interfaces would be decoration (finding e). Transitional `LegacyMeta` index signature on the payloads `log()` still feeds, documented to come off per type as each tee takes ownership in C-E. | `tsc` clean · 360/360 tests · smoke run of all four new types; runtime inert, nothing emits them yet |
 | B | SSE stream + `after=` cursor with gap signal (d) — transport lands before the volume it must carry | engine connects and receives today's `scan.cycle` / `package.settlement` traffic |
 | C | receipts + trade + exit — exit tee at `closePosition` (b); `log()` mapping collapsed per (i) | one nightly paper cycle |
 | D | cash + reset + system | one nightly paper cycle |
@@ -2115,6 +2115,59 @@ New `EventType` members: `trade.execution.receipt`, `account.cash`,
 (`events.ts:4`, currently `1`) once, at step A, not per PR.
 
 The book-widen tee (f) is dropped from step E and folded into item 41.
+
+#### Buffer sizing — measured 2026-09-04, no longer a gate
+
+Step 0 was originally written to block on measuring M and S. It does not: an
+upper bound is all a cap needs, and the VPS samples give one.
+
+**M ≤ 4** — BTC/ETH × 5m/15m. **S ≤ 0.81 scans/sec** — measured on the live
+instance (26 scans in 32.166 s) while discovery was active but zero markets were
+tradable, so it is a ceiling; scan rate only falls once each scan does per-market
+price and depth fetches. Therefore:
+
+```
+2 · M · S  ≤  2 × 4 × 0.81  =  6.5 decision events/sec
+```
+
+Per-event retained heap, measured with `--expose-gc` over 30k live objects on
+Node v24.19.0:
+
+| Event | JSON | Retained heap | Ratio |
+|---|---|---|---|
+| `trade.decision` (structured reasons, rule iii) | 1,059 B | 1,610 B | 1.5× |
+| `scan.cycle` (M=4, embeds the markets array) | 758 B | 1,274 B | 1.7× |
+| **Mix at M=4** (8 decisions : 1 scan.cycle per scan) | — | **1,572 B** | — |
+
+| Cap | Memory | Disconnect tolerance at the 6.5/s ceiling |
+|---|---|---|
+| 5,000 (today) | 7.5 MB | 13 min |
+| 30,000 | 45.0 MB | 77 min |
+| 50,000 | 75.0 MB | 128 min |
+| 100,000 | 150.0 MB | 256 min |
+
+Tolerances are floors, since 6.5/s is a ceiling; at a realistic 3-4/s they roughly
+double. Caveats: measured on a dev machine's V8, so expect ±10-15% on the VPS,
+not a different order of magnitude; assumes 8 decisions per scan, which halves to
+4 when `evalBothSides === false` and a signal has a direction (`bot.ts:2308`),
+doubling every tolerance figure again.
+
+45 MB would make the buffer the largest single structure in the process —
+`actions` and `executionLog` are ~2.5 MB each at their 5,000 caps. In absolute
+terms it is still modest against a `tsx` process already at 80-150 MB RSS, and
+there are no heap flags anywhere (`npm start` is bare `tsx index.ts`, nothing in
+`docker/`), so Node's default limit applies.
+
+**Why this is not a gate.** `setCapacity` already exists (`events.ts`, clamps to
+a 100 floor), so the cap can be an env var tuned live rather than a code change.
+More importantly, finding (d)'s gap signal makes sizing *empirical*: once a
+reconnect can report that it missed events, you ship a cap, watch whether a gap
+is ever reported, and raise it if so. Predicting the cap correctly in advance
+only mattered while drops were silent — which was the actual defect.
+
+Steps A-D are unaffected either way. Receipts, trades, exits, cash writes and
+resets are human-scale — a handful an hour. 5,000 is already oversized for them.
+Only step E emits at scan rate.
 
 **Measuring M and S needs no new instrumentation, but it needs the VPS running.**
 Nothing about scans is persisted: `botState.stats` (`bot.ts:135`) and
@@ -2220,6 +2273,58 @@ actual evidence is that `cashPnl` now has a binding in scope.
 "both branches return a complete portfolio without throwing, for any readiness
 shape" — is not expressible as a test without exporting it. That belongs with
 the D4 position-manager work rather than as a keyhole export now.
+
+---
+
+### 50. The receipt log keeps two generations and silently discards the third
+
+`clobReceipts.ts` is the only immediate, durable, append-only writer in the
+system — `fs.appendFileSync` per receipt (`:109`), synchronous, inside live order
+execution, wrapped in a deliberately silent `catch` (`:113`; the reasoning there
+is sound and should stay — a diagnostic that can break a trade is worse than a
+missing diagnostic).
+
+Rotation is the problem. At `ROTATE_BYTES` = 4 MB (`:36`):
+
+```js
+if (fs.statSync(RECEIPT_LOG).size > ROTATE_BYTES) {
+  fs.renameSync(RECEIPT_LOG, `${RECEIPT_LOG}.1`);
+}
+```
+
+`renameSync` onto an existing `.1` overwrites it. So retention is exactly two
+generations, ~8 MB of traffic, and the third-oldest is destroyed with no record
+that it existed. Found while tracing what the D8 tees would feed (item 48).
+
+Tolerable while receipts are a debugging aid. Not tolerable once they are an
+input to a permanent forensic record, which is what item 48's PR-1 tee makes
+them. Fix is a rotation count (`.1`, `.2`, … `.N`) or handing rotation to
+`logrotate` on the VPS; either way the decision to discard should be explicit
+and configurable rather than a side effect of `rename`.
+
+---
+
+### 51. `persist` and `persistSync` are the same function
+
+`persistence.ts:21-27`:
+
+```js
+export function persist(file, data)     { saveFileOrStore(file, data); }
+export function persistSync(file, data) { saveFileOrStore(file, data); }
+```
+
+Byte-identical bodies. There is no async variant, no debounce, no batching — the
+naming advertises a choice that does not exist, and every call site that reached
+for `persist()` believing it was the cheap one got a full synchronous write.
+
+That matters most at `bot.ts:1093`, where `saveState()` runs on **every** `log()`
+call and re-serialises the whole capped actions array each time — the cost model
+documented at `bot.ts:335-338`. Item 21 addressed the cap; the misleading pair is
+still here.
+
+Not fixed inline: collapsing them is a one-line change but it touches every
+caller's meaning, and if a genuinely deferred writer is wanted later, this is
+where it belongs. Belongs with the D5/D4 store work rather than as a rename now.
 
 ---
 
