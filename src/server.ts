@@ -25,6 +25,14 @@ import { sseLine } from './lib/sse.js';
 import { loadPackages, getArbPackageMetrics } from './polymarket/arbEngine.js';
 import { loadFileOrStore, saveFileOrStore } from './polymarket/sqliteStore.js';
 import { describeBackend } from './polymarket/persistence.js';
+// Imported straight from the bus rather than through `polymarket/index.js`:
+// `telemetry/events.ts` imports only `node:events`, so there is no cycle, and
+// this keeps the SSE route off the bot module's export surface.
+import {
+  onEvent as onTelemetryEvent,
+  queryEventsPage as queryTelemetryEventsPage,
+  evictedCount as telemetryEvictedCount,
+} from './polymarket/telemetry/events.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
@@ -43,6 +51,13 @@ export function addSession(session) {
 }
 
 let sseClients = [];
+
+/**
+ * Cap on how much unflushed data one event-stream client may accumulate before
+ * it is dropped. `res.write` buffers rather than blocking, so a consumer that
+ * stops reading would otherwise grow the bot's heap without limit.
+ */
+const SSE_MAX_BUFFERED_BYTES = 1024 * 1024;
 
 async function collectStreamData(publicClient, wallet) {
   const balance = await Promise.race([
@@ -637,19 +652,156 @@ export async function createApp() {
    */
   app.get('/api/poly/events', (req, res) => {
     try {
-      const { type, symbol, slug, since, limit, level } = req.query;
-      const events = poly.queryTelemetryEvents({
+      const { type, symbol, slug, since, limit, level, after } = req.query;
+      const filter = {
         type: type ? (String(type).includes(',') ? String(type).split(',') : String(type)) : undefined,
         symbol: symbol ? String(symbol) : undefined,
         slug: slug ? String(slug) : undefined,
         since: since ? Number(since) : undefined,
         limit: limit ? Math.min(1000, Number(limit)) : 100,
         level: level ? String(level) : undefined,
+      };
+
+      // `after` switches to the cursor read: events strictly after that id, in
+      // buffer order, front-sliced. Without it the legacy tail-slice behaviour
+      // is preserved exactly, plus the envelope fields so a first-time caller
+      // can pick up a cursor to poll with.
+      if (after) {
+        const page = queryTelemetryEventsPage({ ...filter, after: String(after) });
+        res.json({ ok: true, count: page.events.length, ...page });
+        return;
+      }
+
+      const events = poly.queryTelemetryEvents(filter);
+      res.json({
+        ok: true,
+        count: events.length,
+        events,
+        oldestId: events.length ? events[0].id : null,
+        newestId: events.length ? events[events.length - 1].id : null,
+        dropped: false,
+        evicted: telemetryEvictedCount(),
+        hasMore: false,
       });
-      res.json({ ok: true, count: events.length, events });
     } catch (err) {
       res.status(500).json({ ok: false, error: err.message });
     }
+  });
+
+  /**
+   * Event-native SSE (item 48 step B). Unlike `/api/poly/stream`, which resends
+   * the whole state snapshot, this pushes individual events once each, at emit
+   * time, straight off the bus.
+   *
+   * Reconnect is lossless: subscribe first and hold arrivals in a queue, then
+   * replay the backlog from the cursor, then flush the queue. Doing the replay
+   * before subscribing would drop anything emitted in between.
+   */
+  app.get('/api/poly/events/stream', (req, res) => {
+    const { type, after } = req.query;
+    const types = type
+      ? new Set(String(type).split(',').map((t) => t.trim()).filter(Boolean))
+      : null;
+
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache, no-transform',
+      Connection: 'keep-alive',
+      'X-Accel-Buffering': 'no',
+      'Access-Control-Allow-Origin': '*',
+    });
+    if (typeof res.flushHeaders === 'function') res.flushHeaders();
+
+    let alive = true;
+    let queue = [];
+    let replaying = true;
+    // Declared as `let` and null-guarded: `shutdown` can fire from `frame()`
+    // during replay, which is before these would be assigned as consts.
+    let unsubscribe = null;
+    let heartbeat = null;
+    const replayedIds = new Set();
+
+    const shutdown = (reason) => {
+      if (!alive) return;
+      alive = false;
+      if (unsubscribe) { try { unsubscribe(); } catch { /* already gone */ } }
+      if (heartbeat) clearInterval(heartbeat);
+      try { res.end(); } catch { /* socket already closed */ }
+      if (reason === 'backpressure') {
+        console.warn('[sse:events] dropped a client that stopped draining');
+      }
+    };
+
+    const frame = (event) => {
+      if (!alive) return;
+      try {
+        // `id:` lets a browser EventSource resume via Last-Event-ID on its own.
+        res.write(`id: ${event.id}\ndata: ${JSON.stringify(event)}\n\n`);
+        // res.write never blocks — it buffers. The hazard is unbounded growth
+        // when a client stops reading, so bound it and drop rather than let one
+        // stalled consumer grow the bot's memory without limit.
+        if (res.writableLength > SSE_MAX_BUFFERED_BYTES) shutdown('backpressure');
+      } catch {
+        shutdown('write_error');
+      }
+    };
+
+    const onBusEvent = (event) => {
+      if (!alive) return;
+      if (types && !types.has(event.type)) return;
+      if (replaying) { queue.push(event); return; }
+      frame(event);
+    };
+
+    // Subscribe BEFORE replaying, so nothing emitted during the replay is lost.
+    unsubscribe = onTelemetryEvent('*', onBusEvent);
+
+    heartbeat = setInterval(() => {
+      if (!alive) return;
+      try { res.write(': hb\n\n'); } catch { shutdown('write_error'); }
+    }, 20000);
+
+    req.on('close', () => shutdown('client_closed'));
+    req.on('error', () => shutdown('client_error'));
+
+    try {
+      const page = queryTelemetryEventsPage({
+        after: after ? String(after) : (req.headers['last-event-id'] ? String(req.headers['last-event-id']) : undefined),
+        type: types ? [...types] : undefined,
+        limit: 1000,
+      });
+
+      // Leading sync frame: tells the consumer where it stands before any data,
+      // including whether its cursor had already been evicted.
+      res.write(`event: sync\ndata: ${JSON.stringify({
+        oldestId: page.oldestId,
+        newestId: page.newestId,
+        dropped: page.dropped,
+        evicted: page.evicted,
+        hasMore: page.hasMore,
+        replayed: page.events.length,
+      })}\n\n`);
+
+      for (const event of page.events) {
+        replayedIds.add(event.id);
+        frame(event);
+      }
+    } catch (err) {
+      console.error('[sse:events] replay failed', err.message);
+    }
+
+    // Live from here. Drain what arrived during the replay, skipping anything
+    // the replay already sent — an event emitted between the subscribe and the
+    // buffer snapshot lands in both.
+    replaying = false;
+    const pending = queue;
+    queue = [];
+    for (const event of pending) {
+      if (replayedIds.has(event.id)) continue;
+      replayedIds.add(event.id);
+      frame(event);
+    }
+    replayedIds.clear();
   });
 
   app.post('/api/poly/notifications/read', (req, res) => {

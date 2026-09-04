@@ -2104,7 +2104,7 @@ later nicety.
 |---|---|---|
 | 0 | ~~measure M and S~~ — done 2026-09-04, see *Buffer sizing* below; **not a gate**, the cap is an env var tuned against (d)'s gap signal | operator sign-off on (i)-(v) |
 | A | ✅ **done 2026-09-04.** Four new union members, a payload interface per event type under rule (iii), `formatEventAsLog` cases for all four plus `config.attributed` (which had none and fell through to raw JSON), `TELEMETRY_SCHEMA_VERSION` 1 → 2. `EventType` is now `keyof TelemetryEventPayloads`, so the union cannot drift from the registry. **`// @ts-nocheck` removed** — the file is type-checked, without which the interfaces would be decoration (finding e). Transitional `LegacyMeta` index signature on the payloads `log()` still feeds, documented to come off per type as each tee takes ownership in C-E. | `tsc` clean · 360/360 tests · smoke run of all four new types; runtime inert, nothing emits them yet |
-| B | SSE stream + `after=` cursor with gap signal (d) — transport lands before the volume it must carry | engine connects and receives today's `scan.cycle` / `package.settlement` traffic |
+| B | ✅ **done 2026-09-04.** `GET /api/poly/events/stream` (event-native SSE, one frame per event at emit time) + `after=` on `/api/poly/events`. Bus gained an eviction counter and `queryEventsPage` returning `{events, oldestId, newestId, dropped, evicted, hasMore}`. Reconnect is lossless: subscribe → queue → replay from cursor → drain queue, deduped. Cursor reads front-slice, never tail-slice. `res.write` buffers rather than blocking, so a client is dropped past 1 MB unflushed (`SSE_MAX_BUFFERED_BYTES`) instead of growing the heap. | `tsc` clean · 367/367 · 7 new invariants, both key ones mutation-checked (front-slice→tail-slice and `dropped=false` each killed 2 tests). **HTTP layer not yet exercised against a running instance** — see below |
 | C | receipts + trade + exit — exit tee at `closePosition` (b); `log()` mapping collapsed per (i) | one nightly paper cycle |
 | D | cash + reset + system | one nightly paper cycle |
 | E | decision + arb — **only after (c) is resolved**; differential-check the scan path the way the slice-1 extraction was (convention 5) | zero mismatch on the diffcheck grid |
@@ -2168,6 +2168,41 @@ only mattered while drops were silent — which was the actual defect.
 Steps A-D are unaffected either way. Receipts, trades, exits, cash writes and
 resets are human-scale — a handful an hour. 5,000 is already oversized for them.
 Only step E emits at scan rate.
+
+#### Step B — what is verified and what is not
+
+Verified locally: the bus. `queryEventsPage`'s cursor semantics, the `dropped`
+signal, the eviction counter and the front-slice guarantee are covered by seven
+invariants in `tests/unit/events.test.ts`, two of them mutation-checked.
+
+**Not verified locally: the HTTP and SSE layer.** Exercising it means booting the
+server, and this checkout is not the running instance — starting a live-money
+process locally to test a read endpoint is the wrong trade. `tsc` passes and the
+handler was reviewed, but no connection has been made to it. Confirm on the VPS
+after deploy:
+
+```sh
+# live tail — should print a `sync` frame, then one frame per event
+curl -N -H "Authorization: Bearer $ZINGER_TOKEN" \
+  'https://<host>/api/poly/events/stream'
+
+# cursor read — `dropped` must be false, and `newestId` is the next cursor
+curl -s -H "Authorization: Bearer $ZINGER_TOKEN" \
+  'https://<host>/api/poly/events?after=<id>&limit=10' | jq '{count,dropped,evicted,hasMore,newestId}'
+
+# gap signal — a bogus cursor must report dropped:true, not an empty page
+curl -s -H "Authorization: Bearer $ZINGER_TOKEN" \
+  'https://<host>/api/poly/events?after=evt-0-0' | jq '.dropped'
+```
+
+The third is the one worth running deliberately: an empty page and a gap read
+identically to a naive consumer, and telling them apart is the entire point of
+the step.
+
+Note `X-Accel-Buffering: no` is set on the stream because nginx will otherwise
+buffer SSE and the feed appears dead. If the stream connects but no frames
+arrive on the VPS while `/api/poly/events` works, that header not surviving the
+proxy is the first thing to check.
 
 **Measuring M and S needs no new instrumentation, but it needs the VPS running.**
 Nothing about scans is persisted: `botState.stats` (`bot.ts:135`) and

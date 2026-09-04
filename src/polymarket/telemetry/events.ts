@@ -300,6 +300,34 @@ export interface EventQueryFilter {
   since?: number;
   limit?: number;
   level?: string;
+  /** Return events strictly after this event id, in buffer order. */
+  after?: string;
+}
+
+/**
+ * A cursor-addressed page of events.
+ *
+ * The ring buffer evicts silently (`shift()`), so a cursor that has fallen off
+ * the back is indistinguishable from a cursor that is simply current — both
+ * would yield an empty list. That ambiguity is the whole defect: a consumer
+ * cannot tell "you are up to date" from "you have a hole". Hence `dropped`,
+ * `oldestId` and `evicted`, which make the lossy case explicit.
+ */
+export interface EventPage {
+  events: BaseTelemetryEvent[];
+  /** Oldest id still retained. A cursor older than this is unrecoverable. */
+  oldestId: string | null;
+  /** Newest id retained — what a caller should store as its next cursor. */
+  newestId: string | null;
+  /**
+   * The supplied cursor was not found in the buffer: evicted, from a previous
+   * process, or malformed. All three mean continuity cannot be assumed.
+   */
+  dropped: boolean;
+  /** Events evicted since process start. Monotonic; resets only on `clear()`. */
+  evicted: number;
+  /** More events match beyond this page — call again with the new cursor. */
+  hasMore: boolean;
 }
 
 /* ------------------------------------------------------------------ *
@@ -310,6 +338,8 @@ class TelemetryBus extends EventEmitter {
   private buffer: BaseTelemetryEvent[] = [];
   private maxCap: number = DEFAULT_EVENT_BUFFER_CAP;
   private seq: number = 0;
+  /** Count of events dropped off the back. Without this, loss is invisible. */
+  private evicted: number = 0;
 
   constructor(maxCap: number = DEFAULT_EVENT_BUFFER_CAP) {
     super();
@@ -319,8 +349,14 @@ class TelemetryBus extends EventEmitter {
   public setCapacity(newCap: number): void {
     this.maxCap = Math.max(100, newCap);
     if (this.buffer.length > this.maxCap) {
+      const overflow = this.buffer.length - this.maxCap;
+      this.evicted += overflow;
       this.buffer = this.buffer.slice(-this.maxCap);
     }
+  }
+
+  public getEvicted(): number {
+    return this.evicted;
   }
 
   public emitEvent<T extends EventType>(
@@ -339,6 +375,7 @@ class TelemetryBus extends EventEmitter {
     this.buffer.push(event as BaseTelemetryEvent);
     if (this.buffer.length > this.maxCap) {
       this.buffer.shift(); // Evict oldest
+      this.evicted += 1;
     }
 
     this.emit(type, event);
@@ -346,11 +383,14 @@ class TelemetryBus extends EventEmitter {
     return event;
   }
 
-  public queryEvents(filter: EventQueryFilter = {}): BaseTelemetryEvent[] {
-    const { type, symbol, slug, since, limit = 100, level } = filter;
+  private applyFilters(
+    source: BaseTelemetryEvent[],
+    filter: EventQueryFilter,
+  ): BaseTelemetryEvent[] {
+    const { type, symbol, slug, since, level } = filter;
     const types = type ? (Array.isArray(type) ? type : [type]) : null;
 
-    let res = this.buffer;
+    let res = source;
 
     if (types && types.length > 0) {
       res = res.filter((e) => types.includes(e.type));
@@ -371,11 +411,57 @@ class TelemetryBus extends EventEmitter {
     if (level != null) {
       res = res.filter((e) => (e.data as Record<string, any>)?.level === level);
     }
+    return res;
+  }
 
+  public queryEvents(filter: EventQueryFilter = {}): BaseTelemetryEvent[] {
+    const { limit = 100 } = filter;
+    const res = this.applyFilters(this.buffer, filter);
+
+    // Tail slice: no cursor means "the most recent N".
     if (limit > 0 && res.length > limit) {
       return res.slice(-limit);
     }
     return [...res];
+  }
+
+  /**
+   * Cursor-addressed read. Unlike `queryEvents`, the limit takes from the
+   * FRONT — events strictly after the cursor, oldest first. A tail slice here
+   * would silently skip the middle of the backlog, which is precisely the
+   * failure a catch-up read exists to avoid.
+   */
+  public queryPage(filter: EventQueryFilter = {}): EventPage {
+    const { after, limit = 100 } = filter;
+    const oldestId = this.buffer.length ? this.buffer[0].id : null;
+    const newestId = this.buffer.length ? this.buffer[this.buffer.length - 1].id : null;
+
+    let startIdx = 0;
+    let dropped = false;
+
+    if (after) {
+      const idx = this.buffer.findIndex((e) => e.id === after);
+      if (idx >= 0) {
+        startIdx = idx + 1;
+      } else {
+        // Not found: evicted, from a previous process, or malformed. Report the
+        // gap and hand back everything retained so the caller can resync —
+        // returning an empty page here would read as "you are up to date".
+        dropped = true;
+      }
+    }
+
+    const matched = this.applyFilters(this.buffer.slice(startIdx), filter);
+    const events = limit > 0 && matched.length > limit ? matched.slice(0, limit) : [...matched];
+
+    return {
+      events,
+      oldestId,
+      newestId,
+      dropped,
+      evicted: this.evicted,
+      hasMore: matched.length > events.length,
+    };
   }
 
   public getLatest(type?: EventType): BaseTelemetryEvent | null {
@@ -397,6 +483,7 @@ class TelemetryBus extends EventEmitter {
   public clear(): void {
     this.buffer = [];
     this.seq = 0;
+    this.evicted = 0;
   }
 }
 
@@ -411,6 +498,20 @@ export function emitEvent<T extends EventType>(
 
 export function queryEvents(filter?: EventQueryFilter): BaseTelemetryEvent[] {
   return telemetryBus.queryEvents(filter);
+}
+
+/** Cursor-addressed read with an explicit gap signal. See `EventPage`. */
+export function queryEventsPage(filter?: EventQueryFilter): EventPage {
+  return telemetryBus.queryPage(filter);
+}
+
+/** Events dropped off the back of the buffer since process start. */
+export function evictedCount(): number {
+  return telemetryBus.getEvicted();
+}
+
+export function setEventBufferCapacity(cap: number): void {
+  telemetryBus.setCapacity(cap);
 }
 
 export function getLatestEvent(type?: EventType): BaseTelemetryEvent | null {
