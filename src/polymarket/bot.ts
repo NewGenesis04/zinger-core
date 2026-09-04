@@ -1338,6 +1338,13 @@ function buildPortfolio(readiness, mode) {
     return sum + Number(p.size || 0);
   }, 0);
   const baselineUsd = loadBaseline();
+  // Cash movement against the run baseline, excluding open position value —
+  // distinct from `netPnl` below, which is equity-based. 79ad823 rewrote
+  // `netPnl` and deleted this declaration but left `cashPnl` in the returned
+  // object (:1367), so every live-mode call to buildPortfolio threw a
+  // ReferenceError. Restoring it does not reintroduce that commit's
+  // double-count: `netPnl` stays equity - baselineUsd.
+  const cashPnl = baselineUsd != null ? Math.round((cash - baselineUsd) * 100) / 100 : null;
   const equity = Math.round((cash + openMarkValue) * 100) / 100;
   const netPnl = baselineUsd != null
     ? Math.round((equity - baselineUsd) * 100) / 100

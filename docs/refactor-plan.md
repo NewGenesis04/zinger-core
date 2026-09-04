@@ -1882,6 +1882,347 @@ change.
 
 ---
 
+### 47. `useAlphaFusion` is a kill switch with no writer
+
+The only read is `scan/inputs.ts:67` — `enabled: cfg.useAlphaFusion !== false`.
+Nothing else in the repo mentions the key except the comment at `signal.ts:75`.
+There is no UI control, no default in `defaultLiveStrategy()` /
+`defaultPaperStrategy()`, and no entry in `STRATEGY_KEYS` (`modeConfig.ts:24`).
+So the value is `undefined`, `undefined !== false` is `true`, and fusion is
+**on** with nothing on the dashboard to say so.
+
+It is not cleanly settable either. An unrecognised key does persist —
+`modeConfig.ts:304-306` stashes unknown keys on the active profile rather than
+dropping them — but `pickStrategy()` (`:189`) copies `STRATEGY_KEYS` only, and
+it runs whenever profiles are rebuilt or normalised (`:232-237`, `:322-323`).
+A `useAlphaFusion: false` set today therefore survives some paths and is
+silently discarded by others. A kill switch that can quietly re-arm itself is
+worse than no kill switch.
+
+Inert while `forceArbOnly` holds: `arbEngine.ts:35` bypasses directional
+signals, so fusion cannot reach an entry decision. It still overwrites
+`direction` / `confidence` / `score` / `edge` on signal objects that feed the
+governor and dashboard, but that is display, not execution. **It becomes
+load-bearing the moment directional is re-enabled** — see item 42 for the blast
+radius.
+
+**TODO, to land with the directional dial changes, not before:** add
+`'useAlphaFusion'` to `STRATEGY_KEYS`, seed it in both mode defaults, and add a
+checkbox beside the existing `useSignals` / `useML` / `useOrderBookBias`
+toggles, which are the same shape of flag and already wired end to end.
+Roughly 15 lines across three files.
+
+---
+
+### 48. The D8 decision-emitter tee plan, checked against the code
+
+Proposed 2026-09-03: execute D8's deferred decision emitter (slice 1 progress
+table, `docs/refactor-plan.md:508`) as five tees plus four interface additions,
+feeding an external "Forensics Truth Engine" that permanently records the event
+stream. Every tee is additive — `emitEvent(...)` *beside* the existing
+`persist()` / `log()` / `appendFileSync()`, never instead of it — so paper
+trading keeps running unchanged.
+
+The anchors were checked. Most hold: `clobReceipts.ts:109`
+(`fs.appendFileSync(RECEIPT_LOG…)`), `bot.ts:377`
+(`botState.trades.unshift(normalized)`), `liveAccount.ts:282,298,316,338`
+(the four `saveStore` calls), `bot.ts:3767` (`persistSync(archiveFile…)` in
+`resetLiveData`), `bot.ts:2371` (`buildDecision`), `bot.ts:2450`
+(`resolveOrderSize`), `directional.ts:322-330` (`bookMeta`). The event bus is
+`src/polymarket/telemetry/events.ts`, not `src/lib/events.ts`; auth is
+`src/lib/auth.ts`, not `.js`.
+
+Seven findings. Two change the shape of the work; the rest are corrections.
+
+**a. Every fact the tees emit already emits once.** `log()` maps the log `type`
+onto an `EventType` (`bot.ts:1053-1058`):
+
+```
+type 'sl' | 'tp'          -> position.exit
+type 'buy'                -> trade.execution
+meta.arb | type 'arb'     -> package.settlement
+type 'signal'             -> trade.decision
+everything else           -> system.alert
+```
+
+So a rich `emitEvent('trade.execution', normalized)` at `bot.ts:377` does not
+*add* the trade event — it adds a **second** one, with a different shape, beside
+the message-shaped one every `log(…, 'buy', meta)` already produces. Same for
+`position.exit` and `trade.decision`. A truth engine that counts events would
+double-count every trade and every exit, and the two records would disagree.
+
+This is the decision the plan has to make before any tee lands: **who owns each
+event type**. Recommended — the explicit tee owns the typed types, and the
+`log()` mapping collapses to `system.alert` for everything. That keeps one
+writer per type, which is the same rule D5 applies to cash. The alternative
+(a discriminator field on each event) leaves two writers and asks the consumer
+to reconcile them.
+
+**b. The exit sites are undercounted, and there is a better seam.** The plan
+names three (`~2030-2045`, `~2284-2298`, TP `~2108`). There are at least twelve
+`log(…, 'sl'|'tp', …)` calls: `bot.ts:937, 2045, 2108, 2299, 2676, 2812, 2831,
+2840, 2854, 2866, 2891, 3885, 3919`. Teeing per-site means thirteen edits that
+drift apart.
+
+Six of them are already funnelled through one helper —
+`closePosition(exitReason, extraMeta)` (`bot.ts:2583`), called at `:2810, 2830,
+2839, 2853, 2865, 2878, 2890`. That is the single owner for the settle/TP/SL/
+trail/partial family. The fast-SL paths (`:2044`, `:2298`) and the flatten path
+(`:937`) bypass it and would need their own tee, or to be routed through it.
+
+While counting: `bot.ts:3919` logs a PM-wallet asset sell as type `'sl'`, so it
+currently emits a `position.exit` carrying `{assetId, size, orderId}` and no
+symbol, slug, or PnL. That is a phantom exit in the event stream today,
+independent of this work.
+
+**c. The buffer wraps faster than any poller can drain it — this is the
+load-bearing constraint.** `TelemetryBus` is an in-memory ring of 5000
+(`events.ts:5, 52-55`) with no persistence and no drop counter. `scan()` is
+driven by `setInterval(scan, POLY_SCAN_INTERVAL_MS)` where the interval is
+**250 ms** (`bot.ts:3545`, `config.ts:19`), and PR-4 emits one `trade.decision`
+per market per outcome inside `for (const market of tradableMarkets)`
+(`bot.ts:2155`) × `for (const outcome of targetOutcomes)` (`bot.ts:2362`).
+
+At *M* tradable markets, 2 outcomes, and *S* completed scans per second, the
+ring holds `5000 / (2·M·S)` seconds of history. Even at a conservative M=4, S=1
+that is ~10 minutes; at S=4 it is ~2.6 minutes. **M and S have not been measured
+on the VPS — measure before sizing anything.** The consequence either way: any
+Truth Engine outage longer than the wrap window loses decisions *silently*,
+because the buffer exposes no oldest-id and no eviction count.
+
+Three ways out, in increasing order of work: raise the cap via `setCapacity`
+(`events.ts:35`) and accept a bounded window; have the bus append to a JSONL
+sink the way `clobReceipts.ts:109` does, and let the engine tail the file;
+or emit decisions at a lower rate than the scan loop. Not a detail to settle
+during PR-4 — it decides whether the transport can carry PR-4 at all.
+
+**d. `after=<event_id>` needs a gap signal, and ids are not durable.** The
+existing `since` filter compares `e.ts >= since` (`events.ts:79`) with
+millisecond stamps, so a poller either re-reads or skips events sharing a
+millisecond — the ask is correct that a cursor is needed. But on a ring buffer,
+a cursor whose id has been evicted is indistinguishable from "nothing new".
+`after=` must return the oldest retained id and an explicit dropped flag, or the
+lossy case is invisible. Also `clear()` resets `seq` to 0 (`events.ts:116`),
+and ids are `evt-${Date.now()}-${seq}` (`events.ts:45`) — after a clear, ids can
+repeat. Only tests call `clearEvents()` today, but a cursor makes that a
+correctness property, not a curiosity.
+
+**e. Typed payload interfaces buy almost nothing where they are aimed.**
+`events.ts:1` is `// @ts-nocheck`, as are `bot.ts:1`, `directional.ts:1`,
+`liveAccount.ts:1` and `server.ts:1`. Five of the seven emit sites are in files
+the compiler does not check; only `arbEngine.ts` and `clobReceipts.ts` are
+checked. Replacing `data: Record<string, any>` (`events.ts:22`) with per-type
+interfaces is worth doing as documentation, but it will not catch a malformed
+payload at `bot.ts:2371`. If the schema needs to actually hold, it needs a
+runtime check in `emitEvent` — related to item 32.
+
+**f. Widening `bookMeta` is not low-risk, and collides with open item 41.**
+`getDepthForMarket` (`clob.ts:165`) has two paths. The REST path returns
+`normalizeLevels(...)`, which does carry `bids`/`asks` ladders with cumulative
+size (`clob.ts:43-57, 73-75`) — so on that path the ladder genuinely is already
+fetched. The WS path (`clob.ts:171-179`) returns
+`{bestBid, bestAsk, mid, spread, source}` and **no ladder at all**, and it is
+preferred whenever the socket book is fresh, which is the common case. So the
+tee would emit a ladder exactly when data is stalest and omit it when data is
+freshest — the inverse of what a forensic record wants, and easy to misread as
+"the book was empty". The real fix is item 41, which the backlog already records
+as touching the live price path stop-losses mark against.
+
+**g. Interface ask #4 is already implemented.** `extractToken`
+(`auth.ts:110-119`) already reads `Authorization: Bearer <token>` before falling
+back to `?token=` / `?auth=` and then the cookie, and `requireAuth`
+(`auth.ts:165`) uses it for every `/api/*` route. The Truth Engine needs an
+`issueToken()`-signed token, not a code change. Zero work.
+
+#### Settled in review with the operator, 2026-09-03
+
+**The consumer is a client, not a component.** The Forensics Truth Engine is one
+client of the event stream, on the same footing as Zinger's own dashboard and
+any future reader. Nothing in `polymarket/` may reference it, be shaped around
+it, or special-case it. The emitter's obligation is a complete record of what
+the process did; what any client does with that is the client's business. This
+is D8's own split — the viewing/analysis client is explicitly out of scope
+(`plan:198-202`) — restated because the tee plan arrived from the client side
+and could easily drag client concerns across the line.
+
+**i. Ownership: the explicit tee owns each typed event; `log()` keeps only
+`system.alert`.** Resolves finding (a). One writer per event type, the rule D5
+applies to cash. The `bot.ts:1053-1058` type-guessing mapping is deleted, not
+extended — it reconstructs an `EventType` from a human-chosen string tag and
+ships prose as the payload, which is the pre-D8 direction wearing an event
+costume. Any `log()` call whose fact deserves a typed event gets an explicit
+`emitEvent` beside it; everything else is an alert.
+
+**ii. No rendered string is stored in the event.** Considered and rejected.
+A rendering is derivable from a complete payload at any time, so it can be added
+later for nothing; a payload field never captured is unrecoverable forever. That
+asymmetry puts all the effort on payload completeness. Storing the line also
+weakens the incentive that D8 exists to create — if the readable line is already
+in the record, an author has less reason to care whether the payload is whole,
+which is how 44% of `log()` call sites came to pass no `meta` at all.
+`formatEventAsLog` (`events.ts:147`) stays, serving Zinger's own dashboard as
+one client's projection. It does not define the record.
+
+**iii. No prose inside payload fields — code plus value, the client renders.**
+The direct consequence of (ii), and the substantive schema rule for step A.
+A field whose value is a sentence is a string that a client can display but
+cannot filter, count, aggregate, or diff. Two live instances, both inside what
+PR-4 would emit:
+
+- `directional.ts:334` — ``reasons.push(`arb gap +${(arbGap*100).toFixed(1)}c`)``
+  and `:342` ``  `ultra-tight spread ${spreadPct.toFixed(2)}%` ``. `reasons[]`
+  looks structured and is an array of sentences.
+- `bot.ts:3057` — `summary: market.decision?.summary`, prose inside the
+  `scan.cycle` markets array.
+
+The rule: every reason is `{code, value, delta}` — a stable enum code, the
+number that triggered it, and its score contribution. Every `skipReason` is an
+enum plus the operands that produced it, never `'confidence 41% < 45%'`. The
+client turns those into whatever text, table or chart suits it.
+
+**iv. Transport before volume.** The Truth Engine reads from source over SSE
+(ask #3), subscribing via `onEvent('*')` (`events.ts:138`), which delivers at
+emit time and never touches the ring buffer. While connected it cannot lose
+events at any buffer size. The buffer therefore sizes **disconnect tolerance**,
+not history — "how long may the client be away before reconnecting loses data"
+— which is a far smaller number than "how much history do we keep". The JSONL
+sink floated under (c) is demoted to a possible crash backstop for events lost
+when the process itself dies; it is not the read path, and it may not be needed.
+
+Two constraints this puts on the SSE route: writes must be non-blocking or
+drop-on-backpressure, because `emitEvent` notifies subscribers **synchronously
+on the scan loop's stack** (`events.ts:57-58`) and a stalled socket would stall
+scanning; and reconnect must be able to catch up, which is what makes the
+`after=` cursor with its gap signal (d) part of the same step rather than a
+later nicety.
+
+**v. Interface ask #4 is dropped as already implemented** — see (g).
+
+**Sequencing, as amended:**
+
+| Step | Content | Gate |
+|---|---|---|
+| 0 | measure M and S for (c); size the buffer against (iv) | operator sign-off |
+| A | `events.ts` scaffolding: new union members, payload interfaces under rule (iii), `formatEventAsLog` cases | one paper cycle, events inert |
+| B | SSE stream + `after=` cursor with gap signal (d) — transport lands before the volume it must carry | engine connects and receives today's `scan.cycle` / `package.settlement` traffic |
+| C | receipts + trade + exit — exit tee at `closePosition` (b); `log()` mapping collapsed per (i) | one nightly paper cycle |
+| D | cash + reset + system | one nightly paper cycle |
+| E | decision + arb — **only after (c) is resolved**; differential-check the scan path the way the slice-1 extraction was (convention 5) | zero mismatch on the diffcheck grid |
+| F | `/api/ops/dump` | — |
+
+New `EventType` members: `trade.execution.receipt`, `account.cash`,
+`account.reset`, `arb.decision`. Bump `TELEMETRY_SCHEMA_VERSION`
+(`events.ts:4`, currently `1`) once, at step A, not per PR.
+
+The book-widen tee (f) is dropped from step E and folded into item 41.
+
+**Measuring M and S needs no new instrumentation, but it needs the VPS running.**
+Nothing about scans is persisted: `botState.stats` (`bot.ts:135`) and
+`botState.executionLog` (`bot.ts:139`) are in-memory only — `saveState()`
+(`bot.ts:348-349`) writes positions and actions and neither of those — and
+`logScan` keeps exactly one scan row, filtering every prior one out of
+`executionLog` before unshifting (`bot.ts:1124`). The event buffer is memory-only
+too. So `data/` answers nothing here and a restart erases the window; the numbers
+have to be read off the live instance.
+
+Both are already on the dashboard, which is served from `getState()` via
+`GET /api/poly/state` (`server.ts:393`):
+
+- **S** — the scan counter, `stats.scansDone` in the state payload
+  (`bot.ts:1610`). Read it twice with the clock times noted;
+  `S = Δscans ÷ Δseconds`. Any window; a restart is self-announcing because the
+  counter goes backwards.
+- **M** — the latest-scan line, `🔎 Scan #1234 — 6 mkts · …`, which is
+  `enriched.length` (`bot.ts:3051`). Sample across a quiet hour and an active
+  window, since M varies with how many markets are tradable at the time.
+
+S is **not** 4/sec. `scan()` early-returns while `_scanning` holds
+(`bot.ts:2058-2062`), so the 250 ms interval is a polling tick, not a completion
+rate. Caveat in the conservative direction: `scansDone` increments at the top of
+a scan (`bot.ts:2070`) while `scan.cycle` fires at the end (`bot.ts:3050`), so a
+scan that throws counts in the counter and not in the event stream — the counter
+slightly overstates completions, which is the safe way to be wrong when sizing a
+buffer.
+
+The Telegram `/status` reply also prints `Scans:` (`telegram/bot.ts:349`), but
+that surface is optional — `startBot()` returns early without
+`TELEGRAM_BOT_TOKEN` (`:93`) or under `TELEGRAM_DISABLED` (`:81`) — so the
+dashboard is the route to rely on.
+
+**Unresolved, and it decides where the step E tee goes.** There appear to be two
+scan implementations: `bot.ts:2055` and `scan/index.ts:74`. Both increment
+`scansDone` and both call `logScan`. `bot.ts:3545` wires the interval to the
+`bot.ts` one, so `scan/index.ts` looks like an extraction that is not live yet —
+but that was not chased down, and it must be settled before the decision tee is
+written into either file.
+
+---
+
+### 49. A deleted variable shipped to live and crashed every live-mode portfolio read ✅ FIXED
+
+*Found 2026-09-04 from a VPS crash log, fixed the same day.*
+
+`79ad823` (2026-08-28, "compute netPnl without double-counting") rewrote
+`netPnl` in `buildPortfolio` to be equity-based and deleted the helper it no
+longer needed:
+
+```diff
+   const baselineUsd = loadBaseline();
+-  const cashPnl = baselineUsd != null ? Math.round((cash - baselineUsd) * 100) / 100 : null;
+   const equity = Math.round((cash + openMarkValue) * 100) / 100;
+-  const netPnl = cashPnl != null
+-    ? Math.round((cashPnl + pmUnrealized) * 100) / 100
++  const netPnl = baselineUsd != null
++    ? Math.round((equity - baselineUsd) * 100) / 100
+```
+
+It left `cashPnl,` in the returned object (`bot.ts:1367`). ES modules are strict
+mode, so reading an undeclared identifier throws rather than yielding
+`undefined` — `ReferenceError: cashPnl is not defined`.
+
+**Only the live branch.** The paper branch returns early (`bot.ts:1296-1317`)
+with `cashPnl: netPnl` properly bound and never reaches the faulty line. So the
+defect was invisible for six days of paper trading and fired the moment the
+instance ran in live mode.
+
+Six call sites, one of them guarded — so this was never merely "the dashboard is
+down":
+
+| Site | Guard | Effect in live mode |
+|---|---|---|
+| `getState()` `:1440` | none | `/api/poly/state` 500s; `[sse] serialize fail` |
+| `getAudit()` `:1905` | none | audit endpoint broken |
+| `governorNow()` `:1933` | none | governor broken |
+| `startBot()` `:3500` | none | starting the bot throws |
+| `completeSession()` `:3566` | none | clean stop throws |
+| session reconcile `:3392` | inside `try` | silently stops reconciling every 20s |
+
+*Fix:* restore the deleted declaration in place. `netPnl` is untouched, so
+`79ad823`'s double-count fix stands; `cashPnl` returns to being a standalone
+reported figure — cash movement against the run baseline, excluding open
+position value, which is what `:1367` and the consumer at `:1612` expect.
+
+**Two conventions this confirms, both already written down.**
+
+*`@ts-nocheck` is not cosmetic debt.* `bot.ts:1` is `// @ts-nocheck`, and a
+dangling reference to a deleted variable is exactly what `tsc` catches for free.
+This is item 32's family reaching the live path, and it arrived as finding (e)
+of item 48 three weeks before that finding was scheduled to matter. The 3,900-
+line file the compiler is not allowed to read is the one running live money.
+
+*Green tests prove consistency, not correctness.* The suite was green for the
+entire six days the bug was live, and is green after the fix — 28 files, 360
+tests. Nothing covered it, because nothing exercises `buildPortfolio`'s live
+branch. The passing run after the fix proves only that nothing else broke; the
+actual evidence is that `cashPnl` now has a binding in scope.
+
+*Not done:* `buildPortfolio` is module-private, so the invariant worth having —
+"both branches return a complete portfolio without throwing, for any readiness
+shape" — is not expressible as a test without exporting it. That belongs with
+the D4 position-manager work rather than as a keyhole export now.
+
+---
+
 ## Handoff — state as of 2026-08-20
 
 Written so a fresh session can continue without re-deriving any of the above.
