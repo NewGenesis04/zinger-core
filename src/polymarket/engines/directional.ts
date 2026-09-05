@@ -221,44 +221,69 @@ export function buildDecision({
   const dataAssurance = portfolio?.dataAssurance || null;
 
   const reasons = [];
+  const reasonCodes = [];
   let eligible = true;
   let score = 0;
 
+  /**
+   * Every reason is recorded twice (item 48 rule iii).
+   *
+   * `reasons` keeps the prose line the dashboard has always rendered, passed
+   * through untouched — so the array stays byte-identical and every existing
+   * consumer (`bot.ts` trace/summary, the dashboard's `reasons.join(' · ')`) is
+   * unaffected. That is also what makes this differential-checkable: if the
+   * prose is unchanged for every input, the scoring is unchanged.
+   *
+   * `reasonCodes` is the same fact as `{code, value, delta, operands}` — the
+   * form a client can filter, count, aggregate and diff. A sentence can only be
+   * displayed, or regexed, which is the defect D8 exists to remove.
+   */
+  const addReason = (text, code, extra = null) => {
+    reasons.push(text);
+    reasonCodes.push({ code, ...(extra || {}) });
+  };
+
   if (cfg.tradeCurrentWindowOnly && !market.isCurrent) {
     eligible = false;
-    reasons.push('next window — watch only');
+    addReason('next window — watch only', 'next_window');
   }
 
   if (!market.acceptingOrders) {
     eligible = false;
-    reasons.push('not accepting orders');
+    addReason('not accepting orders', 'not_accepting_orders');
   }
 
   if (!price || price === 0) {
     eligible = false;
-    reasons.push('no price');
+    addReason('no price', 'no_price', { value: price ?? null });
   }
 
   if (eligible && price < cfg.minPrice) {
     eligible = false;
-    reasons.push(`below min $${cfg.minPrice.toFixed(2)}`);
+    addReason(`below min $${cfg.minPrice.toFixed(2)}`, 'price_below_min', {
+      value: price, operands: { min: cfg.minPrice },
+    });
   }
 
   if (eligible && price > cfg.maxPrice) {
     eligible = false;
-    reasons.push(`above max $${cfg.maxPrice.toFixed(2)}`);
+    addReason(`above max $${cfg.maxPrice.toFixed(2)}`, 'price_above_max', {
+      value: price, operands: { max: cfg.maxPrice },
+    });
   }
 
   const entryWin = resolveEntryWindows(market?.duration || '5m', cfg);
   if (eligible && remaining < entryWin.minRemainingSec) {
     eligible = false;
-    reasons.push(`${remaining}s left < ${entryWin.minRemainingSec}s min (${entryWin.duration})`);
+    addReason(`${remaining}s left < ${entryWin.minRemainingSec}s min (${entryWin.duration})`, 'remaining_below_min', {
+      value: remaining, operands: { min: entryWin.minRemainingSec, duration: entryWin.duration },
+    });
   }
 
   // Hard stop on expired / resolved windows (slug clock can lag a few seconds)
   if (eligible && remaining <= 0) {
     eligible = false;
-    reasons.push('window expired');
+    addReason('window expired', 'window_expired', { value: remaining });
   }
 
   if (
@@ -268,54 +293,66 @@ export function buildDecision({
     && !dataAssurance.canBuy
   ) {
     eligible = false;
-    reasons.push(dataAssuranceBuyBlockReason(dataAssurance) || 'data assurance blocked');
+    addReason(dataAssuranceBuyBlockReason(dataAssurance) || 'data assurance blocked', 'data_assurance_blocked', {
+      value: dataAssurance?.score ?? null,
+    });
   }
 
   const maxEntry = entryWin.maxEntryRemainingSec ?? cfg.maxEntryRemainingSec ?? 298;
   if (eligible && remaining > maxEntry) {
     eligible = false;
-    reasons.push(`${remaining}s left > ${maxEntry}s entry window (${entryWin.duration})`);
+    addReason(`${remaining}s left > ${maxEntry}s entry window (${entryWin.duration})`, 'remaining_above_entry_window', {
+      value: remaining, operands: { max: maxEntry, duration: entryWin.duration },
+    });
   }
 
   if (eligible && remaining >= 180) {
     const earlyBoost = Math.min(18, ((remaining - 180) / 120) * 18);
     score += earlyBoost;
-    reasons.push(`early entry +${earlyBoost.toFixed(0)} (${remaining}s left)`);
+    addReason(`early entry +${earlyBoost.toFixed(0)} (${remaining}s left)`, 'early_entry', {
+      value: remaining, delta: earlyBoost,
+    });
   } else if (eligible && remaining >= 120) {
     score += 6;
-    reasons.push(`mid-early ${remaining}s`);
+    addReason(`mid-early ${remaining}s`, 'mid_early_entry', { value: remaining, delta: 6 });
   }
 
   if (eligible && cfg.minPositionSize != null && cfg.maxPositionSize < cfg.minPositionSize) {
     eligible = false;
-    reasons.push(`max $${cfg.maxPositionSize} < min $${cfg.minPositionSize}`);
+    addReason(`max $${cfg.maxPositionSize} < min $${cfg.minPositionSize}`, 'max_below_min_position', {
+      operands: { max: cfg.maxPositionSize, min: cfg.minPositionSize },
+    });
   }
 
   const minBet = Number(cfg.minPositionSize ?? POLY_MIN_ORDER_USD);
   if (eligible && (readiness?.spendableBalance ?? 0) < minBet && cfg.mode === 'live') {
     eligible = false;
-    reasons.push(`bankroll $${(readiness?.spendableBalance ?? 0).toFixed(2)} < min bet $${minBet}`);
+    addReason(`bankroll $${(readiness?.spendableBalance ?? 0).toFixed(2)} < min bet $${minBet}`, 'bankroll_below_min_bet', {
+      value: readiness?.spendableBalance ?? 0, operands: { minBet },
+    });
   }
 
   const maxConcurrent = cfg.maxConcurrentPerSlug ?? 1;
   const allowScaleIn = cfg.allowScaleIn !== false && maxConcurrent > 1;
   if (eligible && existingPosition && !allowScaleIn) {
     eligible = false;
-    reasons.push('position already open');
+    addReason('position already open', 'position_already_open', {
+      operands: { maxConcurrent },
+    });
   }
   if (eligible && existingPosition && allowScaleIn) {
-    reasons.push('scale-in allowed');
+    addReason('scale-in allowed', 'scale_in_allowed', { delta: 4, operands: { maxConcurrent } });
     score += 4;
   }
 
   if (eligible && hasOpenOnSlug) {
     eligible = false;
-    reasons.push('already in this window');
+    addReason('already in this window', 'already_in_window');
   }
 
   if (cfg.mode === 'live' && readiness && !readiness.liveReady) {
     eligible = false;
-    reasons.push('live not ready — fund CLOB USDC');
+    addReason('live not ready — fund CLOB USDC', 'live_not_ready');
   }
 
   // Order book / arb: YES+NO ask sum < 1 → free edge; imbalance biases direction
@@ -331,7 +368,9 @@ export function buildDecision({
 
     if (arbGap != null && arbGap > 0.01) {
       score += arbGap * 160;
-      reasons.push(`arb gap +${(arbGap * 100).toFixed(1)}c`);
+      addReason(`arb gap +${(arbGap * 100).toFixed(1)}c`, 'arb_gap', {
+        value: arbGap, delta: arbGap * 160,
+      });
     }
     // Absolute cents also matter — mid-% can look fine while book is untradeable
     const spreadCents = side?.bestBid > 0 && side?.bestAsk > 0
@@ -339,49 +378,70 @@ export function buildDecision({
       : null;
     if (spreadPct != null && spreadPct < 0.8) {
       score += 12;
-      reasons.push(`ultra-tight spread ${spreadPct.toFixed(2)}%`);
+      addReason(`ultra-tight spread ${spreadPct.toFixed(2)}%`, 'ultra_tight_spread', {
+        value: spreadPct, delta: 12,
+      });
     } else if (spreadPct != null && spreadPct < 1.5) {
       score += 7;
-      reasons.push(`tight spread ${spreadPct.toFixed(2)}%`);
+      addReason(`tight spread ${spreadPct.toFixed(2)}%`, 'tight_spread', {
+        value: spreadPct, delta: 7,
+      });
     } else if (spreadPct != null && spreadPct > 3) {
       score -= 14;
-      reasons.push(`wide spread ${spreadPct.toFixed(2)}%`);
+      addReason(`wide spread ${spreadPct.toFixed(2)}%`, 'wide_spread', {
+        value: spreadPct, delta: -14,
+      });
       const blockPct = cfg.mode === 'paper' ? 12 : 6;
       if (spreadPct > blockPct && cfg.requireTightSpread !== false) {
         eligible = false;
-        reasons.push('spread too wide — blocked');
+        addReason('spread too wide — blocked', 'spread_blocked', {
+          value: spreadPct, operands: { blockPct },
+        });
       }
     }
     if (spreadCents != null && spreadCents > 8 && cfg.requireTightSpread !== false && cfg.mode !== 'paper') {
       eligible = false;
-      reasons.push(`spread ${spreadCents.toFixed(1)}c too wide`);
+      addReason(`spread ${spreadCents.toFixed(1)}c too wide`, 'spread_cents_too_wide', {
+        value: spreadCents, operands: { maxCents: 8 },
+      });
     }
     const imbHelps = (outcome === 'up' && imbalance > 0.15) || (outcome === 'down' && imbalance < -0.15);
     const imbHurts = (outcome === 'up' && imbalance < -0.25) || (outcome === 'down' && imbalance > 0.25);
     if (imbHelps) {
       score += Math.abs(imbalance) * 18;
-      reasons.push(`book ${imbalance > 0 ? 'bid' : 'ask'} heavy`);
+      addReason(`book ${imbalance > 0 ? 'bid' : 'ask'} heavy`, 'book_imbalance_helps', {
+        value: imbalance, delta: Math.abs(imbalance) * 18,
+      });
     } else if (imbHurts) {
       score -= Math.abs(imbalance) * 12;
-      reasons.push('book against');
+      addReason('book against', 'book_imbalance_hurts', {
+        value: imbalance, delta: -Math.abs(imbalance) * 12,
+      });
     }
   }
 
   if (cfg.useSignals) {
     if (!signal) {
       eligible = false;
-      reasons.push('signal unavailable');
+      addReason('signal unavailable', 'signal_unavailable');
     } else if (signal.tooVolatile || signal.skipTrade) {
       eligible = false;
-      reasons.push(`volatility high (${signal.volatility?.atrPct?.toFixed?.(2) || 'n/a'}% ATR)`);
+      addReason(`volatility high (${signal.volatility?.atrPct?.toFixed?.(2) || 'n/a'}% ATR)`, 'volatility_high', {
+        value: signal.volatility?.atrPct ?? null,
+        operands: { tooVolatile: !!signal.tooVolatile, skipTrade: !!signal.skipTrade },
+      });
     } else if (signal.direction === 'neutral') {
       // Neutral: still allow book/arb-driven trades on either side
       const edge = Math.max(0, 0.55 - price);
       score += edge * 35;
-      reasons.push('signal neutral — book/arb may lead');
+      addReason('signal neutral — book/arb may lead', 'signal_neutral', {
+        value: edge, delta: edge * 35,
+      });
       if (edge < 0.02 && !(bookMeta?.arbGap > 0.012)) {
         eligible = false;
-        reasons.push('neutral + no edge');
+        addReason('neutral + no edge', 'neutral_no_edge', {
+          value: edge, operands: { minEdge: 0.02, arbGap: bookMeta?.arbGap ?? null },
+        });
       }
     } else {
       const expectedDirection = outcome === 'up' ? 'up' : 'down';
@@ -393,56 +453,89 @@ export function buildDecision({
         const arbRescue = bookMeta?.arbGap != null && bookMeta.arbGap >= Number(cfg.minArbGap ?? 0.015);
         const explore = (cfg.arbExploreRate > 0 && Math.random() < Number(cfg.arbExploreRate));
         score -= 22;
-        reasons.push(`signal says ${signal.direction.toUpperCase()} (counter)`);
+        addReason(`signal says ${signal.direction.toUpperCase()} (counter)`, 'signal_counter', {
+          delta: -22, operands: { signalDirection: signal.direction, expected: expectedDirection },
+        });
         if (arbRescue) {
           score += bookMeta.arbGap * 200;
-          reasons.push('arb overrides mismatch');
+          addReason('arb overrides mismatch', 'arb_overrides_mismatch', {
+            value: bookMeta.arbGap, delta: bookMeta.arbGap * 200,
+          });
         } else if (explore || skewSoft) {
           score += skewSoft ? 8 : 6;
-          reasons.push(skewSoft ? 'soft skew explore' : 'explore opposite side');
+          addReason(
+            skewSoft ? 'soft skew explore' : 'explore opposite side',
+            skewSoft ? 'soft_skew_explore' : 'explore_opposite_side',
+            { delta: skewSoft ? 8 : 6, operands: { upShare: sideBalance?.upShare ?? null } },
+          );
         }
         // Counter without arb/edge stays eligible only if price is a clear underdog
         if (!arbRescue && !(price > 0 && price <= Number(cfg.underdogMaxPrice ?? 0.42))) {
           eligible = false;
-          reasons.push('counter needs arb or underdog price');
+          addReason('counter needs arb or underdog price', 'counter_needs_arb_or_underdog', {
+            value: price, operands: { underdogMaxPrice: Number(cfg.underdogMaxPrice ?? 0.42) },
+          });
         }
       } else if (signal.confidence < entryWin.minConfidence && !skewSoft) {
         eligible = false;
-        reasons.push(
+        addReason(
           `confidence ${(signal.confidence * 100).toFixed(0)}% < ${(entryWin.minConfidence * 100).toFixed(0)}% (${entryWin.source})`,
+          'confidence_below_min',
+          {
+            value: signal.confidence,
+            operands: { min: entryWin.minConfidence, source: entryWin.source },
+          },
         );
       } else {
         // Cap signal score contribution so soft balance can still nudge
         const confCap = Math.min(Number(signal.confidence || 0), 0.65);
-        score += (confCap * 40) + (edge * 45) + Math.min(Number(signal.score || 0), 6);
-        reasons.push(`signal ${signal.direction.toUpperCase()} ${(confCap * 100).toFixed(0)}%`);
-        if (edge > 0) reasons.push(`price edge +${(edge * 100).toFixed(1)}c`);
+        const signalDelta = (confCap * 40) + (edge * 45) + Math.min(Number(signal.score || 0), 6);
+        score += signalDelta;
+        // One `score +=` above, so the whole contribution is attributed to this
+        // reason. `price_edge` below carries its value but no delta — splitting
+        // the sum across both would double-count it in any client that adds up
+        // the deltas.
+        addReason(`signal ${signal.direction.toUpperCase()} ${(confCap * 100).toFixed(0)}%`, 'signal_agrees', {
+          value: confCap,
+          delta: signalDelta,
+          operands: { rawConfidence: Number(signal.confidence || 0), edge, signalScore: Number(signal.score || 0) },
+        });
+        if (edge > 0) {
+          addReason(`price edge +${(edge * 100).toFixed(1)}c`, 'price_edge', { value: edge });
+        }
         if (price > 0 && price <= Number(cfg.underdogMaxPrice ?? 0.42)) {
           score += 12;
-          reasons.push('underdog hold-to-settle candidate');
+          addReason('underdog hold-to-settle candidate', 'underdog_candidate', {
+            value: price, delta: 12, operands: { underdogMaxPrice: Number(cfg.underdogMaxPrice ?? 0.42) },
+          });
         }
         if (signal.confidenceBiasUsed && signal.confidenceBias?.traceAgree === true) {
           score += 3;
-          reasons.push('ML short-trace agrees');
+          addReason('ML short-trace agrees', 'ml_trace_agrees', { delta: 3 });
         } else if (signal.confidenceBias?.traceAgree === false) {
           score -= 8;
-          reasons.push('ML short-trace disagrees');
+          addReason('ML short-trace disagrees', 'ml_trace_disagrees', { delta: -8 });
         }
       }
     }
   } else {
-    score += Math.max(0, 0.55 - price) * 40;
-    reasons.push('signals disabled');
+    const noSignalDelta = Math.max(0, 0.55 - price) * 40;
+    score += noSignalDelta;
+    addReason('signals disabled', 'signals_disabled', { value: price, delta: noSignalDelta });
   }
 
   // Break chronic single-side bias
   const bal = sideBalanceBonus(outcome, cfg, sideBalance);
   if (bal.bonus) {
     score += bal.bonus;
-    if (bal.note) reasons.push(bal.note);
+    if (bal.note) {
+      addReason(bal.note, 'side_balance', {
+        delta: bal.bonus, operands: { upShare: sideBalance?.upShare ?? null },
+      });
+    }
   }
 
-  if (eligible) reasons.push('tradable now');
+  if (eligible) addReason('tradable now', 'tradable_now');
 
   return {
     outcome,
@@ -450,6 +543,7 @@ export function buildDecision({
     eligible,
     score,
     reasons,
+    reasonCodes,
     book: bookMeta,
   };
 }

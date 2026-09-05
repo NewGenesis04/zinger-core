@@ -6,6 +6,7 @@ process.env.ZINGER_RECEIPT_ECHO = '0';
 
 const { captureReceipt, captureClobCall, readReceipts } =
   await import('../../src/polymarket/clobReceipts.js');
+const { onEvent } = await import('../../src/polymarket/telemetry/events.js');
 
 /** Receipts accumulate in one worker-local log, so each test tags its own. */
 const tag = (name: string) => `test/${name}/${Math.random().toString(36).slice(2)}`;
@@ -138,5 +139,60 @@ describe('INVARIANT: capturing never changes what the caller sees', () => {
     expect(rec.phase).toBe('response');
     expect((rec.raw as any).success).toBe(false);
     expect((rec.raw as any).errorMsg).toBe('order could not be fully filled');
+  });
+});
+
+/**
+ * The bus tee (item 48 step C) is a SECOND sink, never a replacement. The JSONL
+ * remains the durable copy — it survives a restart and the bus does not — so
+ * the invariant is that both receive the same record, not that either one wins.
+ */
+describe('INVARIANT: a receipt reaches the log and the bus alike', () => {
+  it('emits the same record it appends, without disturbing the file', async () => {
+    const fn = tag('bus-tee');
+    const seen: any[] = [];
+    const unsubscribe = onEvent('trade.execution.receipt', (e) => seen.push(e));
+
+    try {
+      captureReceipt({
+        fn,
+        phase: 'response',
+        request: { tokenId: 'token-up', size: 5 },
+        raw: { orderID: '0xfeed', makingAmount: '5000000', status: 'matched' },
+      });
+
+      const [onDisk] = findByFn(fn);
+      const emitted = seen.filter((e) => e.data.fn === fn);
+
+      expect(onDisk).toBeDefined();          // file sink still written
+      expect(emitted).toHaveLength(1);       // exactly one event, no double-emit
+      expect(emitted[0].type).toBe('trade.execution.receipt');
+      // Same record, not a summary of it — the whole point of the capture.
+      expect(emitted[0].data.raw).toEqual(onDisk.raw);
+      expect(emitted[0].data.rawKeys).toEqual(onDisk.rawKeys);
+      expect(emitted[0].data.request).toEqual(onDisk.request);
+    } finally {
+      unsubscribe();
+    }
+  });
+
+  it('still cannot break a trade if the bus throws', () => {
+    // The capture runs inside live order execution. A listener that throws must
+    // not propagate — a diagnostic that can kill an order is worse than none.
+    const fn = tag('bus-throws');
+    const unsubscribe = onEvent('trade.execution.receipt', () => {
+      throw new Error('subscriber exploded');
+    });
+
+    try {
+      expect(() => captureReceipt({
+        fn,
+        phase: 'response',
+        request: { tokenId: 'token-down' },
+        raw: { orderID: '0xdead' },
+      })).not.toThrow();
+    } finally {
+      unsubscribe();
+    }
   });
 });

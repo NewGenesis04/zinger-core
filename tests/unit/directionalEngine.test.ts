@@ -181,6 +181,81 @@ describe('directional engine — entry gate invariants', () => {
   });
 });
 
+/**
+ * Rule (iii) of item 48: a reason must be machine-readable, not a sentence.
+ *
+ * The prose array stays because the dashboard renders it, so the risk is drift
+ * — someone adds a `reasons.push` without a matching code and the event stream
+ * quietly loses a reason it never knew existed. These are the properties that
+ * make that impossible to miss.
+ */
+describe('directional engine — reason codes stay aligned with prose', () => {
+  const CASES = [
+    {},
+    { remaining: 0 },
+    { remaining: 400 },
+    { price: 0.99 },
+    { price: 0.01 },
+    { price: 0.3 },
+    { signal: null },
+    { signal: { direction: 'down', confidence: 0.9, score: 5 } },
+    { signal: { direction: 'neutral', confidence: 0.5, score: 1 } },
+    { signal: { direction: 'up', confidence: 0.05, score: 1 } },
+    { signal: { direction: 'up', confidence: 0.8, score: 9, tooVolatile: true, volatility: { atrPct: 4.2 } } },
+    { market: { ...MARKET, acceptingOrders: false } },
+    { market: { ...MARKET, isCurrent: false } },
+    { existingPosition: { id: 'p1' } },
+    { portfolio: { hasOpenOnSlug: true, sideBalance: BALANCED, dataAssurance: null } },
+    { portfolio: { hasOpenOnSlug: false, sideBalance: BALANCED, dataAssurance: { canBuy: false, note: 'feed thin', score: 12 } } },
+    { depth: null },
+    { cfg: { ...CFG, useSignals: false } },
+    { cfg: { ...CFG, mode: 'live' } },
+  ];
+
+  it('INVARIANT: every prose reason has exactly one code, in the same order', () => {
+    for (const over of CASES) {
+      const d = decide(over);
+      expect(d.reasonCodes, JSON.stringify(over)).toBeDefined();
+      // One-to-one and positional: reasonCodes[i] explains reasons[i]. A bare
+      // `reasons.push` anywhere in the engine breaks this immediately.
+      expect(d.reasonCodes.length, JSON.stringify(over)).toBe(d.reasons.length);
+    }
+  });
+
+  it('INVARIANT: no code is empty, and none carries prose in place of a code', () => {
+    for (const over of CASES) {
+      for (const rc of decide(over).reasonCodes) {
+        expect(typeof rc.code).toBe('string');
+        expect(rc.code.length).toBeGreaterThan(0);
+        // A code is a stable identifier, not a rendered sentence: snake_case
+        // only. This is what stops the prose leaking back in one push at a time.
+        expect(rc.code, JSON.stringify(rc)).toMatch(/^[a-z][a-z0-9_]*$/);
+      }
+    }
+  });
+
+  it('INVARIANT: a scored reason carries the number it scored', () => {
+    // The point of a delta is that a client can sum the contributions and
+    // reconcile them against `score` rather than trusting a total it cannot
+    // check. A reason that moved the score with no delta is a hole.
+    const d = decide({ remaining: 240, price: 0.3 });
+    const scored = d.reasonCodes.filter((r) => r.delta != null);
+    expect(scored.length).toBeGreaterThan(0);
+    for (const r of scored) expect(Number.isFinite(r.delta)).toBe(true);
+  });
+
+  it('carries both sides of a threshold comparison', () => {
+    // `confidence_below_min` is useless as a bare code — the whole question is
+    // 41% against what. Operands are what make it answerable without regexing
+    // the sentence back apart.
+    const d = decide({ signal: { direction: 'up', confidence: 0.05, score: 1 } });
+    const conf = d.reasonCodes.find((r) => r.code === 'confidence_below_min');
+    expect(conf).toBeDefined();
+    expect(conf.value).toBe(0.05);
+    expect(conf.operands.min).toBeGreaterThan(0.05);
+  });
+});
+
 describe('directional engine — sizing invariants', () => {
   const size = (cfgOver = {}, argsOver = {}) => resolveOrderSize(
     { ...CFG, ...cfgOver },

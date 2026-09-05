@@ -377,6 +377,12 @@ function saveTrade(trade) {
   botState.trades.unshift(normalized);
   persist(FILES.TRADES, botState.trades.slice(0, 500));
   refreshKellyHistory();
+  // Item 48 decision (i): this is the single writer for `trade.execution`.
+  // The single trade object, not the array — a consumer wanting history reads
+  // the stream, it does not re-receive every prior trade on each new one.
+  // Placed after the two dedupe guards above, so a suppressed duplicate write
+  // does not emit an event either.
+  emitEvent('trade.execution', normalized);
 }
 
 /**
@@ -577,6 +583,128 @@ function maybeFinalizeCycle() {
 
 function bookWindowExit(exitReason, pnl) {
   bookWindowExitCycle(botState._cycleSettleAccum, exitReason, pnl);
+}
+
+/** Finite number or null — a payload field should never carry NaN. */
+function telemetryNum(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+/**
+ * Single owner for `trade.decision` (item 48 step E — the D8 core).
+ *
+ * Emitted once per market per completed scan, at the point where everything is
+ * known: the candidates and their scores, which one was selected, the sizing
+ * chain, and the final action. Emitting per candidate instead would double the
+ * volume and still not carry the sizing, which only exists once a candidate is
+ * selected.
+ *
+ * Rule (iii) throughout: `reasons` are the `{code, value, delta, operands}`
+ * triples from `buildDecision`, not the prose the dashboard renders, and
+ * `skipReason` is a code plus its operands. Nothing here is a sentence.
+ *
+ * `losers` records what the other outcome scored, so "why UP and not DOWN"
+ * is answerable from one event rather than by correlating two.
+ */
+function emitDecisionEvent({
+  market, outcome, cfg, signal, depth, prices, remaining,
+  selectedCandidate, candidates, action, skipReason, sizing,
+}) {
+  const side = outcome ? depth?.[outcome] : null;
+  const chosen = selectedCandidate || null;
+  const kelly = sizing?.kelly || null;
+
+  emitEvent('trade.decision', {
+    engine: 'directional',
+    symbol: market?.symbol ?? null,
+    slug: market?.slug ?? null,
+    outcome: outcome ?? null,
+    mode: cfg?.mode || 'paper',
+    inputs: {
+      price: telemetryNum(chosen?.price),
+      bestBid: telemetryNum(side?.bestBid),
+      bestAsk: telemetryNum(side?.bestAsk),
+      spreadPct: telemetryNum(side?.spreadPct),
+      imbalance: telemetryNum(side?.imbalance),
+      arbGap: telemetryNum(chosen?.book?.arbGap),
+      remaining: telemetryNum(remaining),
+      priceSource: prices?._source || null,
+      isCurrent: market?.isCurrent ?? null,
+      acceptingOrders: market?.acceptingOrders ?? null,
+      duration: market?.duration ?? null,
+      signalDirection: signal?.direction ?? null,
+      signalConfidence: telemetryNum(signal?.confidence),
+      signalScore: telemetryNum(signal?.score),
+    },
+    scoring: {
+      score: telemetryNum(chosen?.score),
+      eligible: chosen?.eligible ?? false,
+      reasons: chosen?.reasonCodes || [],
+      // What the rejected outcome scored, and why it lost.
+      losers: (candidates || [])
+        .filter((c) => c !== chosen)
+        .map((c) => ({
+          outcome: c?.outcome ?? null,
+          score: telemetryNum(c?.score),
+          eligible: c?.eligible ?? false,
+          reasons: c?.reasonCodes || [],
+        })),
+    },
+    sizing: sizing ? {
+      sizeUsd: telemetryNum(sizing.sizeUsd),
+      kellyFraction: telemetryNum(kelly?.fraction),
+      kellyRaw: telemetryNum(kelly?.raw),
+      volTilt: telemetryNum(kelly?.volTilt),
+      bankroll: telemetryNum(kelly?.bankroll),
+      caps: kelly?.caps ?? null,
+      boundBy: kelly?.boundBy ?? kelly?.reason ?? null,
+    } : null,
+    output: {
+      action: action ?? null,
+      skipReason: skipReason ?? null,
+    },
+  });
+}
+
+/**
+ * Single owner for `position.exit` (item 48, finding b + decision i).
+ *
+ * Twelve `log(…, 'sl'|'tp', …)` call sites used to produce this event via the
+ * type-guessing map that used to sit in `log()`. Two of those were not exits at
+ * all — the unverified-fill flatten and the PM wallet sell — and emitted
+ * phantom exits carrying no symbol or PnL. Routing every real exit through here
+ * means the payload is built once and cannot drift between paths, and the two
+ * impostors simply stop claiming to be exits.
+ *
+ * Call AFTER the position's final state is settled: `pos.pnl`, `pos.exitPrice`
+ * and `pos.feesPaid` are all written late in `closePosition`.
+ *
+ * `pnl` is emitted as recorded on the position. On the paper path it is net of
+ * entry and exit fees (`bot.ts` paper branch of `closePosition`); the live path
+ * takes whatever `markPosition` computed. `fee` is emitted alongside so a
+ * consumer can tell which it is holding rather than having to assume.
+ */
+function emitPositionExit(pos, exitReason, extra = {}) {
+  if (!pos) return;
+  emitEvent('position.exit', {
+    exitReason,
+    symbol: pos.symbol ?? null,
+    slug: pos.slug ?? null,
+    outcome: pos.outcome ?? null,
+    mode: pos.mode || 'paper',
+    engine: pos.engine ?? null,
+    entryPrice: telemetryNum(pos.entryPrice),
+    exitPrice: telemetryNum(extra.exitPrice ?? pos.exitPrice),
+    pnl: telemetryNum(extra.pnl ?? pos.pnl),
+    gainPct: telemetryNum(extra.gainPct ?? pos.gainPct),
+    shares: telemetryNum(extra.shares ?? positionShares(pos)),
+    fee: telemetryNum(pos.feesPaid),
+    orderId: pos.orderId ?? null,
+    sellOrderId: pos.sellOrderId ?? null,
+    windowKey: windowKeyFromTrade(pos) || parseSlugWindow(pos.slug)?.key || null,
+    ...extra,
+  });
 }
 
 function computeStats(trades) {
@@ -1049,13 +1177,36 @@ function log(msg, type = 'info', meta = null) {
   });
   if (botState.executionLog.length > EXECUTION_LOG_CAP) botState.executionLog.length = EXECUTION_LOG_CAP;
 
-  // D8 typed event emission
-  const evtType = (type === 'sl' || type === 'tp') ? 'position.exit'
-    : (type === 'buy') ? 'trade.execution'
-    : (meta?.arb || type === 'arb') ? 'package.settlement'
-    : (type === 'signal') ? 'trade.decision'
-    : 'system.alert';
-  emitEvent(evtType, { message: msg, type, ...(meta || {}) });
+  /**
+   * D8 typed event emission — item 48 decision (i): one writer per event type.
+   *
+   * This used to guess an `EventType` from the human-chosen string tag and ship
+   * the prose as the payload, which is the pre-D8 direction wearing an event
+   * costume, and it double-emitted every fact that also had an explicit tee.
+   * Types are handed over as their tee lands:
+   *
+   *   position.exit        -> `emitPositionExit`  (step C, done)
+   *   trade.execution      -> `saveTrade`         (step C, done)
+   *   package.settlement   -> `arbEngine`         (already explicit)
+   *   trade.decision       -> the decision tee    (step E, NOT YET)
+   *
+   *   trade.decision       -> `emitDecisionEvent`   (step E, done)
+   *
+   * Handover complete: every typed event now has exactly one explicit writer,
+   * and this emits `system.alert` unconditionally. Do not add type-guessing
+   * back — if a new fact deserves a typed event, give it its own tee.
+   *
+   * `kind` is taken from meta when a caller states it, never inferred from the
+   * message text — guessing a category by matching on prose is the same defect
+   * the old type map had, one layer down. Unclassified alerts carry null.
+   */
+  emitEvent('system.alert', {
+    message: msg,
+    type,
+    ...(meta || {}),
+    kind: meta?.kind ?? (type === 'error' ? 'health' : null),
+    level: meta?.level ?? type,
+  });
 
   if (AGILE_NOTIFY_TYPES.has(type) || (meta && meta.arb)) {
     pushNotification({
@@ -1878,15 +2029,45 @@ export function getState(opts = {}) {
   };
 }
 
+/**
+ * Emit only on a readiness TRANSITION (item 48 step D).
+ *
+ * `refreshTelemetry` runs on a timer, so emitting unconditionally would put a
+ * duplicate alert on the bus every cycle and drown the thing worth seeing. What
+ * matters forensically is the edge: the moment live went from ready to not, and
+ * what it said was missing.
+ */
+function emitReadinessTransition(next) {
+  const was = botState._lastLiveReady;
+  const now = !!next?.liveReady;
+  if (was === now) return;
+  botState._lastLiveReady = now;
+  if (was === undefined) return; // first observation is not a transition
+  emitEvent('system.alert', {
+    kind: 'health',
+    level: now ? 'info' : 'warn',
+    message: now ? 'live readiness restored' : 'live readiness lost',
+    detail: {
+      liveReady: now,
+      paperReady: !!next?.paperReady,
+      needs: next?.needs ?? null,
+      clobBalance: telemetryNum(next?.clobBalance),
+      spendableBalance: telemetryNum(next?.spendableBalance),
+    },
+  });
+}
+
 async function refreshTelemetry() {
   try {
     const readiness = await checkReadiness(botState.config);
     botState.readiness = readiness;
     botState.telemetry.usdcBalance = readiness.spendableBalance ?? readiness.clobBalance;
     botState.telemetry.polyBalance = readiness.polyBalance;
+    emitReadinessTransition(readiness);
     return readiness;
   } catch (err) {
     botState.readiness = { liveReady: false, paperReady: true, needs: [err.message], checks: [] };
+    emitReadinessTransition(botState.readiness);
     return botState.readiness;
   }
 }
@@ -2049,6 +2230,11 @@ async function scanOpenExitsFast() {
         fastExit: true,
       });
       bookWindowExit('sl', pos.pnl);
+      // Fast-SL bypasses closePosition entirely, so it tees here (finding b).
+      emitPositionExit(pos, 'sl', {
+        exitPrice: fillPrice, shares: sellShares,
+        effectiveSlPct: effectiveSl, markBid: mark, fastExit: true,
+      });
       log(`🛑 FAST SL ${pos.mode === 'live' ? 'LIVE' : 'PAPER'} ${pos.symbol} ${pos.outcome.toUpperCase()} · -$${Math.abs(pos.pnl).toFixed(2)} (${pos.gainPct.toFixed(1)}%) · stop ${effectiveSl}%`, 'sl', {
         market: pos.symbol, slug: pos.slug, outcome: pos.outcome,
         entryPrice: pos.entryPrice, exitPrice: fillPrice, gainPct: pos.gainPct, pnl: pos.pnl,
@@ -2154,6 +2340,7 @@ export async function scan() {
     });
     if (!botState._dataAssurance.canBuy && cfg.requireDataAssurance !== false) {
       log(`🛡️ DATA GATE · ${botState._dataAssurance.note}`, 'scan', {
+        kind: 'data_gate',
         score: botState._dataAssurance.score,
         blocking: botState._dataAssurance.blocking,
       });
@@ -2303,6 +2490,11 @@ export async function scan() {
             earlyExit: true,
           });
           bookWindowExit('sl', openPos.pnl);
+          // Early-SL also bypasses closePosition (finding b).
+          emitPositionExit(openPos, 'sl', {
+            exitPrice: fillPrice,
+            effectiveSlPct: effectiveSl, markBid: mark, earlyExit: true,
+          });
           log(`🛑 EARLY SL ${openPos.mode === 'live' ? 'LIVE' : 'PAPER'} ${openPos.symbol} ${openPos.outcome.toUpperCase()} · -$${Math.abs(openPos.pnl).toFixed(2)} (${openPos.gainPct.toFixed(1)}%) · stop ${effectiveSl}%`, 'sl', {
             market: openPos.symbol, slug: openPos.slug, outcome: openPos.outcome,
             entryPrice: openPos.entryPrice, exitPrice: fillPrice, gainPct: openPos.gainPct, pnl: openPos.pnl,
@@ -2322,6 +2514,18 @@ export async function scan() {
       let confidence = 0;
       const candidates = [];
       let selectedCandidate = null;
+      /**
+       * Why no order was placed, when the candidate itself was fine (item 48
+       * rule iii — a code plus the operands, never a sentence).
+       *
+       * `buildDecision`'s own reason codes cover a candidate that failed
+       * scoring. These are the gates AFTER it: the edge gate, the position
+       * budget, the slot caps and the cash checks. Without them the record
+       * shows an eligible, high-scoring candidate and no trade, with nothing
+       * saying which gate stopped it — the "why didn't the bot trade?" question
+       * backlog 13 was raised for.
+       */
+      let skipReason = null;
       const activePosition = botState.positions.find((position) =>
         position.symbol === market.symbol && position.slug === market.slug && !position.closed
       );
@@ -2420,6 +2624,7 @@ export async function scan() {
       // Arb-only gate: block directional buys until paper expectancy recovers
       if (selectedCandidate && action !== 'arb') {
         if (edgeGate.arbOnly) {
+          skipReason = { code: 'edge_gate_arb_only', operands: { reason: edgeGate.reason ?? null } };
           selectedCandidate = null;
           action = 'hold';
           confidence = signal?.confidence || 0;
@@ -2445,11 +2650,27 @@ export async function scan() {
           equity: null,
         });
         if (!env.allowNewEntries || !env.maxOpensFor(market.duration || '5m')) {
+          skipReason = {
+            code: 'position_budget_exhausted',
+            operands: {
+              allowNewEntries: !!env.allowNewEntries,
+              maxOpensForDuration: env.maxOpensFor(market.duration || '5m') ?? null,
+              duration: market.duration || '5m',
+            },
+          };
           action = 'hold';
           buyOutcome = null;
         } else if (hasOpenOnSlug(market.slug)) {
+          skipReason = { code: 'already_open_on_slug', operands: { slug: market.slug } };
           action = 'hold';
         } else if (countOpenPositions(cfg.mode, 'directional') >= Number(cfg.maxOpenPositions ?? 6)) {
+          skipReason = {
+            code: 'max_open_positions',
+            operands: {
+              open: countOpenPositions(cfg.mode, 'directional'),
+              max: Number(cfg.maxOpenPositions ?? 6),
+            },
+          };
           action = 'hold';
         } else {
         botState._buyLocks.add(market.slug);
@@ -2465,6 +2686,10 @@ export async function scan() {
           symbol: market.symbol,
         });
         if (!sizeUsd || sizeUsd <= 0) {
+          skipReason = {
+            code: 'size_resolved_to_zero',
+            operands: { sizeUsd: sizeUsd ?? null, kellyFraction: kelly?.fraction ?? null },
+          };
           action = 'hold';
           botState._buyLocks.delete(market.slug);
         } else {
@@ -2476,6 +2701,10 @@ export async function scan() {
         });
 
         if (cfg.mode === 'paper' && plan.costEst > Number(cfg.paperBankroll ?? 0) + 0.001) {
+          skipReason = {
+            code: 'insufficient_paper_cash',
+            operands: { costEst: plan.costEst, paperBankroll: Number(cfg.paperBankroll ?? 0) },
+          };
           action = 'hold';
           botState._buyLocks.delete(market.slug);
         } else {
@@ -2684,6 +2913,13 @@ export async function scan() {
               market: pos.symbol, slug: pos.slug, outcome: pos.outcome,
               entryPrice: pos.entryPrice, exitPrice: fillPrice, gainPct, pnl: partialPnl, shares: sellShares,
             });
+            // Partial returns early, so it needs its own tee — the one at the
+            // end of closePosition is never reached on this path.
+            emitPositionExit(pos, 'partial', {
+              exitPrice: fillPrice, pnl: partialPnl, gainPct, shares: sellShares,
+              partialPct: pos.partialPct ?? null,
+              sharesRemaining: telemetryNum(pos.shares),
+            });
             saveState();
             return true;
           }
@@ -2804,6 +3040,7 @@ export async function scan() {
           } else {
             bookWindowExit('partial', extraMeta.partialPnl ?? pos.partialPnl ?? 0);
           }
+          emitPositionExit(pos, exitReason, { exitPrice: fillPrice, shares: sellShares });
           try { await syncClobBalance(); await refreshTelemetry(); } catch {}
           return true;
         }
@@ -2933,6 +3170,26 @@ export async function scan() {
         });
       }
 
+      // Hoisted out of the object literal below so the decision event and the
+      // dashboard payload share one call — this runs per market per scan, and
+      // `resolveOrderSize` walks the whole kelly chain.
+      const sizingPreview = selectedCandidate?.eligible ? resolveOrderSize(cfg, {
+        price: selectedCandidate.price,
+        signal,
+        readiness,
+        stats: botState.stats,
+        remaining: market.remaining,
+        windowSec: market.windowSeconds || POLY_WINDOW_SECONDS,
+        duration: market.duration,
+        symbol: market.symbol,
+      }) : null;
+
+      emitDecisionEvent({
+        market, outcome: selectedCandidate?.outcome || buyOutcome, cfg, signal, depth, prices,
+        remaining: winMeta.remainingMs != null ? Math.ceil(winMeta.remainingMs / 1000) : market.remaining,
+        selectedCandidate, candidates, action, skipReason, sizing: sizingPreview,
+      });
+
       enriched.push({
         symbol: market.symbol, slug: market.slug, question: market.question,
         tokenIds: market.tokenIds, endTime: market.endTime,
@@ -2959,16 +3216,7 @@ export async function scan() {
         signalDetails: summarizeSignal(signal),
         decision,
         candidates,
-        sizingPreview: selectedCandidate?.eligible ? resolveOrderSize(cfg, {
-          price: selectedCandidate.price,
-          signal,
-          readiness,
-          stats: botState.stats,
-          remaining: market.remaining,
-          windowSec: market.windowSeconds || POLY_WINDOW_SECONDS,
-          duration: market.duration,
-          symbol: market.symbol,
-        }) : null,
+        sizingPreview,
         position: activePosition ? {
           id: activePosition.id,
           outcome: activePosition.outcome,
@@ -3494,6 +3742,17 @@ export function startBot() {
   botState.running = true;
   botState._startTime = Date.now();
   botState.stopRequest = null;
+  emitEvent('system.alert', {
+    kind: 'lifecycle',
+    level: 'info',
+    message: 'bot started',
+    detail: {
+      mode: botState.config.mode || 'paper',
+      startedAt: botState._startTime,
+      liveAllowed: !!gate.liveAllowed,
+      gateReason: gate.reason ?? null,
+    },
+  });
   reconcilePaperCash('bot start');
   repairPaperOverdraft('bot start');
   // A package stranded PENDING_FILL by a restart is exactly what this catches,
@@ -3654,6 +3913,20 @@ export function stopBot(options = {}) {
   if (botState.interval) { clearInterval(botState.interval); botState.interval = null; }
   const session = completeSession(options?.reason || (immediate ? 'immediate' : 'stopped'));
   botState.stopRequest = null;
+  emitEvent('system.alert', {
+    kind: 'lifecycle',
+    level: 'info',
+    message: 'bot stopped',
+    detail: {
+      mode: botState.config.mode || 'paper',
+      reason: options?.reason || (immediate ? 'immediate' : 'stopped'),
+      immediate,
+      sessionId: session?.id ?? null,
+      sessionTrades: session?.trades ?? 0,
+      sessionPnl: telemetryNum(session?.pnl),
+      ranForMs: botState._startTime ? Date.now() - botState._startTime : null,
+    },
+  });
   log(`⏹️ Bot stopped · session ${session?.trades || 0} trades · PnL $${Number(session?.pnl || 0).toFixed(2)}`, 'system');
   notifyStateChange();
   return { ok: true, running: false, session };
@@ -3745,6 +4018,19 @@ export function resetPaperData({ initialDeposit = 100 } = {}) {
   saveConfig({ mode: 'paper', enabled: false, paperBankroll: amount, paperInitialDeposit: amount },
     { tier: 'operator', source: 'reset-paper' });
   refreshKellyHistory();
+  // Paper resets orphan arb packages from their trades (backlog 24), so the
+  // cleared counts are worth recording here too — `account.reset` is not a
+  // live-only event.
+  emitEvent('account.reset', {
+    at: Date.now(),
+    mode: 'paper',
+    reason: 'paper_reset_clean_slate',
+    baselineUsd: telemetryNum(amount),
+    clearedTrades: removed.trades,
+    clearedPositions: removed.positions,
+    clearedPackages: removed.packages,
+    clearedActions: removed.actions,
+  });
   log(`♻️ PAPER DATA RESET · $${amount.toFixed(2)} initial · removed ${removed.trades} trades, ${removed.packages} packages`, 'system', removed);
   notifyStateChange();
   return { ok: true, removed, paperBankroll: amount };
@@ -3819,6 +4105,24 @@ export function resetLiveData({ baselineUsd = null } = {}) {
   const baseline = saveBaseline(cash, 'Live account normalized — clean slate');
   saveConfig({ mode: 'live', enabled: false }, { tier: 'operator', source: 'reset-live' });
   refreshKellyHistory();
+  // Item 48 step D. A reset rebases the baseline every later PnL figure is
+  // measured against, so what it cleared has to be recoverable afterwards —
+  // backlog 46 is exactly what happens when it is not. Emitted after
+  // `saveBaseline` so the payload carries the baseline actually written.
+  emitEvent('account.reset', {
+    at: Date.now(),
+    mode: 'live',
+    reason: 'live_reset_clean_slate',
+    baselineUsd: telemetryNum(baseline?.balanceUsd),
+    baselineRequested: telemetryNum(baselineUsd),
+    clearedTrades: removed.trades,
+    clearedPositions: removed.positions,
+    clearedPackages: removed.packages,
+    clearedActions: removed.actions,
+    phantomTrades: removed.phantomTrades,
+    phantomOpen: removed.phantomOpen,
+    archiveFile: String(archiveFile),
+  });
   log(
     `♻️ LIVE DATA RESET · baseline $${Number(baseline.balanceUsd).toFixed(2)} · removed ${removed.trades} trades (${removed.phantomTrades} phantom)`,
     'system',

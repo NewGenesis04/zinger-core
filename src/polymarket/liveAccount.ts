@@ -10,6 +10,7 @@ import { persist, persistSync, load, dataPath, FILES } from './persistence.js';
 import { getWallet } from '../lib/wallet.js';
 import { getClobBalance } from './trade.js';
 import { dedupeTrades } from './audit.js';
+import { emitEvent } from './telemetry/events.js';
 
 const FILE = dataPath('live_account.json');
 const MAX_EVENTS = 800;
@@ -38,10 +39,42 @@ function loadStore() {
   return load(FILE, emptyStore()) || emptyStore();
 }
 
+/**
+ * Single owner for `account.cash` (item 48 step D).
+ *
+ * The tee lives here rather than at the four call sites for the same reason
+ * `emitPositionExit` exists: one payload builder cannot drift, four can. Every
+ * write of the live-account store is a cash-state transition worth recording,
+ * so the persist boundary is exactly the right seam.
+ *
+ * A second sink — the store file remains the durable copy.
+ */
 function saveStore(store, sync = false) {
   store.updatedAt = Date.now();
   if (sync) persistSync(FILE, store);
   else persist(FILE, store);
+
+  const mismatches = store.botMismatch || [];
+  emitEvent('account.cash', {
+    mode: 'live',
+    clob: numOrNull(store.cash?.clob),
+    lifetimeBaseline: numOrNull(store.cash?.lifetimeBaseline),
+    sessionStartCash: numOrNull(store.cash?.sessionStartCash),
+    lastSyncAt: store.cash?.lastSyncAt ?? null,
+    pmRealizedSum: numOrNull(store.reconcile?.pmRealizedSum),
+    botVerifiedSum: numOrNull(store.reconcile?.botVerifiedSum),
+    reconcile: store.reconcile ?? null,
+    mismatchCount: mismatches.length,
+    ok: mismatches.length === 0,
+    closedCount: (store.closed || []).length,
+    sync,
+  });
+}
+
+/** Finite number or null — a payload field should never carry NaN. */
+function numOrNull(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
 }
 
 function round2(n) {

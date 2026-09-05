@@ -38,8 +38,16 @@ export const DEFAULT_EVENT_BUFFER_CAP = 5000;
  */
 export interface DecisionReason {
   code: string;
+  /** The measured number this reason fired on. */
   value?: number | null;
+  /** Its contribution to the score, where it has one. */
   delta?: number | null;
+  /**
+   * The other side of a comparison, so `confidence_below_min` carries both the
+   * 0.41 and the 0.45 rather than a client having to know the threshold — or
+   * worse, parse it back out of a sentence.
+   */
+  operands?: Record<string, number | string | boolean | null>;
 }
 
 /** Rule (iii) for the negative case: why no order was placed. */
@@ -340,6 +348,8 @@ class TelemetryBus extends EventEmitter {
   private seq: number = 0;
   /** Count of events dropped off the back. Without this, loss is invisible. */
   private evicted: number = 0;
+  private subscriberErrors: number = 0;
+  private lastSubscriberError: string | null = null;
 
   constructor(maxCap: number = DEFAULT_EVENT_BUFFER_CAP) {
     super();
@@ -357,6 +367,44 @@ class TelemetryBus extends EventEmitter {
 
   public getEvicted(): number {
     return this.evicted;
+  }
+
+  public getSubscriberErrors(): { count: number; last: string | null } {
+    return { count: this.subscriberErrors, last: this.lastSubscriberError };
+  }
+
+  /**
+   * Deliver to one channel's subscribers, isolating each from the others.
+   *
+   * A plain `this.emit(type, …)` would propagate the first listener's throw,
+   * so the subsequent `emit('*', …)` never ran — one bad consumer silently cut
+   * the feed to every other consumer, including the SSE stream. Worse, the
+   * throw surfaced on whatever stack emitted, which for the receipt tee is live
+   * order execution.
+   *
+   * `rawListeners()` returns a copy, so a handler that unsubscribes mid-fan-out
+   * cannot shift the array underneath the loop, and Node's `once` wrapper
+   * self-removes when invoked directly, so `once()` semantics survive.
+   *
+   * Subscriber faults are counted and reported rather than silently eaten — a
+   * swallowed exception with no trace is how a dead consumer stays invisible.
+   * Reporting is throttled because emission runs at scan-loop rate.
+   */
+  private fanOut(channel: EventType | '*', event: BaseTelemetryEvent): void {
+    for (const listener of this.rawListeners(channel)) {
+      try {
+        (listener as (e: BaseTelemetryEvent) => void)(event);
+      } catch (err) {
+        this.subscriberErrors += 1;
+        this.lastSubscriberError = `${channel}: ${(err as Error)?.message || String(err)}`;
+        if (this.subscriberErrors === 1 || this.subscriberErrors % 100 === 0) {
+          console.error(
+            `[telemetry] subscriber threw on '${channel}' (${this.subscriberErrors} total):`,
+            (err as Error)?.message || err,
+          );
+        }
+      }
+    }
   }
 
   public emitEvent<T extends EventType>(
@@ -378,8 +426,8 @@ class TelemetryBus extends EventEmitter {
       this.evicted += 1;
     }
 
-    this.emit(type, event);
-    this.emit('*', event);
+    this.fanOut(type, event);
+    this.fanOut('*', event);
     return event;
   }
 
@@ -508,6 +556,11 @@ export function queryEventsPage(filter?: EventQueryFilter): EventPage {
 /** Events dropped off the back of the buffer since process start. */
 export function evictedCount(): number {
   return telemetryBus.getEvicted();
+}
+
+/** Subscriber faults absorbed by the fan-out, so they are not invisible. */
+export function subscriberErrors(): { count: number; last: string | null } {
+  return telemetryBus.getSubscriberErrors();
 }
 
 export function setEventBufferCapacity(cap: number): void {

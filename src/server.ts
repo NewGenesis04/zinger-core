@@ -23,7 +23,7 @@ import { refreshAllTokens, loadAutoSellConfig, saveAutoSellConfig } from './lib/
 import { sellToken, addTransaction, loadTransactions, getTokenFees } from './lib/pons.js';
 import { sseLine } from './lib/sse.js';
 import { loadPackages, getArbPackageMetrics } from './polymarket/arbEngine.js';
-import { loadFileOrStore, saveFileOrStore } from './polymarket/sqliteStore.js';
+import { loadFileOrStore, saveFileOrStore, sqliteLoadWithMeta } from './polymarket/sqliteStore.js';
 import { describeBackend } from './polymarket/persistence.js';
 // Imported straight from the bus rather than through `polymarket/index.js`:
 // `telemetry/events.ts` imports only `node:events`, so there is no cycle, and
@@ -861,6 +861,71 @@ export async function createApp() {
       });
     } catch (err) {
       res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
+  /**
+   * Store doc reader (item 48 step F) — a named doc plus its `updated_at`.
+   *
+   * **Allowlisted, operator-only, and deliberately not a general key reader.**
+   *
+   * The obvious implementation — `sqliteLoad(req.query.key)` — is an arbitrary
+   * read primitive over the whole `docs` table, and that table holds
+   * `wallet.json`, whose fields include `privateKey`. Worse, `/api/ops/*` is
+   * the one prefix `viewerDenial` opens to the read-only viewer role
+   * (`auth.ts`), whose documented scope is explicitly "no reads of operator
+   * internals (state, streams, wallet, audit, traces)". So a naive version
+   * would let the read-only password fetch the live wallet key.
+   *
+   * Three guards, in order, each sufficient alone:
+   *   1. operator role required — not inferred from the path prefix
+   *   2. the key must be on DUMPABLE_KEYS — an allowlist, never a denylist,
+   *      because a denylist only blocks the secrets already thought of
+   *   3. a pattern check that refuses wallet/secret-shaped keys regardless
+   *
+   * Adding a key here is a security decision. Anything under `migrated/` stays
+   * out: that subtree contains a full `wallet.json` snapshot.
+   */
+  const DUMPABLE_KEYS = new Set([
+    'poly_trades.json',
+    'poly_positions.json',
+    'poly_packages.json',
+    'poly_config.json',
+    'poly_baseline.json',
+    'poly_actions.json',
+    'poly_paper_archive.json',
+    'poly_config_sessions.json',
+    'session_ledger.json',
+    'session_perf.json',
+    'equity_curve.json',
+    'trade_samples.json',
+    'optimizer_state.json',
+    'governor_state.json',
+    'regime_signal.json',
+  ]);
+  const SECRET_SHAPED = /wallet|private|secret|key|seed|mnemonic|passphrase|token|credential/i;
+
+  app.get('/api/ops/dump', (req, res) => {
+    try {
+      if (req.auth?.role !== 'operator') {
+        return res.status(403).json({ ok: false, error: 'operator role required' });
+      }
+      const key = String(req.query.key || '');
+      if (!key) {
+        return res.json({ ok: true, keys: [...DUMPABLE_KEYS].sort() });
+      }
+      if (!DUMPABLE_KEYS.has(key) || SECRET_SHAPED.test(key)) {
+        return res.status(404).json({ ok: false, error: 'unknown or non-dumpable key' });
+      }
+      const doc = sqliteLoadWithMeta(key);
+      if (!doc) {
+        return res.status(404).json({ ok: false, error: 'not found (or sqlite backend inactive)' });
+      }
+      return res.json({
+        ok: true, key, updatedAt: doc.updatedAt, bytes: doc.bytes, value: doc.value,
+      });
+    } catch (err) {
+      return res.status(500).json({ ok: false, error: err.message });
     }
   });
 

@@ -58,6 +58,34 @@ export async function detectAndExecuteArbPackage({
   const sum = upAsk + downAsk;
   const gap = 1 - sum;
 
+  /**
+   * `arb.decision` (item 48 step E). Emitted from the point where a real
+   * evaluation happened — both asks are live and in range — so the record shows
+   * every book that was genuinely considered and which gate turned it down.
+   * Earlier returns (arb disabled, non-complementary market, asks out of range)
+   * are deliberately silent: they fire every scan on markets that never had a
+   * chance, and would bury the decisions that matter.
+   *
+   * Rule (iii): the skip is a code plus the operands that produced it.
+   */
+  const arbDecision = (action, skipCode, operands = null, extra = {}) => {
+    emitEvent('arb.decision', {
+      symbol: market.symbol,
+      slug: market.slug,
+      mode,
+      upAsk,
+      downAsk,
+      asksSum: sum,
+      arbGap: gap,
+      minArbGap: Number(cfg.minArbGap ?? 0.015),
+      ...extra,
+      output: {
+        action,
+        skipReason: skipCode ? { code: skipCode, operands } : null,
+      },
+    });
+  };
+
   // Fee-aware threshold (backlog item 7). Profit per share IS the gap, because
   // a full set redeems exactly $1.00 — and each leg pays a taker fee of
   // rate × (p(1−p))^e per share. So break-even is a function of the book, not a
@@ -83,6 +111,9 @@ export async function detectAndExecuteArbPackage({
   const marginPct = Number(cfg.arbMinMarginPct ?? 0.005);
   const requiredGap = breakEvenGap + marginPct;
   if (!(gap > requiredGap)) {
+    arbDecision('skip', 'gap_below_breakeven',
+      { gap, breakEvenGap, requiredGap, marginPct },
+      { breakEvenGap, requiredGap, fees: { feeParams } });
     if (log && gap > 0) {
       log(
         `⏭️ ARB SKIP ${market.symbol} gap ${(gap * 100).toFixed(2)}% ≤ break-even ${(breakEvenGap * 100).toFixed(2)}%${marginPct ? ` + margin ${(marginPct * 100).toFixed(2)}%` : ''} — would not cover its own fees`,
@@ -98,15 +129,27 @@ export async function detectAndExecuteArbPackage({
   // gate above answers "can this trade make money at all". Setting it below
   // break-even is now safe — the fee gate is not optional.
   const minGap = Number(cfg.minArbGap ?? 0.015);
-  if (gap < minGap) return null;
+  if (gap < minGap) {
+    arbDecision('skip', 'gap_below_operator_floor', { gap, minGap },
+      { breakEvenGap, requiredGap });
+    return null;
+  }
 
   // Capacity check against dedicated maxArbPackages setting
   const activePkgs = getActivePackages(mode);
   const maxPkgs = Number(cfg.maxArbPackages ?? 4);
-  if (activePkgs.length >= maxPkgs) return null;
+  if (activePkgs.length >= maxPkgs) {
+    arbDecision('skip', 'package_capacity_full', { active: activePkgs.length, max: maxPkgs },
+      { breakEvenGap, requiredGap });
+    return null;
+  }
 
   // Verify no active package on this market slug
-  if (activePkgs.some((p) => p.slug === market.slug)) return null;
+  if (activePkgs.some((p) => p.slug === market.slug)) {
+    arbDecision('skip', 'package_already_on_slug', { slug: market.slug },
+      { breakEvenGap, requiredGap });
+    return null;
+  }
 
   // Bankroll allocation
   const arbBank = mode === 'paper'
@@ -127,6 +170,9 @@ export async function detectAndExecuteArbPackage({
   const totalCost = Math.round((costUp + costDown) * 100) / 100;
 
   if (mode === 'paper' && Number(cfg.paperBankroll ?? 0) < totalCost + 0.01) {
+    arbDecision('skip', 'insufficient_paper_cash',
+      { totalCost, paperBankroll: Number(cfg.paperBankroll ?? 0) },
+      { breakEvenGap, requiredGap, sizing: { shares, costUp, costDown, capitalUsd: totalCost } });
     return null;
   }
 
@@ -147,6 +193,20 @@ export async function detectAndExecuteArbPackage({
   ) / 100;
   const lockedProfitUsd = Math.round((expectedPayout - totalCost - feesEstUsd) * 100) / 100;
   const lockedProfitPct = Math.round((lockedProfitUsd / totalCost) * 10000) / 100;
+
+  // Every gate passed — this is the open decision, recorded before execution so
+  // the intent survives even if the legs then fail (backlog 43/27 territory).
+  arbDecision('open', null, null, {
+    breakEvenGap,
+    requiredGap,
+    fees: { takerFeeUsdc: feesEstUsd, feeParams },
+    sizing: {
+      shares, costUp, costDown, capitalUsd: totalCost,
+      expectedPayout, lockedProfitUsd, lockedProfitPct,
+      boundBy: 'arbBankrollFrac/arbMaxUsd',
+    },
+    packageId,
+  });
 
   const pkg: ArbPackage = {
     packageId,

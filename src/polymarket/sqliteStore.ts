@@ -112,6 +112,32 @@ export function keyFromPath(file) {
   return path.basename(abs);
 }
 
+/**
+ * Read a doc together with its `updated_at`, for callers that need to know how
+ * stale the value is. `sqliteLoad` deliberately stays value-only so the hot
+ * paths do not pay for metadata they ignore.
+ *
+ * Returns null when sqlite is not the active backend — there is no equivalent
+ * timestamp on the JSON-file fallback, and inventing one from file mtime would
+ * report the wrong thing (the `-shm` sidecar moves on any connection; see
+ * convention 4).
+ */
+export function sqliteLoadWithMeta(key) {
+  const db = getDb();
+  if (!db) return null;
+  const row = db.prepare('SELECT value, updated_at FROM docs WHERE key = ?').get(key);
+  if (!row) return null;
+  try {
+    return {
+      value: JSON.parse(row.value),
+      updatedAt: Number(row.updated_at) || null,
+      bytes: String(row.value).length,
+    };
+  } catch {
+    return null;
+  }
+}
+
 export function sqliteLoad(key) {
   const db = getDb();
   if (!db) return null;
@@ -171,7 +197,51 @@ export function saveFileOrStore(file, data) {
   sqlitePersistSync(keyFromPath(file), data);
 }
 
-/** Import all existing JSON files under a directory into sqlite (idempotent, recursive). */
+/**
+ * Filenames that are credentials by convention. Fast path only — the content
+ * check below is the real guard, because this one can only refuse the names
+ * somebody already thought of.
+ */
+const SECRET_FILENAMES = /^(wallet|secret|secrets|credential|credentials|key|keys)\.json$/i;
+
+/** Top-level fields that make a document a credential regardless of its name. */
+const SECRET_FIELDS = /^(privateKey|private_key|secret|secretKey|mnemonic|seed|passphrase|apiSecret|apiKey)$/i;
+
+/**
+ * Does this document carry a credential?
+ *
+ * Content-based, because the case that actually happened gave no warning from
+ * the filename side: `wallet.json` was swept in by a bulk walk and sat in the
+ * `docs` table with a live `privateKey` until a read endpoint made it reachable
+ * (backlog 52/53). A name filter alone would not have caught a key living in
+ * something called `config.json`.
+ *
+ * Top level only. Nothing under `data/` nests a secret deeper, and a recursive
+ * scan on every migrated file would cost more than it buys.
+ */
+function carriesSecret(raw) {
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+    const hit = Object.keys(parsed).find((k) => SECRET_FIELDS.test(k));
+    return hit || null;
+  } catch {
+    // Unparseable is not a credential; the import below reports it separately.
+    return null;
+  }
+}
+
+/**
+ * Import all existing JSON files under a directory into sqlite (idempotent,
+ * recursive), **skipping anything that carries a credential**.
+ *
+ * The store is shared state: it is read by the dashboard, backed up, and copied
+ * off the VPS for analysis. A secret in it is a secret in all of those. Refusing
+ * at the boundary is the only place one filter covers every future consumer.
+ *
+ * This prevents new imports. Rows already present are not removed — that is a
+ * deliberate operator action, not a side effect of a migration.
+ */
 export function migrateDir(dir = DATA_DIR, { overwrite = false } = {}) {
   if (!SQLITE_AVAILABLE) return { imported: 0, skipped: 0 };
   if (!fs.existsSync(dir)) return { imported: 0, skipped: 0 };
@@ -183,6 +253,7 @@ export function migrateDir(dir = DATA_DIR, { overwrite = false } = {}) {
   const hasRow = db.prepare('SELECT 1 FROM docs WHERE key = ?');
   let imported = 0;
   let skipped = 0;
+  let refused = 0;
   const files = [];
   (function walk(d) {
     for (const name of fs.readdirSync(d)) {
@@ -191,6 +262,12 @@ export function migrateDir(dir = DATA_DIR, { overwrite = false } = {}) {
       if (st.isDirectory()) {
         walk(full);
       } else if (name.endsWith('.json')) {
+        if (SECRET_FILENAMES.test(name)) {
+          // Named like a credential — refuse without reading it.
+          console.warn(`[sqlite] migrate refused ${keyFromPath(full)}: credential filename`);
+          refused += 1;
+          continue;
+        }
         files.push(full);
       }
     }
@@ -199,6 +276,14 @@ export function migrateDir(dir = DATA_DIR, { overwrite = false } = {}) {
     const key = keyFromPath(file);
     try {
       const raw = fs.readFileSync(file, 'utf-8');
+      const secretField = carriesSecret(raw);
+      if (secretField) {
+        // Named innocuously but carrying a key. Warn loudly with the field name
+        // — never the value — so a refusal is visible rather than a silent gap.
+        console.warn(`[sqlite] migrate refused ${key}: carries '${secretField}'`);
+        refused += 1;
+        continue;
+      }
       if (!overwrite && hasRow.get(key)) {
         skipped += 1;
         continue;
@@ -214,7 +299,7 @@ export function migrateDir(dir = DATA_DIR, { overwrite = false } = {}) {
       console.error(`[sqlite] migrate ${key}: ${err.message}`);
     }
   }
-  return { imported, skipped };
+  return { imported, skipped, refused };
 }
 
 /** Total rows currently stored in sqlite. */

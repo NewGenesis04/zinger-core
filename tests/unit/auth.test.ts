@@ -97,4 +97,25 @@ describe('auth', () => {
     expect(parseCookies('a=1; b=two%20parts')).toEqual({ a: '1', b: 'two parts' });
     expect(parseCookies('')).toEqual({});
   });
+
+  /**
+   * `viewerDenial` gates on the path PREFIX, so it opens every GET under
+   * `/ops/` to the read-only viewer role. That is fine for the curated status
+   * page it was written for, and a trap for anything added beside it.
+   *
+   * `/api/ops/dump` reads the sqlite `docs` table, which holds `wallet.json`
+   * with a `privateKey` field. If that route ever relies on the path prefix for
+   * protection instead of checking `req.auth.role === 'operator'` itself, the
+   * viewer password reads the live wallet key.
+   *
+   * This asserts the hazard rather than the fix, deliberately: it fails the day
+   * someone "simplifies" the route by trusting the prefix.
+   */
+  it('does NOT protect /ops/dump — the route must check the role itself', () => {
+    expect(viewerDenial('GET', '/ops/dump')).toBeNull();
+    expect(viewerDenial('GET', '/ops/dump?key=poly_trades.json')).toBeNull();
+    // Writes are still refused, so the exposure is read-only — which is exactly
+    // enough to exfiltrate a private key.
+    expect(viewerDenial('POST', '/ops/dump')).toBe('read-only');
+  });
 });

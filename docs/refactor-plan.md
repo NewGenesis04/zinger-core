@@ -2105,10 +2105,10 @@ later nicety.
 | 0 | ~~measure M and S~~ — done 2026-09-04, see *Buffer sizing* below; **not a gate**, the cap is an env var tuned against (d)'s gap signal | operator sign-off on (i)-(v) |
 | A | ✅ **done 2026-09-04.** Four new union members, a payload interface per event type under rule (iii), `formatEventAsLog` cases for all four plus `config.attributed` (which had none and fell through to raw JSON), `TELEMETRY_SCHEMA_VERSION` 1 → 2. `EventType` is now `keyof TelemetryEventPayloads`, so the union cannot drift from the registry. **`// @ts-nocheck` removed** — the file is type-checked, without which the interfaces would be decoration (finding e). Transitional `LegacyMeta` index signature on the payloads `log()` still feeds, documented to come off per type as each tee takes ownership in C-E. | `tsc` clean · 360/360 tests · smoke run of all four new types; runtime inert, nothing emits them yet |
 | B | ✅ **done 2026-09-04.** `GET /api/poly/events/stream` (event-native SSE, one frame per event at emit time) + `after=` on `/api/poly/events`. Bus gained an eviction counter and `queryEventsPage` returning `{events, oldestId, newestId, dropped, evicted, hasMore}`. Reconnect is lossless: subscribe → queue → replay from cursor → drain queue, deduped. Cursor reads front-slice, never tail-slice. `res.write` buffers rather than blocking, so a client is dropped past 1 MB unflushed (`SSE_MAX_BUFFERED_BYTES`) instead of growing the heap. | `tsc` clean · 367/367 · 7 new invariants, both key ones mutation-checked (front-slice→tail-slice and `dropped=false` each killed 2 tests). **HTTP layer not yet exercised against a running instance** — see below |
-| C | receipts + trade + exit — exit tee at `closePosition` (b); `log()` mapping collapsed per (i) | one nightly paper cycle |
-| D | cash + reset + system | one nightly paper cycle |
-| E | decision + arb — **only after (c) is resolved**; differential-check the scan path the way the slice-1 extraction was (convention 5) | zero mismatch on the diffcheck grid |
-| F | `/api/ops/dump` | — |
+| C | ✅ **done 2026-09-04.** Receipts tee in `clobReceipts.captureReceipt` (second sink, JSONL still the durable copy). `trade.execution` tee in `saveTrade`, placed after both dedupe guards so a suppressed duplicate write emits nothing. `position.exit` routed through one new `emitPositionExit` helper called from all four real exit paths — `closePosition` full close, its early-returning partial branch, fast-SL and early-SL, the last two of which bypass `closePosition` entirely. `log()`'s type-guessing map collapsed per (i): it now emits only `system.alert`, plus `trade.decision` until step E. | `tsc` clean · 369/369 · 2 new invariants on the receipt tee. **The exit and trade tees are not unit-tested** — see below |
+| D | ✅ **done 2026-09-04.** `account.cash` teed inside `liveAccount.saveStore` — one site, not the four `saveStore` callers, since the persist boundary *is* the cash-state transition. `account.reset` at both resets, live and paper, emitted after `saveBaseline` so it carries the baseline actually written. `system.alert` gained `kind`, taken from `meta.kind` and never inferred from message text; `lifecycle` on start/stop, `health` on readiness **transitions only** (the check runs on a timer — emitting every cycle would drown the edge that matters), `data_gate` on the assurance block. Bus fan-out now isolates subscribers. | `tsc` clean · 374/374 · 5 new invariants on subscriber isolation, mutation-checked (reverting `fanOut` to `emit` killed 4) |
+| E | ✅ **done 2026-09-04.** `trade.decision` via `emitDecisionEvent`, once per market per scan at `enriched.push` where candidates, selection, sizing and action are all known — carrying inputs, scoring with `reasonCodes`, the losing outcome's score and reasons, the kelly chain with caps, and `output.skipReason`. Six post-scoring gates now record *why* an eligible candidate did not trade. `arb.decision` in `detectAndExecuteArbPackage` at five skip gates plus the open. Rule (iii) applied to all 43 `reasons.push` sites in `directional.ts` via an `addReason` helper that records prose and `{code, value, delta, operands}` together. `log()`'s last typed arm removed — it emits `system.alert` unconditionally now, handover complete. | **0 mismatches over 300,000 combinations**, harness mutation-checked (altered string → 2,091; weight 160→161 → 15,504; dropped reason → 12,094). `tsc` clean · 378/378 · 4 new reason-code invariants, mutation-checked |
+| F | ✅ **done 2026-09-04, but NOT as specified.** `GET /api/ops/dump?key=` returns a doc plus its `updated_at` via a new `sqliteLoadWithMeta`. It is **allowlisted and operator-only**, not the general key reader the ask described — see item 52 for why that version would have handed the wallet private key to the read-only viewer password. No key returns the allowlist. | `tsc` clean · 379/379 · a regression test asserting `viewerDenial` does *not* cover `/ops/dump`, so the in-route role check cannot be "simplified" away |
 
 New `EventType` members: `trade.execution.receipt`, `account.cash`,
 `account.reset`, `arb.decision`. Bump `TELEMETRY_SCHEMA_VERSION`
@@ -2168,6 +2168,104 @@ only mattered while drops were silent — which was the actual defect.
 Steps A-D are unaffected either way. Receipts, trades, exits, cash writes and
 resets are human-scale — a handful an hour. 5,000 is already oversized for them.
 Only step E emits at scan rate.
+
+#### Step E — the differential check, and what it does and does not prove
+
+Convention 5, applied to the `reasons.push` → `addReason` conversion. The
+harness (`tmp/diffcheck/`, throwaway) drove the pre-change `buildDecision` from
+`HEAD` and the new one over **300,000** randomised input combinations and
+diffed `reasons`, `eligible`, `score` and `book`. `reasonCodes` is new and is
+not compared — the claim under test is that adding it changed nothing else.
+
+`buildDecision` calls `Math.random()` on the counter-signal path, so the draw is
+pinned to the same value for both sides of each comparison; without that the
+harness would report phantom mismatches and be tuned into uselessness.
+
+**0 mismatches.** Mutation-checked so the zero means something:
+
+| Mutation | Mismatches / 50,000 |
+|---|---|
+| one prose string altered (`'tradable now'` → `'tradable now.'`) | 2,091 |
+| one score weight altered (`arbGap * 160` → `* 161`) | 15,504 |
+| one reason suppressed (`book_imbalance_hurts`) | 12,094 |
+
+What it proves: the prose array, the eligibility flag, the score and the book
+summary are byte-identical for every input tried, so the dashboard, the trace
+and the summary see exactly what they saw before. What it does **not** prove:
+that `reasonCodes` is correct — the four new invariants in
+`directionalEngine.test.ts` cover its alignment, non-emptiness and operand
+carriage, and those are mutation-checked too (a bare `reasons.push` and a
+prose-shaped code each kill one).
+
+**Volume, against the estimate.** The tee emits one `trade.decision` per market
+per scan rather than one per outcome, so directional is `M·S ≈ 3.2/s` rather
+than `2·M·S`. `arb.decision` adds roughly another `M·S`, plus one `scan.cycle`.
+Total lands near **7/s**, marginally above the 6.5/s ceiling derived earlier —
+the ceiling held as an order-of-magnitude figure, and the buffer sizing table is
+unaffected at that precision.
+
+#### Step C — three findings that came out of doing it
+
+**a. Two phantom exits stopped being exits, for free.** The collapse in (i)
+means `log(…, 'sl', …)` no longer produces a `position.exit`. Two call sites
+were tagged `'sl'` without being position exits at all — the unverified-fill
+flatten (`bot.ts`, `UNVERIFIED FILL FLATTENED`) and the PM wallet asset sell
+(`PM WALLET SELL asset …`). Both were emitting exits carrying no symbol, slug
+or PnL. They are now `system.alert`, which is what they always were.
+
+**b. `package.settlement` only ever fires on one of several settlement paths.**
+Checked before collapsing the `meta.arb` arm, to be sure nothing was lost:
+nothing is. `arbEngine.ts:280` is the *only* emitter in the repo, and it sits on
+the instant-CTF-merge branch. `syncPackageSettlements` and
+`reconcilePendingPackages` settle packages and emit nothing. So a consumer
+counting settlements sees a fraction of them. Pre-existing, not introduced here,
+and it belongs with the arb decision tee in step E.
+
+**c. One throwing subscriber can starve every other subscriber.** ✅ *Fixed in
+step D — `TelemetryBus.fanOut` now invokes each subscriber via `rawListeners()`
+in its own `try/catch`, so a throw cannot reach the emitting stack, cannot skip
+the wildcard fan-out, and cannot skip later subscribers on the same channel.
+Faults are counted and surfaced (`subscriberErrors()`, plus a throttled
+`console.error`) rather than silently eaten — a swallowed exception with no
+trace is how a dead consumer stays invisible. `rawListeners()` returns a copy so
+a handler that unsubscribes mid-fan-out cannot shift the array underneath the
+loop, and Node's `once` wrapper self-removes when invoked directly, so `once()`
+semantics survive; there is a test for that. Five invariants, mutation-checked:
+reverting `fanOut` to a plain `emit` kills four of them.* Original finding:
+`emitEvent`
+does `this.emit(type, …)` then `this.emit('*', …)`, both synchronous. A
+type-specific listener that throws propagates out of the first call, so the
+wildcard emit never runs — and the wildcard is what step B's SSE stream
+subscribes to. So a single bad consumer silently cuts the event feed to all the
+others, and the throw lands on whatever call stack emitted, which for the
+receipt tee is live order execution.
+
+`captureReceipt`'s own `try/catch` absorbs it, so an order cannot be broken —
+there is a test for exactly that — and the SSE handler wraps its writes. But the
+protection is incidental to each call site rather than a property of the bus.
+The fix is for the bus to isolate subscribers, invoking each in its own
+`try/catch` so one cannot starve the rest. Not done here: it changes
+`EventEmitter` semantics for every consumer and swallows subscriber bugs unless
+they are surfaced somewhere, which is a design call, not a step-C detail.
+
+#### Step C — what is verified and what is not
+
+The receipt tee has two invariants: the record reaches the JSONL and the bus
+identically (not a summary — the whole premise of that capture is that we do not
+know what fields matter), and a throwing subscriber still cannot break a trade.
+
+**The trade and exit tees have no unit tests.** `saveTrade`, `closePosition` and
+the two SL passes are all module-private and reachable only through `scan()`,
+which needs a whole `botState`, `readiness` and market fixtures. This is the same
+wall item 49 hit with `buildPortfolio`, and it has the same answer: it becomes
+expressible when the D4 position manager owns the exit path. Recorded so the gap
+is a known one rather than an assumed pass.
+
+The invariant that matters and is currently unproven is **exactly one
+`position.exit` per exit, and one `trade.execution` per trade** — the property
+decision (i) exists to guarantee. Until it can be tested, the nightly paper cycle
+is the check: count `position.exit` events against closed trades over a window
+and they should agree.
 
 #### Step B — what is verified and what is not
 
@@ -2360,6 +2458,149 @@ still here.
 Not fixed inline: collapsing them is a one-line change but it touches every
 caller's meaning, and if a genuinely deferred writer is wanted later, this is
 where it belongs. Belongs with the D5/D4 store work rather than as a rename now.
+
+---
+
+### 52. `/api/ops/dump` as specified would have served the wallet private key to the viewer password
+
+*Found 2026-09-04 while implementing item 48 step F. Not shipped — the endpoint
+was built with guards instead.*
+
+The ask was `GET /api/ops/dump?key=` → `sqliteLoad(key)` + `updated_at`. Written
+literally that is an **arbitrary read primitive over the whole `docs` table**.
+Two facts make that unsafe here, and neither is visible from the endpoint:
+
+1. **The store holds a private key.** `data/zinger.db` contains a
+   `migrated/<ts>/wallet.json` doc whose top-level fields are `address`,
+   **`privateKey`**, `polymarketDepositWallet`, `createdAt`, `importedAt`,
+   `instance`. Verified by listing the table's keys and that doc's field names
+   locally — the value was never read or printed.
+2. **`/ops/` is the viewer-readable prefix.** `viewerDenial` (`lib/auth.ts`)
+   allows *any* GET whose path starts with `/ops/`. Its own docstring says
+   viewers get "no writes, and no reads of operator internals (state, streams,
+   wallet, audit, traces)" — but it enforces that by prefix, and `dump` sitting
+   beside `status` inherits the allowance.
+
+So `GET /api/ops/dump?key=migrated/<ts>/wallet.json`, authenticated with the
+**read-only viewer password**, would have returned the live wallet key. Nothing
+about the route would have looked wrong in review: it is one line, it reuses an
+existing store function, and it sits under a prefix already documented as
+read-only.
+
+*Not a git exposure:* `.gitignore` carries `data/**` and `data/zinger.db` has
+never been tracked. The risk was the endpoint, not the repository.
+
+**Shipped instead**, three independent guards:
+
+1. `req.auth?.role !== 'operator'` → 403. The role is checked directly, never
+   inferred from the path prefix.
+2. `DUMPABLE_KEYS`, an explicit allowlist of fifteen state docs. An allowlist,
+   not a denylist — a denylist can only exclude the secrets already thought of,
+   which is the same reasoning `clobReceipts` uses for not whitelisting fields.
+   Everything under `migrated/` is excluded; that subtree is where the wallet
+   snapshot lives.
+3. A `SECRET_SHAPED` pattern check that refuses wallet/key/seed-shaped key names
+   even if one is ever mistakenly added to the allowlist.
+
+A request with no `key` returns the allowlist, so the endpoint is still
+discoverable without being enumerable.
+
+**The general lesson, and it outlives this endpoint.** Any read primitive over
+the store is a wallet-key primitive for as long as the key lives there. Chasing
+*why* it lives there turned up the actual defect — see **item 53**, which is the
+one to read. This entry is the symptom; 53 is the cause.
+
+---
+
+### 53. `tryLoadWallet` wrote the `.env` private key into the state store, on a timer ✅ FIXED
+
+*Found 2026-09-04 while implementing item 48 step F; fixed the same day.*
+
+The operator's private key lives in `.env`, which is correct and was never in
+doubt. What nothing in `.env` reveals is that **reading it persisted it**:
+
+```
+refreshTelemetry()   ── on a timer ──>  checkReadiness()          readiness.ts:50
+                                          └── getWallet()                    :51
+                                                └── tryLoadWallet()      wallet.ts
+                                                      ├── reads POLYMARKET_PRIVATE_KEY
+                                                      └── importWalletKey(envKey)
+                                                            └── saveFileOrStore(WALLET_FILE)
+                                                                  └── docs table, key
+                                                                      `wallet.json`,
+                                                                      privateKey included
+```
+
+`importWalletKey` persists — that is its job on the operator import path (item
+18). `tryLoadWallet` called it unconditionally, so a function named "load"
+performed a write, of a secret, into shared state. With no caching, every
+`getWallet()` re-imported and re-saved, and `checkReadiness` runs on the
+telemetry timer. The live key was therefore rewritten into `data/zinger.db`
+continuously for the life of the process.
+
+**Why it was invisible.** No call site looks wrong. `readiness.ts` asks for the
+wallet, which is exactly what a readiness check should do. `.env` is genuinely
+the source of truth, so an operator reasoning about where the key lives gets the
+right answer and still misses this. The write is three frames below a function
+whose name promises a read.
+
+**Blast radius beyond the endpoint.** `data/zinger.db` is a secret-bearing file.
+Any copy of it carries a live key — a backup, a debug pull to a laptop, a
+database shared for analysis. The dump endpoint was one exposure; the file is
+the general one.
+
+*Fix:* `importWalletKey` takes `persist` (default `true`, preserving item 18's
+import path) and a `source` tag. `tryLoadWallet` passes `persist: false` for
+env-sourced keys — `.env` is already the durable home, so copying it into the
+store buys no recoverability. `setDepositWallet` spread `current` wholesale and
+would have re-persisted the key, so it now strips `privateKey` when the wallet
+came from env. `loadOrCreateWallet` still persists, deliberately: a generated
+key exists nowhere else and not writing it strands any funds sent to that
+address.
+
+*Invariants:* `tests/unit/walletKeyPersistence.test.ts` — five, in a separate
+file from `wallet.test.ts` because they mock the store and that mock would
+change the meaning of item 18's existing tests. The load-bearing one is a
+property, not a shape assertion: *no argument this module passes to the store
+may contain the key*, which survives a refactor that changes what gets saved.
+Mutation-checked — restoring the unconditional persist kills three.
+
+**Operator actions, neither of which is code:**
+
+1. **Purge the stored copies on the VPS.** The fix stops new writes; it does not
+   remove what is already in `data/zinger.db`. Both `wallet.json` and
+   `migrated/<ts>/wallet.json` should be deleted from the `docs` table.
+2. **Consider the key exposed and rotate it** if that database has ever left the
+   VPS — a backup, a copy pulled for debugging, anything.
+
+*Mechanism fixed too, 2026-09-05.* `migrateDir` walked `data/` and imported
+**every** `.json` with no filter — how `wallet.json` entered the store in the
+first place, and what would have done the same to the next credential-shaped
+file. It now refuses on two independent checks, and returns a `refused` count
+alongside `imported`/`skipped`:
+
+| Guard | Catches | Misses |
+|---|---|---|
+| `SECRET_FILENAMES` on the walk | anything named `wallet`/`secret`/`key`/`credential`.json, without reading it | a key inside `config.json` |
+| `carriesSecret` on the content | a top-level `privateKey`/`mnemonic`/`seed`/… in any file, whatever its name | a key nested below the top level |
+
+Neither subsumes the other, which is the point — the case that actually happened
+(`wallet.json`) is caught by both, and each covers a shape the other cannot see.
+Refusals `console.warn` the filename and the offending **field name**, never the
+value, so a skipped file is visible rather than a silent gap.
+
+Scope, deliberately: the filter is on the bulk walk only, not `saveFileOrStore`.
+`loadOrCreateWallet` must still be able to persist a generated key — that one
+exists nowhere else. A considered write is different from a directory sweep.
+
+*Convention 6 earned its place here.* The first version of the test suite passed
+with the filename filter disabled — `wallet.json` carries a top-level
+`privateKey`, so the content check caught it either way and the filename guard
+was never exercised. The surviving mutant was the finding: the test was wrong
+about *where* the property was enforced, exactly as the convention predicts. A
+case only the filename filter can catch (`secrets.json` with the key nested one
+level down, invisible to a top-level scan) now covers it, and disabling either
+guard fails a test.
 
 ---
 

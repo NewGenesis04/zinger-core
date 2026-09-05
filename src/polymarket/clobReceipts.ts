@@ -25,11 +25,13 @@
  * Captures both outcomes. The rejection shape is the more valuable of the two
  * and is the one a success-only capture would miss.
  *
- * Imports nothing but `fs` and `dataDir` — safe to pull into the order path
- * from any layer without a cycle.
+ * Imports nothing but `fs`, `dataDir` and the telemetry bus — safe to pull into
+ * the order path from any layer without a cycle. `telemetry/events.ts` imports
+ * only `node:events`, so it does not reintroduce one.
  */
 import fs from 'fs';
 import { dataPath } from './dataDir.js';
+import { emitEvent } from './telemetry/events.js';
 
 /** Append-only JSONL: one self-contained record per line, no read-modify-write. */
 const RECEIPT_LOG = dataPath('clob_receipts.jsonl');
@@ -108,6 +110,11 @@ export function captureReceipt(entry: Omit<ClobReceipt, 'at'>): void {
 
     fs.appendFileSync(RECEIPT_LOG, `${line}\n`);
     if (ECHO) console.log(`📼 CLOB RECEIPT ${line}`);
+    // A second sink, never a replacement: the JSONL above stays the durable
+    // copy. This puts the same record on the bus so a live consumer sees the
+    // raw CLOB response as it happens rather than by tailing a file that
+    // rotates away (see backlog 50).
+    emitEvent('trade.execution.receipt', record);
   } catch {
     // Deliberately silent. This path runs inside live order execution; a
     // diagnostic that can break a trade is worse than a missing diagnostic.

@@ -12,6 +12,7 @@ import {
   evictedCount,
   setEventBufferCapacity,
   DEFAULT_EVENT_BUFFER_CAP,
+  subscriberErrors,
 } from '../../src/polymarket/telemetry/events.js';
 
 describe('telemetry/events.ts (D8 Event System)', () => {
@@ -206,5 +207,79 @@ describe('telemetry cursor reads (item 48 step B)', () => {
     const all = emitN(5);
     // No cursor: still "the most recent N", as every existing caller expects.
     expect(queryEvents({ limit: 2 }).map((e) => e.id)).toEqual([all[3].id, all[4].id]);
+  });
+});
+
+/**
+ * Emission is synchronous and runs on the emitting caller's stack — for the
+ * receipt tee that is live order execution. So a subscriber must not be able to
+ * reach the trading loop, and must not be able to starve other subscribers.
+ */
+describe('INVARIANT: one subscriber cannot break the bus for anyone else', () => {
+  beforeEach(() => clearEvents());
+
+  it('delivers to the wildcard even when a typed subscriber throws', () => {
+    // The real case: the SSE stream subscribes to '*'. Before the fan-out
+    // isolated subscribers, a throw here meant emit('*') never ran at all.
+    const wildcard: string[] = [];
+    const offBad = onEvent('system.alert', () => { throw new Error('boom'); });
+    const offGood = onEvent('*', (e) => wildcard.push(e.id));
+
+    try {
+      const event = emitEvent('system.alert', { message: 'x', level: 'info' });
+      expect(wildcard).toEqual([event.id]);
+    } finally {
+      offBad();
+      offGood();
+    }
+  });
+
+  it('delivers to later subscribers on the same channel', () => {
+    const seen: string[] = [];
+    const offBad = onEvent('system.alert', () => { throw new Error('boom'); });
+    const offGood = onEvent('system.alert', (e) => seen.push(e.id));
+
+    try {
+      const event = emitEvent('system.alert', { message: 'x', level: 'info' });
+      expect(seen).toEqual([event.id]);
+    } finally {
+      offBad();
+      offGood();
+    }
+  });
+
+  it('never lets a subscriber throw reach the emitter', () => {
+    const off = onEvent('*', () => { throw new Error('boom'); });
+    try {
+      expect(() => emitEvent('system.alert', { message: 'x', level: 'info' })).not.toThrow();
+    } finally {
+      off();
+    }
+  });
+
+  it('counts subscriber faults rather than swallowing them silently', () => {
+    const before = subscriberErrors().count;
+    const off = onEvent('system.alert', () => { throw new Error('a distinctive failure'); });
+
+    try {
+      emitEvent('system.alert', { message: 'x', level: 'info' });
+      const after = subscriberErrors();
+      expect(after.count).toBe(before + 1);
+      expect(after.last).toContain('a distinctive failure');
+    } finally {
+      off();
+    }
+  });
+
+  it('preserves once() semantics through the fan-out', () => {
+    // The fan-out invokes rawListeners directly; Node's once wrapper
+    // self-removes when called, and this proves it still does.
+    let calls = 0;
+    telemetryBus.once('system.alert', () => { calls += 1; });
+
+    emitEvent('system.alert', { message: 'one', level: 'info' });
+    emitEvent('system.alert', { message: 'two', level: 'info' });
+
+    expect(calls).toBe(1);
   });
 });
