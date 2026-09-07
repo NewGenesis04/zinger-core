@@ -30,6 +30,7 @@ import { describeBackend } from './polymarket/persistence.js';
 // this keeps the SSE route off the bot module's export surface.
 import {
   onEvent as onTelemetryEvent,
+  queryEvents as queryTelemetryEvents,
   queryEventsPage as queryTelemetryEventsPage,
   evictedCount as telemetryEvictedCount,
 } from './polymarket/telemetry/events.js';
@@ -672,7 +673,7 @@ export async function createApp() {
         return;
       }
 
-      const events = poly.queryTelemetryEvents(filter);
+      const events = queryTelemetryEvents(filter);
       res.json({
         ok: true,
         count: events.length,
