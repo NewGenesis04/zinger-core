@@ -3688,8 +3688,16 @@ export function startBackgroundFeeds() {
   }, 2000);
 
   // Public signal feed — always-on TA so /api/v1 publishes live signals without trading bot
+  //
+  // Backlog item 56 — the timer below fires every 2s but `getSignalForBoth` can
+  // take up to 5s (two Binance fetches, AbortSignal.timeout(5000) each,
+  // signal.ts:86). Without this flag a Binance stall stacks calls indefinitely:
+  // the pile-up is bounded only by how long the outage lasts, not by the timer.
+  let publicSignalsInFlight = false;
   const publishPublicSignals = async () => {
+    if (publicSignalsInFlight) return; // previous tick still waiting on Binance
     if (botState.running && botState.config.useSignals) return; // scan() owns signals while trading
+    publicSignalsInFlight = true;
     try {
       const both = await getSignalForBoth();
       if (!both) return;
@@ -3702,6 +3710,10 @@ export function startBackgroundFeeds() {
       notifyStateChange();
     } catch (err) {
       console.error('[public-signals]', err?.message || err);
+    } finally {
+      // `finally`, not a line after the catch: the `if (!both) return` above
+      // would skip that and wedge the flag on permanently.
+      publicSignalsInFlight = false;
     }
   };
   publishPublicSignals().catch(() => {});

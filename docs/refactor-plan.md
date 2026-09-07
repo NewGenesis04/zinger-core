@@ -2604,6 +2604,150 @@ guard fails a test.
 
 ---
 
+### 54. The request timeout has two writers and no owner
+
+*Found 2026-09-07 diagnosing an `ERR_HTTP_HEADERS_SENT` on the live VPS run.*
+
+The observed stack:
+
+```
+Error [ERR_HTTP_HEADERS_SENT]: Cannot set headers after they are sent to the client
+    at ServerResponse.json (express/lib/response.js:252:15)
+    at <anonymous> (/opt/apps/ZINGER/src/server.ts:459:23)
+    at process.processTicksAndRejections
+```
+
+`server.ts:459:23` is exact — column 23 lands on the `json` of
+`res.status(500).json(...)` in the `POST /api/poly/sync` catch, and the
+`processTicksAndRejections` frame places it in the post-`await` continuation.
+
+Two things write to the same response. The timeout middleware (`server.ts:122-129`):
+
+```js
+res.setTimeout(long ? 90000 : 25000, () => {
+  if (!res.headersSent) res.status(503).json({ error: 'timeout' });
+});
+```
+
+and the route handler itself (`server.ts:455-461`). Because a callback is passed,
+`res.setTimeout` overrides Node's default socket-destroy: at 25 s the middleware
+sends a complete 503 and **leaves the handler running**. Nothing cancels the work
+behind it. When it finishes, it writes to a committed response.
+
+The sequence is not the obvious one. `syncBalances` (`bot.ts:2079`) does not
+reject on a network fault — `syncClobBalance` is wrapped in a bare
+`try {} catch {}` (`bot.ts:2080-2082`) and `refreshTelemetry`
+(`bot.ts:2060-2073`) catches everything and returns a degraded readiness object.
+So under a stall it **resolves**, line 457's `res.json(result)` throws first, its
+own catch swallows that, and line 459 throws again and escapes. Express 5.2.1
+forwards the escaped rejection to `finalhandler`, which finds `headersSent` and
+can only log the stack and destroy the socket.
+
+**The consequence worth naming: the dashboard was told `503 timeout` for a
+balance sync that succeeded.** The result was computed and discarded. The stack
+trace is currently the only evidence that happened.
+
+Scale of the exposure, counted rather than estimated:
+
+```
+67   route handlers in server.ts
+34   res.status(500).json sites
+ 3   guarded with `if (res.headersSent) return`  (:1072, :1087, :1096)
+```
+
+Those three are `/api/poly/depth`, `/api/poly/charts` and `/api/poly/ml-refresh`
+— the slowest routes, two of which the middleware already special-cases to 90 s.
+Someone hit this race there and guarded the symptom. Note what the guard does:
+it silences the log while still returning a 503 for work that completed.
+
+**Do not fix this by scattering `headersSent` checks, and do not fix it by
+monkey-patching `res.json` to no-op** (both were proposed; the second was
+proposed as the "clean" option). Every `headersSent` check is a negotiation
+between two writers — none of them makes one the owner, and the global wrapper
+version turns a loud bug into a silent one: the sync still reports a timeout it
+did not have, and now nothing logs it. A wrapper of that shape would also cover
+`json`/`status` but not `send`/`end`/`redirect`/`sendFile`/`setHeader`, so
+`express.static` and `finalhandler` bypass it. (`server.ts:1` is `// @ts-nocheck`,
+so any claim that such a patch is "type-safe" is vacuous — TS is not checking
+this file.)
+
+The owner-shaped fix: one `AbortController` per request; the middleware aborts the
+signal and is the **sole** responder on timeout; handlers observe the signal and
+return without writing. Then `headersSent` never needs checking, because there is
+only one writer — and you get real cancellation, which is what sheds load during a
+stall. A `Promise.race` deadline does not cancel: the underlying fetch keeps
+running with its socket open, so a sustained stall accumulates in-flight work
+instead of shedding it.
+
+Blocked on item 55: no deadline is defensible while the worst case is unbounded.
+
+---
+
+### 55. `checkReadiness` has one outbound call with no timeout at all
+
+`readiness.ts:41`, inside `fetchDepositPositions`:
+
+```js
+const res = await fetch(`https://data-api.polymarket.com/positions?user=${depositWallet}`);
+```
+
+No `AbortSignal`. Every other remote call in that file is bounded — the viem
+transport at `:23` (8 s), the geoblock check at `proxyEnv.ts:121` (8 s). This one
+falls back to undici's dispatcher defaults, which is minutes, not seconds, on a
+connection that opens and never answers.
+
+It sits in the middle of a **strictly sequential** chain (`readiness.ts:50`):
+geoblock `:65` → `ensureApiKey` `:75` → `readDepositWalletOwner` `:83` →
+`readContract` pUSD `:94` → **`fetchDepositPositions` `:41`** → `getClobBalance`
+`:122` → `readContract` USDC `:144` → `getBalance` `:161`. The bounded steps
+alone sum past the 25 s deadline that item 54's middleware enforces on
+`/api/poly/sync`, so the collision there is structural, not unlucky. The unbounded
+step makes the worst case unknowable, which is why item 54 cannot be closed by
+picking a larger number.
+
+Two candidate fixes, and they are not equivalent: bound the call and keep the
+chain sequential, or bound it *and* parallelise the independent legs (the two
+`readContract` calls and `getBalance` share no data). The second changes the RPC
+burst profile against `polygon-bor.publicnode.com`, so it is a decision, not a
+cleanup.
+
+Blast radius is smaller than it looks: `refreshTelemetry` swallows the failure and
+`liveReady` is not a runtime order gate — its only consumer is a start-time log
+line at `bot.ts:3800`. What a stall produces is a spurious
+`system.alert` "live readiness lost"/"restored" pair (`bot.ts:2040-2058`), not a
+halted bot.
+
+---
+
+### 56. `publishPublicSignals` runs a 5 s operation on a 2 s interval
+
+`bot.ts:3708`:
+
+```js
+setInterval(() => { publishPublicSignals().catch(() => {}); }, 2000);
+```
+
+No in-flight guard. `publishPublicSignals` → `getSignalForBoth` (`signal.ts:343`)
+→ `Promise.all` over two `fetchCandles`, each `AbortSignal.timeout(5000)`
+(`signal.ts:86`). When Binance is slow, the interval keeps firing into a stalled
+predecessor and concurrent fetches accumulate — the opposite of the retry it reads
+as. Observed on the VPS as two consecutive
+`[public-signals] The operation was aborted due to timeout` lines (`bot.ts:3704`;
+that string is the verbatim `AbortSignal.timeout` `DOMException` message, and
+`fetchFunding` at `:100` swallows its own errors, so the throw is `fetchCandles`).
+
+Harmless at two ticks. The failure mode to avoid is a longer Binance outage, where
+the pile-up is bounded only by how long the stall lasts. A single in-flight flag,
+or replacing the interval with a self-rescheduling timer, closes it.
+
+Worth recording alongside: Binance egress does **not** ride the CLOB proxy.
+`installClobProxy` sets axios defaults and nothing calls `setGlobalDispatcher`, so
+native `fetch` goes direct. The Binance path and the Polymarket path share only the
+VPS's own egress — which is why both symptoms appearing together points at the host
+network rather than at the proxy.
+
+---
+
 ## Handoff — state as of 2026-08-20
 
 Written so a fresh session can continue without re-deriving any of the above.

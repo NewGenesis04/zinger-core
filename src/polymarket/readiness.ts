@@ -38,13 +38,32 @@ async function readDepositWalletOwner(depositWallet) {
 
 async function fetchDepositPositions(depositWallet) {
   try {
-    const res = await fetch(`https://data-api.polymarket.com/positions?user=${depositWallet}`);
+    // Backlog item 55 — every other outbound call in this file is bounded (the
+    // viem transport at :23, the geoblock check at proxyEnv.ts:121). This one was
+    // not, so a connection that opened and never answered could hold the whole
+    // readiness chain for minutes. The catch below already returns [] on an HTTP
+    // error, so an abort lands on the identical path.
+    const res = await fetch(`https://data-api.polymarket.com/positions?user=${depositWallet}`, {
+      signal: AbortSignal.timeout(8000),
+    });
     if (!res.ok) return [];
     const data = await res.json();
     return Array.isArray(data) ? data : [];
   } catch {
     return [];
   }
+}
+
+/**
+ * Capture a promise's outcome instead of letting it reject.
+ *
+ * `checkReadiness` starts every leg before it awaits any of them, so a rejection
+ * that lands before its `await` would surface as an unhandledRejection
+ * (`index.ts:18`) — a real log line for an error that is already handled. This
+ * keeps each call site's original try/catch semantics while the work overlaps.
+ */
+function capture(p) {
+  return p.then((value) => ({ ok: true, value }), (error) => ({ ok: false, error }));
 }
 
 export async function checkReadiness(config = {}) {
@@ -62,7 +81,42 @@ export async function checkReadiness(config = {}) {
   let ownerMatches = false;
   let clobError = null;
   let positions = [];
-  const geoblock = await checkGeoblock();
+  /*
+   * Backlog item 55 — these eight calls share no input data; only the assembly
+   * of `checks` below is ordered. Run sequentially the worst case was the SUM of
+   * eight independent timeouts (~55s), which sits past the 25s response deadline
+   * that item 54 documents, so `/api/poly/sync` could not answer inside its own
+   * budget. Started together, the worst case is the MAX of one (~8s).
+   *
+   * Two invariants this must preserve, and does: `checks` is pushed in exactly
+   * the previous order (the dashboard renders the array as-is), and every leg
+   * keeps its original failure branch. Only the waiting overlaps.
+   *
+   * Cost of the change: four concurrent calls to polygon-bor.publicnode.com
+   * instead of four sequential ones. Agreed with the operator 2026-09-07.
+   */
+  const geoblockP = checkGeoblock();                    // never rejects — proxyEnv.ts:180
+  const apiP = capture(ensureApiKey());
+  const ownerP = depositWallet ? readDepositWalletOwner(depositWallet) : null;   // never rejects — :34
+  const pusdP = depositWallet
+    ? capture(getClient().readContract({
+      address: POLY.pUsd,
+      abi: ERC20_ABI,
+      functionName: 'balanceOf',
+      args: [depositWallet],
+    }))
+    : null;
+  const positionsP = depositWallet ? fetchDepositPositions(depositWallet) : null; // never rejects — :50
+  const clobP = capture(getClobBalance());
+  const usdcP = capture(getClient().readContract({
+    address: POLY.usdc,
+    abi: ERC20_ABI,
+    functionName: 'balanceOf',
+    args: [address],
+  }));
+  const polP = capture(getClient().getBalance({ address }));
+
+  const geoblock = await geoblockP;
   checks.push({
     id: 'geoblock',
     ok: geoblock.ok && !geoblock.blocked,
@@ -71,16 +125,16 @@ export async function checkReadiness(config = {}) {
       : (geoblock.ok ? `Trading region allowed (${geoblock.country || 'unknown'})` : `Region check failed: ${geoblock.error || 'unknown error'}`),
   });
 
-  try {
-    const creds = await ensureApiKey();
-    apiReady = !!creds?.key;
+  const api = await apiP;
+  if (api.ok) {
+    apiReady = !!api.value?.key;
     checks.push({ id: 'api', ok: apiReady, detail: apiReady ? 'CLOB API key derived from wallet' : 'API key missing' });
-  } catch (err) {
-    checks.push({ id: 'api', ok: false, detail: `API auth failed: ${err.message}` });
+  } else {
+    checks.push({ id: 'api', ok: false, detail: `API auth failed: ${api.error.message}` });
   }
 
   if (depositWallet) {
-    depositOwner = await readDepositWalletOwner(depositWallet);
+    depositOwner = await ownerP;
     ownerMatches = !!depositOwner && depositOwner.toLowerCase() === address.toLowerCase();
     checks.push({
       id: 'deposit_owner',
@@ -90,24 +144,19 @@ export async function checkReadiness(config = {}) {
         : `Deposit wallet owner ${depositOwner?.slice(0, 6)}…${depositOwner?.slice(-4)} ≠ bot ${address.slice(0, 6)}…${address.slice(-4)}`,
     });
 
-    try {
-      const bal = await getClient().readContract({
-        address: POLY.pUsd,
-        abi: ERC20_ABI,
-        functionName: 'balanceOf',
-        args: [depositWallet],
-      });
-      depositPusd = Number(formatUnits(bal, 6));
+    const pusd = await pusdP;
+    if (pusd.ok) {
+      depositPusd = Number(formatUnits(pusd.value, 6));
       checks.push({
         id: 'deposit_pusd',
         ok: depositPusd > 0,
         detail: `Deposit wallet pUSD $${depositPusd.toFixed(2)} at ${depositWallet.slice(0, 6)}…${depositWallet.slice(-4)}`,
       });
-    } catch (err) {
-      checks.push({ id: 'deposit_pusd', ok: false, detail: `Deposit pUSD check failed: ${err.message}` });
+    } else {
+      checks.push({ id: 'deposit_pusd', ok: false, detail: `Deposit pUSD check failed: ${pusd.error.message}` });
     }
 
-    positions = await fetchDepositPositions(depositWallet);
+    positions = await positionsP;
     if (positions.length) {
       const openPnl = positions.reduce((sum, p) => sum + Number(p.cashPnl || 0), 0);
       checks.push({
@@ -118,11 +167,11 @@ export async function checkReadiness(config = {}) {
     }
   }
 
-  try {
-    const bal = await getClobBalance();
-    clobBalance = bal.balance;
-    clobAllowance = bal.allowance;
-    clobError = bal.clobError;
+  const clob = await clobP;
+  if (clob.ok) {
+    clobBalance = clob.value.balance;
+    clobAllowance = clob.value.allowance;
+    clobError = clob.value.clobError;
     const effectiveBalance = clobBalance > 0 ? clobBalance : depositPusd;
     checks.push({
       id: 'clob_balance',
@@ -136,37 +185,32 @@ export async function checkReadiness(config = {}) {
       ok: clobAllowance > 0 || effectiveBalance === 0,
       detail: clobAllowance > 0 ? `Allowance $${clobAllowance.toFixed(2)}` : 'No exchange allowance yet',
     });
-  } catch (err) {
-    checks.push({ id: 'clob_balance', ok: depositPusd >= POLY_MIN_ORDER_USD, detail: `CLOB balance check failed: ${err.message}` });
+  } else {
+    checks.push({ id: 'clob_balance', ok: depositPusd >= POLY_MIN_ORDER_USD, detail: `CLOB balance check failed: ${clob.error.message}` });
   }
 
-  try {
-    const bal = await getClient().readContract({
-      address: POLY.usdc,
-      abi: ERC20_ABI,
-      functionName: 'balanceOf',
-      args: [address],
-    });
-    onchainUsdc = Number(formatUnits(bal, 6));
+  const usdc = await usdcP;
+  if (usdc.ok) {
+    onchainUsdc = Number(formatUnits(usdc.value, 6));
     checks.push({
       id: 'wallet_usdc',
       ok: onchainUsdc > 0,
       detail: `Signer wallet USDC $${onchainUsdc.toFixed(2)}`,
     });
-  } catch (err) {
-    checks.push({ id: 'wallet_usdc', ok: false, detail: `Wallet USDC check failed: ${err.message}` });
+  } else {
+    checks.push({ id: 'wallet_usdc', ok: false, detail: `Wallet USDC check failed: ${usdc.error.message}` });
   }
 
-  try {
-    const bal = await getClient().getBalance({ address });
-    polyBalance = Number(formatUnits(bal, 18));
+  const pol = await polP;
+  if (pol.ok) {
+    polyBalance = Number(formatUnits(pol.value, 18));
     // CLOB trades via deposit wallet — POL on signer is optional, not a live blocker
     checks.push({
       id: 'gas',
       ok: true,
       detail: polyBalance > 0.01 ? `Signer POL ${polyBalance.toFixed(4)} (optional)` : 'CLOB uses deposit wallet — no POL needed',
     });
-  } catch (err) {
+  } else {
     checks.push({ id: 'gas', ok: true, detail: 'Gas check skipped (CLOB path)' });
   }
 
