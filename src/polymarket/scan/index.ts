@@ -72,9 +72,26 @@ export async function executeScanCycle({
     }
     botState.stats = botState.stats || {};
     botState.stats.scansDone = (botState.stats.scansDone || 0) + 1;
-    const readiness = typeof refreshTelemetry === 'function'
-      ? await refreshTelemetry()
-      : null;
+    /*
+     * Backlog item 60 — read the cached readiness; never refresh it here.
+     *
+     * This used to `await refreshTelemetry()`, i.e. run the full eight-call
+     * `checkReadiness()` on EVERY tick of a 250ms timer. Two of those calls go
+     * through the metered CLOB proxy, so the hot trading loop was the single
+     * largest consumer of a 1GB/month quota — and every cycle blocked on remote
+     * I/O before doing any trading work, so a slow proxy throttled the scan rate
+     * itself (`_scanning` serialises cycles).
+     *
+     * Ownership: the 30s/60s `syncBalances` timer in `startBackgroundFeeds` owns
+     * `botState.readiness`. The scan loop is a reader. Nothing here writes it.
+     *
+     * Staleness is safe for both consumers as of the affordability work:
+     * `arbEngine.ts` refuses a package it cannot fund in either mode, and
+     * `resolveOrderSize` (`engines/directional.ts:78`) returns `no_bankroll` when
+     * the balance is absent or zero — so a cold start with no readiness yet
+     * declines trades rather than sizing against an unknown balance.
+     */
+    const readiness = botState.readiness ?? null;
 
     // 2. Refresh signals & market inputs
     await collectSignals({
