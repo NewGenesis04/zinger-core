@@ -504,10 +504,21 @@ export async function cancelOrder(orderId) {
 
 export const deriveApiKey = ensureApiKey;
 
+/**
+ * Ask the CLOB to refresh its cached allowance. Returns nothing on purpose.
+ *
+ * This used to end with `return getClobBalance()` — a second proxied round trip
+ * whose result every one of its seven call sites discarded, and which five of
+ * them immediately duplicated by calling `refreshTelemetry()` (which reads the
+ * balance again via `readiness.ts`). `getClobBalance` is pure, so the read had
+ * no side effect worth keeping either. Backlog item 61: that one line was 25% of
+ * the bot's steady-state proxy traffic.
+ *
+ * Callers that need the balance should call `getClobBalance()` themselves.
+ */
 export async function syncClobBalance() {
   const client = await getProxyTradingClient();
   await client.updateBalanceAllowance({ asset_type: AssetType.COLLATERAL });
-  return getClobBalance();
 }
 
 export function resetTradingClient() {

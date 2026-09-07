@@ -42,10 +42,67 @@ export function getClobProxyAgent() {
 
 
 
+/**
+ * CLOB endpoints that move money. Matched by exact pathname + method.
+ *
+ * `@polymarket/clob-client-v2` routes everything through the *global* axios
+ * instance (`dist/http-helpers/index.js:18`), so `axios.defaults.timeout` would
+ * bound order submission too — and an order POST that times out is NOT a
+ * cancelled order. It may have reached the book, leaving real money in a state
+ * the bot has no record of, which is the failure `assertOrderAccepted`
+ * (`trade.ts:140`) and the receipt log exist to prevent. Killing a read is free;
+ * killing a write is not.
+ *
+ * Substring matching is wrong here and was the first version of this fix: the
+ * SDK's read endpoints include `/data/order/`, `/data/orders`, `/order-scoring`
+ * and `/orders-scoring` (`clob-client-v2/dist/endpoints.cjs`), all of which a
+ * `/order/` test would wrongly exempt. Worse, `createOrDeriveApiKey` POSTs to
+ * `/auth/api-key` — so a "leave POSTs alone" rule would have left unbounded the
+ * exact call that hung for 25s and started this investigation (backlog 57).
+ */
+const MONEY_PATHS = new Set(['/order', '/orders', '/cancel-market-orders']);
+const READ_TIMEOUT_MS = Number(process.env.CLOB_READ_TIMEOUT_MS) || 10000;
+
+let _timeoutsInstalled = false;
+
+/**
+ * Does this request move money? Exported so the classification is testable on
+ * its own — it is the load-bearing half of the timeout policy, and getting it
+ * wrong in either direction is a real failure: bound an order POST and you risk
+ * an order in unknown state, exempt `/auth/api-key` and the hang stays.
+ */
+export function movesMoney(url, method) {
+  let path = '';
+  try {
+    path = new URL(url, 'https://clob.polymarket.com').pathname;
+  } catch {
+    path = String(url || '').split('?')[0];
+  }
+  const verb = String(method || 'get').toLowerCase();
+  return MONEY_PATHS.has(path) && (verb === 'post' || verb === 'delete');
+}
+
+/** Bound every CLOB read; leave order submission and cancellation unbounded. */
+export function installAxiosReadTimeouts() {
+  if (_timeoutsInstalled) return;
+  _timeoutsInstalled = true;
+  axios.interceptors.request.use((config) => {
+    const url = config.baseURL && config.url && !/^https?:/i.test(config.url)
+      ? `${String(config.baseURL).replace(/\/$/, '')}/${String(config.url).replace(/^\//, '')}`
+      : config.url;
+    if (!movesMoney(url, config.method) && config.timeout == null) {
+      config.timeout = READ_TIMEOUT_MS;
+    }
+    return config;
+  });
+}
+
 /** Install axios default agent so @polymarket/clob-client-v2 posts exit via proxy. */
 export function installClobProxy() {
   if (_installed) return { ok: true, proxyUrl: redactProxy(_proxyUrl), agent: !!_agent };
   _installed = true;
+  // Runs even with no proxy configured — a hung read is a hung read either way.
+  installAxiosReadTimeouts();
   _proxyUrl = getClobProxyUrl();
   if (!_proxyUrl) {
     return { ok: false, proxyUrl: null, agent: false, reason: 'no CLOB_PROXY_URL' };
