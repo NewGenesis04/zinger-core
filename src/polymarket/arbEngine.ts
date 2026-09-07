@@ -169,9 +169,24 @@ export async function detectAndExecuteArbPackage({
   const costDown = Math.round(shares * downAsk * 100) / 100;
   const totalCost = Math.round((costUp + costDown) * 100) / 100;
 
-  if (mode === 'paper' && Number(cfg.paperBankroll ?? 0) < totalCost + 0.01) {
-    arbDecision('skip', 'insufficient_paper_cash',
-      { totalCost, paperBankroll: Number(cfg.paperBankroll ?? 0) },
+  /*
+   * Affordability gate — both modes.
+   *
+   * This read `mode === 'paper' && ...`, so live sizing took
+   * `readiness.spendableBalance` (:157) and then never checked it covered the
+   * cost. `shareBudget` floors at `minPositionSize * 2` (:159), so even a zero
+   * balance still produced an order.
+   *
+   * That was survivable only because readiness was refetched every scan tick.
+   * Once it is cached (backlog item 60) a stale-high balance can fill leg one
+   * and have leg two rejected for collateral — an UNHEDGED directional position,
+   * which is the one outcome an arb package exists to prevent. `arbBank` already
+   * holds the right number per mode, so the gate is the same expression for both.
+   */
+  if (arbBank < totalCost + 0.01) {
+    arbDecision('skip',
+      mode === 'paper' ? 'insufficient_paper_cash' : 'insufficient_live_cash',
+      { totalCost, available: arbBank, mode },
       { breakEvenGap, requiredGap, sizing: { shares, costUp, costDown, capitalUsd: totalCost } });
     return null;
   }
