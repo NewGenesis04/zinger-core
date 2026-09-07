@@ -25,7 +25,7 @@ import { EventEmitter } from 'node:events';
  * cycle, which is what lets the order path emit without a dependency loop.
  */
 export const TELEMETRY_SCHEMA_VERSION = 2;
-export const DEFAULT_EVENT_BUFFER_CAP = 5000;
+export const DEFAULT_EVENT_BUFFER_CAP = Number(process.env.EVENT_BUFFER_CAP) || 30_000;
 
 /* ------------------------------------------------------------------ *
  * Shared shapes
