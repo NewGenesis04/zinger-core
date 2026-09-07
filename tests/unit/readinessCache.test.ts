@@ -58,7 +58,7 @@ vi.mock('viem', async (importOriginal) => {
   };
 });
 
-const { checkReadiness, resetReadinessCache, invalidateBalanceCache } =
+const { checkReadiness, resetReadinessCache, invalidateBalanceCache, applyBalanceDelta } =
   await import('../../src/polymarket/readiness.js');
 
 function allLegsHealthy() {
@@ -188,5 +188,65 @@ describe('INVARIANT: a fill expires the balance legs but nothing else', () => {
 
     // The whole point of the tiering: a fill must not cost a proxied geo check.
     expect(geoblockSpy).not.toHaveBeenCalled();
+  });
+});
+
+describe('INVARIANT: a fill is deducted synchronously, before the next sizing read', () => {
+  it('reduces the balance immediately, without waiting for a refresh', async () => {
+    const readiness = { spendableBalance: 100, clobBalance: 100 };
+
+    applyBalanceDelta(readiness, -12.34);
+
+    // arbEngine.ts:157 reads this field. It must be current the instant the fill
+    // lands — a refresh takes hundreds of ms, during which the 250ms scan loop
+    // could size more orders against money already committed.
+    expect(readiness.spendableBalance).toBe(87.66);
+    expect(readiness.clobBalance).toBe(87.66);
+  });
+
+  it('clamps at zero rather than going negative', async () => {
+    const readiness = { spendableBalance: 5, clobBalance: 5 };
+
+    applyBalanceDelta(readiness, -20);
+
+    // A negative balance would size the NEXT trade wrongly in the other
+    // direction, which is worse than reporting zero.
+    expect(readiness.spendableBalance).toBe(0);
+    expect(readiness.clobBalance).toBe(0);
+  });
+
+  it('credits on a sale as readily as it debits on a buy', async () => {
+    const readiness = { spendableBalance: 10, clobBalance: 10 };
+    applyBalanceDelta(readiness, 4.5);
+    expect(readiness.spendableBalance).toBe(14.5);
+  });
+
+  it('leaves fields it cannot parse alone', async () => {
+    const readiness = { spendableBalance: 50, clobBalance: null };
+    applyBalanceDelta(readiness, -10);
+
+    expect(readiness.spendableBalance).toBe(40);
+    expect(readiness.clobBalance).toBeNull();   // not coerced to -10
+  });
+
+  it('is a no-op on a zero delta or a missing snapshot', async () => {
+    const readiness = { spendableBalance: 50, clobBalance: 50 };
+    applyBalanceDelta(readiness, 0);
+    expect(readiness.spendableBalance).toBe(50);
+
+    expect(() => applyBalanceDelta(null, -5)).not.toThrow();
+    expect(() => applyBalanceDelta(undefined, -5)).not.toThrow();
+  });
+
+  it('expires the cached balance legs so the truth-up actually refetches', async () => {
+    await checkReadiness({});
+    vi.clearAllMocks();
+    allLegsHealthy();
+
+    applyBalanceDelta({ spendableBalance: 100, clobBalance: 100 }, -1);
+    await checkReadiness({});
+
+    // Without this the post-fill refresh silently returns the pre-trade cache.
+    expect(clobBalanceSpy).toHaveBeenCalledTimes(1);
   });
 });

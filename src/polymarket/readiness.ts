@@ -154,6 +154,37 @@ export function resetReadinessCache() {
   _memo.clear();
 }
 
+/**
+ * Apply a fill to an in-memory readiness snapshot, then expire the cached legs.
+ *
+ * `arbEngine.ts:157` sizes live packages straight off `spendableBalance`, which
+ * is TTL-cached above. A post-trade refresh would hand back the PRE-trade
+ * number, and waiting for the TTL to lapse leaves a window in which the 250ms
+ * scan loop sizes further orders against money already committed — a second leg
+ * rejected for collateral leaves the first UNHEDGED.
+ *
+ * So the deduction is synchronous and local; the network round trip that
+ * follows is a truth-up, not the mechanism. Clamped at zero because a balance
+ * cannot go negative, and a negative here would size the *next* trade wrongly in
+ * the opposite direction.
+ */
+export function applyBalanceDelta(readiness, deltaUsd) {
+  const delta = Number(deltaUsd) || 0;
+  if (!delta || !readiness) return readiness;
+  for (const field of ['spendableBalance', 'clobBalance']) {
+    const raw = readiness[field];
+    // `Number(null)` is 0, which is finite — so a plain isFinite check would
+    // turn "balance unknown" into a fabricated "balance zero". Leave unknown
+    // alone; a caller that has never read a balance must not be handed one.
+    if (raw == null) continue;
+    const current = Number(raw);
+    if (!Number.isFinite(current)) continue;
+    readiness[field] = Math.max(0, Math.round((current + delta) * 100) / 100);
+  }
+  invalidateBalanceCache();
+  return readiness;
+}
+
 export async function checkReadiness(config = {}) {
   const wallet = getWallet();
   const address = wallet.address;

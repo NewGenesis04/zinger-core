@@ -455,7 +455,8 @@ export async function createApp() {
 
   app.post('/api/poly/sync', async (req, res) => {
     try {
-      res.json(await poly.syncBalances());
+      // Operator pressed Sync — bypass the readiness TTL cache (backlog 61).
+      res.json(await poly.syncBalances({ force: true }));
     } catch (err) {
       res.status(500).json({ error: err.message });
     }
@@ -464,7 +465,7 @@ export async function createApp() {
   app.post('/api/poly/deposit', async (req, res) => {
     try {
       const { amountUsd } = req.body || {};
-      const result = await poly.syncBalances();
+      const result = await poly.syncBalances({ force: true });
       res.json({ ok: true, ...result });
     } catch (err) {
       res.status(500).json({ error: err.message });
@@ -523,8 +524,9 @@ export async function createApp() {
       return res.status(400).json({ ok: false, error: 'Confirmation must be RESET LIVE' });
     }
     try {
-      // Refresh CLOB cash so baseline matches wallet before wipe
-      await poly.syncBalances().catch(() => null);
+      // Refresh CLOB cash so baseline matches wallet before wipe. Forced: a
+      // cached balance here would write a stale baseline that outlives the reset.
+      await poly.syncBalances({ force: true }).catch(() => null);
       const readiness = await poly.getReadiness().catch(() => null);
       const cash = Number(readiness?.spendableBalance ?? readiness?.clobBalance ?? 0);
       const result = poly.resetLiveData({ baselineUsd: cash > 0 ? cash : undefined });

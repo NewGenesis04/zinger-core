@@ -82,6 +82,63 @@ export function movesMoney(url, method) {
   return MONEY_PATHS.has(path) && (verb === 'post' || verb === 'delete');
 }
 
+/**
+ * Proxy request counter — backlog item 61.
+ *
+ * The bandwidth budget was previously unmeasurable in-process: nothing counted
+ * requests, so the only way to know the bot was draining a metered quota was the
+ * provider's dashboard, and by then it had already stopped working. Every axios
+ * call rides the proxy agent (installClobProxy sets axios.defaults), so the
+ * interceptor below is the one place that sees all of them.
+ *
+ * Counts since process start, bucketed by UTC day so a daily burn rate is
+ * readable without storing history.
+ */
+const _proxyStats = {
+  startedAt: Date.now(),
+  total: 0,
+  reads: 0,
+  writes: 0,
+  byDay: new Map(),
+};
+
+function recordProxyRequest(isWrite) {
+  _proxyStats.total += 1;
+  if (isWrite) _proxyStats.writes += 1; else _proxyStats.reads += 1;
+  const day = new Date().toISOString().slice(0, 10);
+  _proxyStats.byDay.set(day, (_proxyStats.byDay.get(day) || 0) + 1);
+  // Keep a week; this is a gauge, not a ledger.
+  if (_proxyStats.byDay.size > 7) {
+    const oldest = [..._proxyStats.byDay.keys()].sort()[0];
+    _proxyStats.byDay.delete(oldest);
+  }
+}
+
+/** Live quota gauge: requests seen, and the rate they imply. */
+export function getProxyRequestStats() {
+  const elapsedMs = Math.max(1, Date.now() - _proxyStats.startedAt);
+  const perHour = (_proxyStats.total / elapsedMs) * 3_600_000;
+  return {
+    configured: Boolean(_proxyUrl),
+    since: new Date(_proxyStats.startedAt).toISOString(),
+    total: _proxyStats.total,
+    reads: _proxyStats.reads,
+    writes: _proxyStats.writes,
+    perHour: Math.round(perHour * 10) / 10,
+    projectedPerDay: Math.round(perHour * 24),
+    byDay: Object.fromEntries(_proxyStats.byDay),
+  };
+}
+
+/** Test seam. */
+export function resetProxyRequestStats() {
+  _proxyStats.startedAt = Date.now();
+  _proxyStats.total = 0;
+  _proxyStats.reads = 0;
+  _proxyStats.writes = 0;
+  _proxyStats.byDay.clear();
+}
+
 /** Bound every CLOB read; leave order submission and cancellation unbounded. */
 export function installAxiosReadTimeouts() {
   if (_timeoutsInstalled) return;
@@ -90,7 +147,13 @@ export function installAxiosReadTimeouts() {
     const url = config.baseURL && config.url && !/^https?:/i.test(config.url)
       ? `${String(config.baseURL).replace(/\/$/, '')}/${String(config.url).replace(/^\//, '')}`
       : config.url;
-    if (!movesMoney(url, config.method) && config.timeout == null) {
+    const isWrite = movesMoney(url, config.method);
+    recordProxyRequest(isWrite);
+    // `config.timeout > 0`, not `== null`: axios merges its defaults before
+    // request interceptors run, and its default timeout is 0 ("no timeout") —
+    // not undefined. A null check therefore never fires, which silently made
+    // this interceptor a no-op for bounding while still looking correct.
+    if (!isWrite && !(Number(config.timeout) > 0)) {
       config.timeout = READ_TIMEOUT_MS;
     }
     return config;

@@ -49,7 +49,7 @@ import {
 } from './arbEngine.js';
 import { persist, persistSync, load, FILES, dataPath } from './persistence.js';
 import { placeOrder, placeMarketBuy, placeMarketSell, sellFloor, cancelOrder, syncClobBalance } from './trade.js';
-import { checkReadiness } from './readiness.js';
+import { checkReadiness, invalidateBalanceCache, applyBalanceDelta } from './readiness.js';
 import { resolveDynamicLimits, setKellyTradeHistory, getKellyStats, buildDynamicPlan, checkTrailingStop, checkPartialProfit, resolveAdaptiveSl } from './kelly.js';
 import {
   dedupeTrades,
@@ -419,6 +419,28 @@ function reconcilePaperCash(reason = 'reconcile') {
 
 function adjustPaperCash(delta, reason = '') {
   return paperCash.adjust(delta, reason);
+}
+
+/**
+ * Apply a live fill to the in-memory balance immediately — backlog item 61.
+ *
+ * `arbEngine.ts:157` sizes live packages straight off
+ * `readiness.spendableBalance`, and that value is now TTL-cached for 60s. A
+ * post-trade `refreshTelemetry()` therefore returns the PRE-trade balance, and
+ * waiting for the TTL to lapse leaves a window in which the 250ms scan loop
+ * sizes further orders against money already committed. A second leg rejected
+ * for collateral leaves the first leg UNHEDGED, which is the one outcome an arb
+ * package exists to prevent.
+ *
+ * So the deduction is synchronous and local, and the network round trip that
+ * follows is a truth-up rather than the mechanism. This is the live counterpart
+ * of `adjustPaperCash` above; paper has had it all along.
+ */
+function applyLiveCashDelta(deltaUsd, reason = '') {
+  const delta = Number(deltaUsd) || 0;
+  if (!delta || !botState.readiness) return;
+  applyBalanceDelta(botState.readiness, delta);
+  if (reason) botState._lastLiveCashDelta = { delta, reason, at: Date.now() };
 }
 
 /**
@@ -1025,7 +1047,12 @@ async function executePendingTrade(pending) {
       pos.entryPrice = orderResult.price;
       if (orderResult.fillSource === 'matched-unverified') pos.unverifiedFill = true;
       markPosition(pos, orderResult.price);
-      try { await syncClobBalance(); await refreshTelemetry(); } catch {}
+      // Synchronous first: the next sizing read must not see money already
+      // spent. `costBasis` is shares × entryPrice as of markPosition (:1360).
+      applyLiveCashDelta(-Number(pos.costBasis || 0), `BUY ${pending.symbol} ${pending.outcome?.toUpperCase()}`);
+      // Then truth up in the background — this used to be awaited, so every live
+      // fill blocked on two proxied round trips before the log line even printed.
+      syncClobBalance().then(refreshTelemetry).catch(() => {});
       log(`✅ LIVE BUY ${pending.symbol} ${pending.outcome.toUpperCase()} @ $${orderResult.price.toFixed(3)} · ${pos.shares} sh · TP $${Number(plan.tpPrice || 0).toFixed(3)} · SL $${Number(plan.slPrice || 0).toFixed(3)}`, 'buy', {
         market: pending.symbol, slug: pending.slug, outcome: pending.outcome,
         orderId: pos.orderId, amount: plan.sizeUsd, price: orderResult.price,
@@ -2076,7 +2103,16 @@ export async function getReadiness() {
   return refreshTelemetry();
 }
 
-export async function syncBalances() {
+/**
+ * @param force  Bypass the readiness TTL cache (item 61).
+ *
+ * The two callers want opposite things. The 30s background timer should honour
+ * the cache — that is the entire bandwidth saving. An operator pressing Sync is
+ * asking for the truth *now*, and serving them a 60s-old snapshot would look
+ * like the button is broken. So freshness is explicit rather than implied.
+ */
+export async function syncBalances({ force = false } = {}) {
+  if (force) invalidateBalanceCache();
   try {
     await syncClobBalance();
   } catch {}
@@ -3041,7 +3077,9 @@ export async function scan() {
             bookWindowExit('partial', extraMeta.partialPnl ?? pos.partialPnl ?? 0);
           }
           emitPositionExit(pos, exitReason, { exitPrice: fillPrice, shares: sellShares });
-          try { await syncClobBalance(); await refreshTelemetry(); } catch {}
+          // Expire first: since item 61 the balance legs are TTL-cached, so refreshing
+  // without invalidating would hand back the pre-trade snapshot.
+  try { invalidateBalanceCache(); await syncClobBalance(); await refreshTelemetry(); } catch {}
           return true;
         }
 
@@ -4203,7 +4241,9 @@ async function executeSell(pos, reason = 'manual') {
   }
   saveTrade({ ...pos, timestamp: Date.now(), orderId: pos.orderId });
   saveState();
-  try { await syncClobBalance(); await refreshTelemetry(); } catch {}
+  // Expire first: since item 61 the balance legs are TTL-cached, so refreshing
+  // without invalidating would hand back the pre-trade snapshot.
+  try { invalidateBalanceCache(); await syncClobBalance(); await refreshTelemetry(); } catch {}
 
   log(`⚡ RAPID SELL ${pos.symbol} ${pos.outcome?.toUpperCase()} · ${reason} · PnL $${pos.pnl?.toFixed(2)}`, 'sl', {
     market: pos.symbol, slug: pos.slug, outcome: pos.outcome, reason,
@@ -4238,7 +4278,9 @@ export async function rapidSellPmAsset({ assetId, size }) {
     negRisk: false,
     tickSize: '0.01',
   });
-  try { await syncClobBalance(); await refreshTelemetry(); } catch {}
+  // Expire first: since item 61 the balance legs are TTL-cached, so refreshing
+  // without invalidating would hand back the pre-trade snapshot.
+  try { invalidateBalanceCache(); await syncClobBalance(); await refreshTelemetry(); } catch {}
   log(`⚡ PM WALLET SELL asset ${String(assetId).slice(0, 12)} · ${size} sh`, 'sl', { assetId, size, orderId: result.id });
   return { ok: true, orderId: result.id };
 }

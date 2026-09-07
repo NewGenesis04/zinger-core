@@ -5,7 +5,7 @@ import { getSpotHistory, getSpotPriceSnapshot, onSpotTick } from '../polymarket/
 import { getMidPrice, getOrderBook } from '../polymarket/clob.js';
 import { openCostWithFee, closeProceedsWithFee } from '../polymarket/fees.js';
 import { buildDataAssurance } from '../polymarket/dataAssurance.js';
-import { checkGeoblock, checkGeoblockDirect, checkProxyHealth } from '../polymarket/proxyEnv.js';
+import { checkGeoblock, checkGeoblockDirect, checkProxyHealth, getProxyRequestStats } from '../polymarket/proxyEnv.js';
 import { getClobWsSnapshot } from '../polymarket/clobWs.js';
 import { getSessionLedger } from '../polymarket/sessionLedger.js';
 import { syncLiveAccount, getLiveAccount } from '../polymarket/liveAccount.js';
@@ -998,6 +998,10 @@ export function registerPublicAPI(app, getPolyState) {
               : 'Falling back to Gamma mids',
         },
       },
+      // Live quota gauge (backlog item 61). The CLOB proxy is metered, and a
+      // 1GB/month plan was drained in ~9 days at ~10KB/request before anything
+      // in-process counted them. `perHour` is the number to watch.
+      proxyUsage: getProxyRequestStats(),
       geoblock: {
         direct: geoblockDirect,
         viaProxy: geoblockProxy,
