@@ -66,6 +66,94 @@ function capture(p) {
   return p.then((value) => ({ ok: true, value }), (error) => ({ ok: false, error }));
 }
 
+/* ------------------------------------------------------------------ *
+ * Tiered TTL cache — backlog item 60/61
+ *
+ * `checkReadiness` runs on a background timer, and two of its legs go through a
+ * metered CLOB proxy. Before this, every pass refetched all eight legs, which
+ * drained a 1 GB/month Webshare quota in ~9 days at ~10 KB/request.
+ *
+ * The lifetime is chosen from the OUTCOME, not the call site, because the three
+ * cases have genuinely different costs:
+ *
+ *   - a good answer      → cache long; it is what we wanted
+ *   - a bad-but-true answer ("you are blocked") → cache briefly, so recovery is
+ *     noticed quickly once the proxy is restored
+ *   - a failed check     → cache briefly WITH BACKOFF. This is the subtle one:
+ *     "never cache failures" means "retry every time", which is precisely the
+ *     hammering that exhausted the quota while the proxy was dead.
+ * ------------------------------------------------------------------ */
+
+const MINUTE = 60_000;
+export const TTL = {
+  geoblockAllowed: 4 * 60 * MINUTE,
+  geoblockBlocked: 10 * MINUTE,
+  depositOwner: 60 * MINUTE,
+  gas: 10 * MINUTE,
+  balances: MINUTE,
+  failBase: MINUTE,
+  failCap: 15 * MINUTE,
+};
+
+const _memo = new Map();
+
+/** Backoff for a leg that keeps failing: 1m → 2m → 4m → 8m → 15m (capped). */
+function failTtl(streak) {
+  return Math.min(TTL.failBase * 2 ** Math.max(0, streak - 1), TTL.failCap);
+}
+
+/**
+ * Run `fn`, caching its settled outcome for `ttlFor(value, error)` ms.
+ *
+ * Caches the in-flight promise, not just the result, so concurrent callers share
+ * one network call — `checkReadiness` starts all legs at once and the background
+ * timer can overlap an operator-triggered sync.
+ */
+function leased(key, fn, ttlFor) {
+  const now = Date.now();
+  const hit = _memo.get(key);
+  if (hit && now < hit.expires) return hit.promise;
+
+  const streak = hit?.streak ?? 0;
+  const entry = { promise: null, expires: Infinity, streak };
+  entry.promise = Promise.resolve()
+    .then(fn)
+    .then(
+      (value) => {
+        if (_memo.get(key) === entry) {
+          entry.streak = 0;
+          entry.expires = Date.now() + ttlFor(value, null);
+        }
+        return value;
+      },
+      (error) => {
+        if (_memo.get(key) === entry) {
+          entry.streak = streak + 1;
+          entry.expires = Date.now() + failTtl(entry.streak);
+        }
+        throw error;
+      },
+    );
+  _memo.set(key, entry);
+  return entry.promise;
+}
+
+/**
+ * Expire the balance-derived legs immediately.
+ *
+ * Called after a fill so the next sizing read cannot be based on money already
+ * spent. Deliberately does NOT touch geoblock or the API key: a trade changes
+ * balances, not your region or your credentials.
+ */
+export function invalidateBalanceCache() {
+  for (const key of ['clobBalance', 'depositPusd', 'positions']) _memo.delete(key);
+}
+
+/** Test seam — drop every cached leg. */
+export function resetReadinessCache() {
+  _memo.clear();
+}
+
 export async function checkReadiness(config = {}) {
   const wallet = getWallet();
   const address = wallet.address;
@@ -95,26 +183,33 @@ export async function checkReadiness(config = {}) {
    * Cost of the change: four concurrent calls to polygon-bor.publicnode.com
    * instead of four sequential ones. Agreed with the operator 2026-09-07.
    */
-  const geoblockP = checkGeoblock();                    // never rejects — proxyEnv.ts:180
+  const geoblockP = leased('geoblock', checkGeoblock,   // never rejects — proxyEnv.ts:180
+    (v) => (v?.ok && !v.blocked ? TTL.geoblockAllowed : TTL.geoblockBlocked));
+  // `ensureApiKey` owns its own success/backoff memo (trade.ts), so it is not
+  // leased here — double-caching would only delay its recovery.
   const apiP = capture(ensureApiKey());
-  const ownerP = depositWallet ? readDepositWalletOwner(depositWallet) : null;   // never rejects — :34
+  const ownerP = depositWallet
+    ? leased('depositOwner', () => readDepositWalletOwner(depositWallet), () => TTL.depositOwner)
+    : null;   // never rejects — :34
   const pusdP = depositWallet
-    ? capture(getClient().readContract({
+    ? capture(leased('depositPusd', () => getClient().readContract({
       address: POLY.pUsd,
       abi: ERC20_ABI,
       functionName: 'balanceOf',
       args: [depositWallet],
-    }))
+    }), () => TTL.balances))
     : null;
-  const positionsP = depositWallet ? fetchDepositPositions(depositWallet) : null; // never rejects — :50
-  const clobP = capture(getClobBalance());
-  const usdcP = capture(getClient().readContract({
+  const positionsP = depositWallet
+    ? leased('positions', () => fetchDepositPositions(depositWallet), () => TTL.balances)
+    : null; // never rejects — :50
+  const clobP = capture(leased('clobBalance', getClobBalance, () => TTL.balances));
+  const usdcP = capture(leased('onchainUsdc', () => getClient().readContract({
     address: POLY.usdc,
     abi: ERC20_ABI,
     functionName: 'balanceOf',
     args: [address],
-  }));
-  const polP = capture(getClient().getBalance({ address }));
+  }), () => TTL.balances));
+  const polP = capture(leased('polBalance', () => getClient().getBalance({ address }), () => TTL.gas));
 
   const geoblock = await geoblockP;
   checks.push({

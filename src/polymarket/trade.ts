@@ -64,11 +64,55 @@ function baseClient() {
   return new ClobClient({ host: HOST, chain: POLY.chainId, signer: getSigner(), ...getClientOptions() });
 }
 
+/**
+ * Derive CLOB L2 credentials once, and fail loudly rather than silently.
+ *
+ * Backlog items 57/58. Three defects lived in `if (_creds) return _creds`:
+ *
+ *  1. A falsy result never memoised, so every readiness pass re-derived — an
+ *     unbounded proxied call, on a timer.
+ *  2. A rejection never memoised either, so a dead proxy was retried on every
+ *     pass rather than backed off.
+ *  3. Credentials that came back *without a key* were cached as success. The
+ *     readiness panel then said "API key missing" and the balance check said
+ *     `buildPolyHmacSignature: secret is empty` — both of which read as a
+ *     credential bug. The actual cause was an exhausted proxy quota, and that
+ *     misdirection cost six rounds of diagnosis. Unusable credentials are now a
+ *     failure with a message that says so.
+ *
+ * Success is cached for the process lifetime; failure is cached briefly with
+ * exponential backoff so the bot heals on its own once the proxy returns,
+ * without hammering it in the meantime.
+ */
+const AUTH_FAIL_BASE_MS = 60_000;
+const AUTH_FAIL_CAP_MS = 15 * 60_000;
+
+let _credsFailUntil = 0;
+let _credsFailStreak = 0;
+let _credsLastError = null;
+
 export async function ensureApiKey() {
   if (_creds) return _creds;
-  const client = baseClient();
-  _creds = await client.createOrDeriveApiKey();
-  return _creds;
+  if (Date.now() < _credsFailUntil) {
+    const waitS = Math.ceil((_credsFailUntil - Date.now()) / 1000);
+    throw new Error(`CLOB auth backoff (${waitS}s left): ${_credsLastError}`);
+  }
+  try {
+    const creds = await baseClient().createOrDeriveApiKey();
+    // Resolved-but-keyless is a failure, not a cacheable success: an empty
+    // secret cannot sign an L2 header, so every downstream call would throw.
+    if (!creds?.key) throw new Error('CLOB returned credentials without an API key');
+    _creds = creds;
+    _credsFailStreak = 0;
+    _credsLastError = null;
+    return _creds;
+  } catch (err) {
+    _credsFailStreak = Math.min(_credsFailStreak + 1, 5);
+    _credsFailUntil = Date.now()
+      + Math.min(AUTH_FAIL_BASE_MS * 2 ** (_credsFailStreak - 1), AUTH_FAIL_CAP_MS);
+    _credsLastError = err?.message || String(err);
+    throw err;
+  }
 }
 
 export async function getTradingClient() {
@@ -526,4 +570,9 @@ export function resetTradingClient() {
   _client = null;
   _proxyCreds = null;
   _proxyClient = null;
+  // Clear the auth backoff too: an explicit reset is the operator saying "try
+  // again now", which a lingering backoff window would silently ignore.
+  _credsFailUntil = 0;
+  _credsFailStreak = 0;
+  _credsLastError = null;
 }

@@ -91,7 +91,7 @@ vi.mock('viem', async (importOriginal) => {
   };
 });
 
-const { checkReadiness } = await import('../../src/polymarket/readiness.js');
+const { checkReadiness, resetReadinessCache } = await import('../../src/polymarket/readiness.js');
 
 /** Every leg succeeds, each after `delayMs`. Individual legs overridden per test. */
 function allLegsHealthy(delayMs = 0) {
@@ -126,6 +126,9 @@ function isSubsequenceOfCanonical(ids) {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  // The legs are TTL-cached (backlog item 61), so a stale entry would serve the
+  // previous test's mocks and quietly make these assertions meaningless.
+  resetReadinessCache();
   globalThis.fetch = fetchSpy;
   allLegsHealthy(0);
 });
@@ -165,6 +168,7 @@ describe('INVARIANT: readiness checks keep their order and their independence', 
 
     for (const [name, breakIt] of Object.entries(failable)) {
       vi.clearAllMocks();
+      resetReadinessCache();   // otherwise iteration 2+ replays iteration 1's cache
       allLegsHealthy(0);
       breakIt();
 
