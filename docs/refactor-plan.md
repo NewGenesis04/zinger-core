@@ -1916,6 +1916,14 @@ Roughly 15 lines across three files.
 
 ### 48. The D8 decision-emitter tee plan, checked against the code ✅ IMPLEMENTED (Steps A–F shipped in `c7e53d1` & `9d2667e`)
 
+**Status 2026-09-08 — implemented, one verification gap left.** Step B's HTTP and
+SSE layer is now verified on the VPS (see "Step B — what is verified and what is
+not" below). Step C's gap stands: the trade and exit tees still have no unit
+tests, and the invariant *exactly one `position.exit` per exit, one
+`trade.execution` per trade* is unproven. That is blocked on the D4 position
+manager owning the exit path, not on effort here. **Do not mark this FIXED until
+that invariant is testable.**
+
 Proposed 2026-09-03: execute D8's deferred decision emitter (slice 1 progress
 table, `docs/refactor-plan.md:508`) as five tees plus four interface additions,
 feeding an external "Forensics Truth Engine" that permanently records the event
@@ -2296,6 +2304,26 @@ curl -s -H "Authorization: Bearer $ZINGER_TOKEN" \
 The third is the one worth running deliberately: an empty page and a gap read
 identically to a naive consumer, and telling them apart is the entire point of
 the step.
+
+**✅ Verified on the VPS 2026-09-08** (localhost:3000, cookie auth). All three:
+
+- Stream: `event: sync` → `{"dropped":false,"evicted":366229,"hasMore":true,
+  "replayed":1000}`, then one `id:`-tagged frame per event. Leading sync and
+  per-event framing both confirmed live.
+- Cursor at head: `{"count":0,"dropped":false,"hasMore":false}`. Not a vacuous
+  pass — `events.ts:490-499` leaves `dropped` false *only* when `findIndex`
+  resolves the cursor inside the buffer, so this proves the id was located and
+  the front slice was correctly empty.
+- Bogus cursor `evt-0-0`: `dropped: true`.
+
+The last two together are the invariant: two responses carrying zero usable
+events, told apart by one flag, against a buffer that had already evicted
+366,283 events.
+
+The `hasMore: true` in that sync frame is not benign — see **item 65**. The
+replay is capped at 1,000 events against a 30,000 buffer, and on this instance
+that is a 94-second horizon, after which a reconnecting consumer silently loses
+the middle with `dropped: false`.
 
 Note `X-Accel-Buffering: no` is set on the stream because nginx will otherwise
 buffer SSE and the feed appears dead. If the stream connects but no frames
@@ -2957,6 +2985,80 @@ hedge to break; and `maxUsd` caps exposure at `bankroll × maxPositionPct`
 (default 10%) of the *stale* number.
 
 Worth closing for symmetry with item 62, but it does not gate item 60.
+
+### 65. SSE reconnect loses the middle, and `dropped` stays false ✅ FIXED
+
+**Found 2026-09-08** while closing item 48 step B on the VPS. The live sync frame
+reported `hasMore: true`, which is the bug condition, not an edge case.
+
+`/api/poly/events/stream` replays with a hard-coded `limit: 1000`
+(`server.ts:771-775`) against a 30,000-event buffer
+(`DEFAULT_EVENT_BUFFER_CAP`, `events.ts:28`). The replay is a *front* slice —
+correct for a catch-up read, and `events.ts:478-481` deliberately guards against
+a tail slice skipping the middle. But the stream then goes live from the queue,
+which only holds events emitted after the subscribe at `server.ts:760`. So when
+`hasMore` is true, everything between replay-end and connect-time is never
+framed:
+
+```
+subscribe (server.ts:760) ──────────────┐  queue starts HERE
+queryPage(after=cursor, limit=1000)     │
+  └─ front slice: the OLDEST 1,000 ─────┤
+     ╔══════════════════════════════╗   │
+     ║  up to 29,000 events         ║   │  ← never framed, dropped:false
+     ╚══════════════════════════════╝   │
+flush queue (server.ts:802-806) ────────┘
+```
+
+`dropped` is false because the cursor *was* found (`events.ts:490-499`), so the
+one gap signal step B exists to provide does not fire on this gap. `hasMore` in
+the sync frame is the only indication, and a consumer that treats the stream as
+self-sufficient has no reason to read it.
+
+Measured on the live instance: 30,000 events span 46.7 minutes (~10.7 events/s,
+~2.7 per 250 ms scan cycle — `scan.cycle` at `bot.ts:1309` plus one
+`arb.decision` per symbol at `arbEngine.ts:72`). **A 1,000-event replay is
+therefore a 94-second reconnect horizon.** Any consumer away longer comes back
+holed and cannot tell.
+
+Three candidate fixes, cheapest first:
+
+1. Set `dropped: true` whenever `hasMore` is true on a stream replay. One line,
+   turns a silent hole into the loud one the consumer already handles.
+2. Page the replay to the head before flushing the queue, rather than a single
+   1,000 slice. Correct, but unbounded work on a cold cursor.
+3. Raise the replay limit toward the buffer cap. Only moves the cliff.
+
+(1) is right on its own merits: the consumer contract already says a true
+`dropped` means resync. Do not do (3) alone.
+
+**Fixed with (1).** `buildSyncFrame` (`events.ts:583-594`) now reports
+`dropped: page.dropped || page.hasMore`, and `server.ts:779-782` calls it
+instead of assembling the frame inline. Put in the leaf telemetry module rather
+than in `server.ts` deliberately: importing `server.ts` from a test pulls in the
+whole bot, which is why this layer had no coverage and why the bug survived
+review. Four invariants in `tests/unit/events.test.ts` — the truncated case
+reports a gap, the complete case stays quiet (over-reporting on every connect
+would train the consumer to ignore the flag), an evicted cursor still reports
+even when the head *is* reached, and `replayed` matches the frames actually
+sent. Mutation-checked: reverting the `|| page.hasMore` fails the first with
+`expected false to be true`. 457/457, `tsc` clean.
+
+Widening `dropped` is the safe direction but it is not free — it is a **contract
+change** for any consumer already written against the old meaning. Today there
+is none (`grep` finds no in-repo reader of `/api/poly/events/stream`; the
+Forensics Truth Engine is external and unbuilt), so the cost is zero now and
+would not have been later. Note that a *cursorless* connect on a busy instance
+now reports `dropped: true`, because it genuinely is missing history — a fresh
+consumer that wants the backlog must page `/api/poly/events`, not trust the
+replay.
+
+**Note the emission rate independently.** 396,283 events in ~10.3 hours is
+~2.7 per scan cycle, almost all of them `arb.decision` skips recording the same
+`gap_below_breakeven`. That is not wrong — the bus is additive and the DB is the
+system of record — but it is what reduces the buffer's useful horizon to 47
+minutes, and it is worth asking whether a repeated skip on an unchanged quote
+needs its own event.
 
 ---
 

@@ -33,6 +33,7 @@ import {
   queryEvents as queryTelemetryEvents,
   queryEventsPage as queryTelemetryEventsPage,
   evictedCount as telemetryEvictedCount,
+  buildSyncFrame,
 } from './polymarket/telemetry/events.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -775,15 +776,11 @@ export async function createApp() {
       });
 
       // Leading sync frame: tells the consumer where it stands before any data,
-      // including whether its cursor had already been evicted.
-      res.write(`event: sync\ndata: ${JSON.stringify({
-        oldestId: page.oldestId,
-        newestId: page.newestId,
-        dropped: page.dropped,
-        evicted: page.evicted,
-        hasMore: page.hasMore,
-        replayed: page.events.length,
-      })}\n\n`);
+      // including whether its cursor had already been evicted, and whether the
+      // replay was truncated — which on a stream is itself a hole (item 65).
+      res.write(`event: sync\ndata: ${JSON.stringify(
+        buildSyncFrame(page, page.events.length),
+      )}\n\n`);
 
       for (const event of page.events) {
         replayedIds.add(event.id);

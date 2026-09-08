@@ -558,6 +558,44 @@ export function evictedCount(): number {
   return telemetryBus.getEvicted();
 }
 
+/** The leading `sync` frame of an SSE replay. See `buildSyncFrame`. */
+export interface SyncFrame {
+  oldestId: string | null;
+  newestId: string | null;
+  dropped: boolean;
+  evicted: number;
+  hasMore: boolean;
+  replayed: number;
+}
+
+/**
+ * Build the sync frame for a streamed replay (item 65).
+ *
+ * `dropped` here is deliberately BROADER than `EventPage.dropped`. On a page
+ * read, `hasMore` is benign — the caller pages again with the new cursor and
+ * loses nothing. On a *stream* it is not: the replay is a front slice, but the
+ * live feed resumes from connect time, so a truncated replay means the events
+ * between replay-end and connect-time are never framed at all. The consumer
+ * sees a continuous id sequence with a hole in the middle.
+ *
+ * `EventPage.dropped` cannot catch that, because the cursor was found. So a
+ * truncated stream replay is reported as dropped: the consumer contract already
+ * says a true `dropped` means resync, which is exactly the right response.
+ *
+ * Over-reporting is the safe direction. A consumer that resyncs unnecessarily
+ * does redundant reads; one that misses a hole trades on a false history.
+ */
+export function buildSyncFrame(page: EventPage, replayed: number): SyncFrame {
+  return {
+    oldestId: page.oldestId,
+    newestId: page.newestId,
+    dropped: page.dropped || page.hasMore,
+    evicted: page.evicted,
+    hasMore: page.hasMore,
+    replayed,
+  };
+}
+
 /** Subscriber faults absorbed by the fan-out, so they are not invisible. */
 export function subscriberErrors(): { count: number; last: string | null } {
   return telemetryBus.getSubscriberErrors();

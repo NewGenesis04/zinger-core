@@ -9,6 +9,7 @@ import {
   telemetryBus,
   TELEMETRY_SCHEMA_VERSION,
   queryEventsPage,
+  buildSyncFrame,
   evictedCount,
   setEventBufferCapacity,
   DEFAULT_EVENT_BUFFER_CAP,
@@ -281,5 +282,78 @@ describe('INVARIANT: one subscriber cannot break the bus for anyone else', () =>
     emitEvent('system.alert', { message: 'two', level: 'info' });
 
     expect(calls).toBe(1);
+  });
+});
+
+/**
+ * INVARIANT: a consumer is never told it is current when it has a hole.
+ *
+ * Item 65. `/api/poly/events/stream` replays a front slice capped at 1,000
+ * events, then goes live from connect time. When the replay is truncated, the
+ * events between replay-end and connect-time are never framed — and
+ * `EventPage.dropped` stays false, because the cursor WAS found. Measured on the
+ * live VPS instance the buffer turns over in ~47 minutes, making the reconnect
+ * horizon ~94 seconds, so this is the steady state rather than an edge case.
+ *
+ * These assert the reporting contract, not the cap: raising the replay limit
+ * moves the cliff without changing what a truncated replay must say.
+ */
+describe('INVARIANT: a truncated stream replay reports a gap (item 65)', () => {
+  beforeEach(() => {
+    clearEvents();
+    setEventBufferCapacity(DEFAULT_EVENT_BUFFER_CAP);
+  });
+
+  const emitN = (n: number) =>
+    Array.from({ length: n }, (_, i) =>
+      emitEvent('system.alert', { message: `m${i}`, level: 'info' }),
+    );
+
+  it('reports dropped when the replay could not reach the head', () => {
+    const all = emitN(6);
+    const page = queryEventsPage({ after: all[0].id, limit: 2 });
+
+    // The page itself is honest: the cursor resolved, so nothing was evicted.
+    expect(page.dropped).toBe(false);
+    expect(page.hasMore).toBe(true);
+
+    // On a stream that is still a hole, because the live feed resumes from
+    // connect time rather than from where the replay stopped.
+    expect(buildSyncFrame(page, page.events.length).dropped).toBe(true);
+  });
+
+  it('stays quiet when the replay did reach the head', () => {
+    // The other half: over-reporting on every connect would train the consumer
+    // to ignore the flag, which costs exactly as much as never setting it.
+    const all = emitN(4);
+    const page = queryEventsPage({ after: all[0].id });
+
+    expect(page.hasMore).toBe(false);
+    expect(buildSyncFrame(page, page.events.length).dropped).toBe(false);
+  });
+
+  it('still reports an evicted cursor even when the replay reached the head', () => {
+    setEventBufferCapacity(100);
+    const first = emitN(1)[0];
+    emitN(150); // pushes `first` off the back
+
+    const page = queryEventsPage({ after: first.id, limit: 1000 });
+
+    expect(page.hasMore).toBe(false); // the head IS reached
+    expect(page.dropped).toBe(true);  // but the cursor is gone
+    // `hasMore` must widen the signal, never narrow it.
+    expect(buildSyncFrame(page, page.events.length).dropped).toBe(true);
+  });
+
+  it('passes the replayed count through as the frame reports it', () => {
+    const all = emitN(6);
+    const page = queryEventsPage({ after: all[0].id, limit: 2 });
+    const frame = buildSyncFrame(page, page.events.length);
+
+    // A consumer filling the hole pages from the last id it actually received,
+    // so a replayed count that disagrees with the frames sent is unrecoverable.
+    expect(frame.replayed).toBe(2);
+    expect(frame.newestId).toBe(all[5].id);
+    expect(frame.hasMore).toBe(true);
   });
 });
