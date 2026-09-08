@@ -2748,6 +2748,216 @@ network rather than at the proxy.
 
 ---
 
+### 57. `ensureApiKey` was unbounded, and cached a failure as a success ✅ FIXED
+
+*Found 2026-09-07 tracing a 25 s `/api/poly/sync`. Root cause was billing, not code.*
+
+`trade.ts:67` read:
+
+```js
+export async function ensureApiKey() {
+  if (_creds) return _creds;
+  _creds = await client.createOrDeriveApiKey();
+  return _creds;
+}
+```
+
+Three defects behind one line:
+
+1. **Unbounded.** `@polymarket/clob-client-v2` calls the *global* axios instance
+   (`dist/http-helpers/index.js:18`) and sets no timeout of its own;
+   `installClobProxy` set `axios.defaults.httpAgent/httpsAgent/proxy` but never
+   `timeout`. On a dead proxy this hung past the 25 s response deadline.
+2. **A falsy result never memoised**, so every readiness pass re-derived — an
+   unbounded proxied call, on a timer.
+3. **Credentials returned *without a key* were cached as success.** The panel
+   then reported `API key missing` and the balance check
+   `buildPolyHmacSignature: secret is empty`. Both read as a credential bug. The
+   actual cause was an exhausted proxy quota, and that misdirection cost six
+   rounds of diagnosis.
+
+Fixed: success caches for the process lifetime, keyless credentials are a
+failure with a message that says so, and failure backs off 1m→15m so the bot
+heals on its own once the proxy returns.
+
+**The timeout fix is not `axios.defaults.timeout`.** That would also cap order
+submission, and an order POST that times out is *not* a cancelled order — it may
+have reached the book, leaving money in a state the bot has no record of, which
+is what `assertOrderAccepted` and the receipt log exist to prevent. A request
+interceptor bounds reads only, matching money paths exactly. Substring matching
+is wrong: the SDK's *reads* include `/data/order/`, `/data/orders`,
+`/order-scoring`, `/orders-scoring`, and `createOrDeriveApiKey` POSTs to
+`/auth/api-key` — so a "leave POSTs alone" rule leaves the hang exactly where it
+was.
+
+*A caution worth keeping.* The first version of that interceptor shipped green
+and did nothing: axios merges its defaults (`timeout: 0`) **before** request
+interceptors run, so the `config.timeout == null` guard never fired and no read
+was ever bounded. Every predicate test passed, because the predicate was right —
+only the application was dead. It was caught by an assertion on
+`res.config.timeout`, not by review. Test the effect, not the helper.
+
+---
+
+### 58. Cache policy: "never cache failures" means "retry every time" ✅ FIXED
+
+The instinct is that failures must not be cached, or a transient error gets
+locked in. Taken literally it produces the opposite of what you want: a dead
+dependency is re-probed on **every** pass, which is precisely the hammering that
+drained the proxy quota *after* it had already stopped working.
+
+The three cases have genuinely different costs, so lifetime is chosen from the
+outcome rather than the call site (`readiness.ts`):
+
+| outcome | TTL | why |
+|---|---|---|
+| `ok && !blocked` | 4 h | a good answer; cache long |
+| `ok && blocked` | 10 min | a *true* answer — recover fast when the proxy returns |
+| check failed | 1m → 15m backoff | rate-limit a dead dependency |
+
+Recovery stays immediate: the streak resets on the first success.
+
+`deposit_owner` was proposed as a permanent cache on the grounds that "contract
+ownership is immutable". That is not verified in
+`docs/research/polymarket-domain-facts.md`, and Ownable contracts have
+`transferOwnership` — the exact shape of the negRisk incident in CLAUDE.md. It is
+also a *direct RPC* call, so caching it saves no proxy bandwidth at all. Given a
+1 h TTL instead: no upside to the risk.
+
+---
+
+### 59. Readiness cannot say "the proxy is down"
+
+**OPEN.** `checkProxyHealth()` already exists (`proxyEnv.ts:191`), is bounded, and
+is cheap — but `checkReadiness` never consults it. So a dead egress proxy
+surfaces as `API key missing` plus `secret is empty`, which reads as an auth
+problem three layers away from the cause.
+
+Item 57 improves the message (`CLOB auth backoff (Ns left): …`), but the
+diagnosis is still indirect. A `proxy` check consulted first, short-circuiting
+the CLOB legs when it fails, would turn a 25 s hang and two misleading checks
+into one accurate check in ~2 s.
+
+This is the highest-value remaining item in the group. It is the difference
+between an outage that diagnoses itself and one that takes six rounds.
+
+---
+
+### 60. `checkReadiness` ran on the 250 ms trading hot loop ✅ FIXED
+
+`scan/index.ts:75` awaited `refreshTelemetry()` — the full eight-call
+`checkReadiness()` — on every tick of `setInterval(scan, POLY_SCAN_INTERVAL_MS)`
+where `POLY_SCAN_INTERVAL_MS = 250` (`config.ts:19`). Two of those calls egress
+through the metered CLOB proxy.
+
+Two costs, not one. The obvious one is bandwidth. The other is that every cycle
+blocked on remote I/O before doing any trading work, and `_scanning` serialises
+cycles — so a slow proxy throttled the scan rate itself. During the outage the
+loop likely fell from ~4/s to roughly one per 25–30 s.
+
+Fixed: the background `syncBalances` timer owns `botState.readiness`; the scan
+loop is a reader and writes nothing.
+
+*The test froze the bug.* `scanOrchestrator.test.ts` asserted
+`expect(refreshTelemetry).toHaveBeenCalled()` — a characterization test that made
+the defect a requirement. Inverted to `not.toHaveBeenCalled()`. This is the
+failure mode CLAUDE.md describes: a snapshot of current behaviour freezes the
+bugs too.
+
+---
+
+### 61. The always-on timer drank a 1 GB/month quota in nine days ✅ FIXED
+
+*Measured, not estimated.* Webshare dashboard, cycle 26 Aug – 25 Sep 2026:
+**105,125 requests / 1.01 GB**, exhausted ~3 Sep.
+
+`setInterval(syncBalances, 30000)` (`bot.ts:3637`) ran whether or not the bot
+traded, at 4 proxied requests per tick:
+
+```
+syncClobBalance()   → updateBalanceAllowance + getBalanceAllowance   = 2
+refreshTelemetry()  → checkGeoblock + getBalanceAllowance            = 2
+```
+
+2,880 ticks/day × 4 × ~10 KB ≈ **116 MB/day → 1 GB in ~8.8 days.** Cycle opened
+26 Aug 21:07; the dashboard shows bandwidth flatlining 1–3 Sep. The arithmetic
+matches the outage to the day.
+
+Note the *scan loop was not the dominant consumer* despite being the far larger
+ceiling — at 8 req/s it would have burned 1 GB in ~1.5 days, and only 105k
+requests were made in total. The boring always-on timer was the drain. Worth
+remembering when triaging by theoretical rate rather than measurement.
+
+Three of the four requests per tick were waste:
+
+- `getBalanceAllowance` was called **twice**: `syncClobBalance` ended with
+  `return getClobBalance()` (a value all seven call sites discarded), then
+  `checkReadiness` called `getClobBalance()` again.
+- `checkGeoblock` ran every 30 s. Your country does not change every 30 s.
+- `updateBalanceAllowance` ran every 30 s with no trading in flight.
+
+Fixed via items 58 and 60 plus the dedupe. Projected ~1,500 req/day (~35 days
+per GB) — **a projection from the timers, not a measurement.** The counter added
+in this work (`getProxyRequestStats`, exposed as `proxyUsage` on
+`/api/v1/data-health`) is what makes it checkable; `perHour` is the number to
+watch, and it should agree with the Webshare dashboard within a few percent.
+
+---
+
+### 62. Live arb had no affordability gate ✅ FIXED
+
+`arbEngine.ts:172` read `mode === 'paper' && ...`. Paper refused to size beyond
+its bankroll; **live had no equivalent anywhere.** Live sizing took
+`readiness.spendableBalance` (`:157`), computed a cost, and never checked the
+balance covered it — and `shareBudget` floors at `minPositionSize * 2` (`:159`),
+so even a zero balance produced an order.
+
+Survivable only while readiness was refetched every scan tick. Item 60 makes it
+load-bearing: a stale-high balance fills leg one and has leg two rejected for
+collateral, leaving an **unhedged directional position** — the one outcome an arb
+package exists to prevent. The risk is never an overdraft (Polymarket will not
+fill what you cannot fund); it is always a broken hedge.
+
+Fixed: one expression for both modes, live skips emitting
+`insufficient_live_cash` so the refusal is visible in telemetry.
+
+Paired with `applyBalanceDelta` (`readiness.ts`), which deducts a fill in memory
+*synchronously* — the TTL cache means a post-trade refresh returns the pre-trade
+number, so waiting for the network would leave the same window open.
+
+---
+
+### 63. A failed CLOB balance read never sets `clobError`
+
+**OPEN — behavioural, needs a decision.** In `checkReadiness`, the failure branch
+for `getClobBalance` pushes a `clob_balance` check but leaves `clobError` null.
+So `clobWorks = apiReady && !clobError` stays true, and `liveReady` can remain
+**true while the CLOB is unreachable**, provided on-chain pUSD is visible.
+
+It may well be deliberate — the check falls back to `depositPusd`, and there is a
+`needs` message about "website balance may still work". In practice a dead proxy
+also fails `ensureApiKey`, which does force `liveReady: false`, so the state is
+hard to reach. Left alone because changing it is a design call on the live gate,
+not a cleanup.
+
+---
+
+### 64. Directional live sizing has the same staleness gap, bounded
+
+**OPEN, low severity.** `bot.ts:2703` gates affordability on
+`cfg.mode === 'paper'` exactly as arb did (item 62), and `resolveOrderSize`
+takes `readiness` directly (`bot.ts:2678`).
+
+Materially safer than arb was, for three reasons: `engines/directional.ts:78`
+already returns `no_bankroll` when the balance is absent or zero, so cold start
+is covered; it is a single leg, so a rejection is just a rejected order with no
+hedge to break; and `maxUsd` caps exposure at `bankroll × maxPositionPct`
+(default 10%) of the *stale* number.
+
+Worth closing for symmetry with item 62, but it does not gate item 60.
+
+---
+
 ## Handoff — state as of 2026-08-20
 
 Written so a fresh session can continue without re-deriving any of the above.
