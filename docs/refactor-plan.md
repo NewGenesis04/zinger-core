@@ -2683,7 +2683,7 @@ Blocked on item 55: no deadline is defensible while the worst case is unbounded.
 
 ---
 
-### 55. `checkReadiness` has one outbound call with no timeout at all
+### 55. `checkReadiness` has one outbound call with no timeout at all ✅ FIXED
 
 `readiness.ts:41`, inside `fetchDepositPositions`:
 
@@ -2719,7 +2719,7 @@ halted bot.
 
 ---
 
-### 56. `publishPublicSignals` runs a 5 s operation on a 2 s interval
+### 56. `publishPublicSignals` runs a 5 s operation on a 2 s interval ✅ FIXED
 
 `bot.ts:3708`:
 
