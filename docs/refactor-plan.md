@@ -3060,6 +3060,134 @@ system of record — but it is what reduces the buffer's useful horizon to 47
 minutes, and it is worth asking whether a repeated skip on an unchanged quote
 needs its own event.
 
+### 66. The instant CTF merge has never executed — dead guard on the money path
+
+**OPEN, high severity.** Found 2026-09-08 chasing why arb redemption had to be done
+by hand in the Polymarket web app.
+
+`arbEngine.ts:337-374` implements exactly the right thing: on a locked package it
+calls `executeCtfMerge` (`ctf/merge.ts:46`), burning the matched UP+DOWN pair back
+to collateral on-chain. **Merge, not redeem** — a complete set converts to $1.00 of
+USDC immediately, with no oracle, no resolution wait and no claim step. That is
+strictly better than `redeemPositions` for arb and the implementation looks correct
+(CTF `0x4D97DC…6045`, partition `[1,2]`, 6-decimal amount).
+
+It has never run. The guard is:
+
+```js
+if (cfg?.instantCtfMerge !== false && mode === 'live'
+    && (botState?.walletClient || botState?.signer)) {
+```
+
+`botState.walletClient` and `botState.signer` are **read at `arbEngine.ts:338,345`
+and assigned nowhere in the tree.** `grep -rn "walletClient\|botState.signer" src/
+scripts/` returns hits only in `pons.ts`, `swap.ts` and `trade.ts`, each of which
+builds its own local client; none of them writes to `botState`. Both properties are
+permanently `undefined`, so the condition is always false.
+
+**It fails silently in two layers.** The guard has no `else`, so a skip is never
+logged. And if it ever did run, `if (mergeRes?.ok)` at `:349` also has no `else` —
+a reverted merge leaves `pkg.status` at `LOCKED`, emits nothing, and logs nothing.
+Nothing sweeps for `LOCKED` packages to retry (`grep` for `pkg.status` shows no
+retry path). Capital sits in unredeemed tokens until someone opens the web app.
+
+**The unresolved question gates the fix.** `walletClient.account` would sign as the
+EOA, but Polymarket trades settle through the deposit/proxy wallet
+(`getFunderAddress()`, `trade.ts:143`) which is a different address from
+`getWalletAddress()`. If the ERC-1155 outcome tokens are held by the proxy, a direct
+EOA `mergePositions` reverts on balance and wiring a viem wallet client fixes
+nothing — the call has to go through the relayer instead
+(`@polymarket/builder-relayer-client`, already a dependency at `package.json:25`).
+
+Check before building anything: `balanceOf(address, positionId)` on the CTF
+contract for both the signer and the deposit wallet, for a known held position.
+That single reading decides between a ten-line fix and a relayer integration.
+
+Note the directional path has no equivalent at all: merge needs a complete set, so
+a directional position that expires in the money requires `redeemPositions` after
+resolution, or a CLOB exit before expiry. Not currently biting because
+`forceArbOnly` is on.
+
+**Second defect in the same path: the collateral token is wrong.** `ctf/merge.ts:5`
+defaults to `DEFAULT_COLLATERAL_USDC = 0x2791Bca1…4174` (USDC.e). Polymarket's
+[CTF docs](https://docs.polymarket.com/trading/ctf/redeem) state the collateral is
+**pUSD** at `0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB` — "Splitting converts pUSD
+into a complete set of outcome tokens". Zinger already has that exact address in
+`config.ts:7` as `POLY.pUsd` and uses it throughout `swap.ts`.
+
+`arbEngine.ts:344` passes `collateralToken: market.collateralToken`, which would
+override the default — except `collateralToken` is **read there and assigned
+nowhere**; `grep -rn "collateralToken" src/` returns that one line plus `merge.ts`
+itself. So the call would fall back to USDC.e and compute the wrong collection id.
+
+That is three independent faults on one path, each sufficient to break it: the
+guard never passes, the collateral is never supplied, and the fallback collateral is
+the wrong token. Wiring only the wallet client would produce a revert, not a merge —
+worth knowing before anyone "fixes" this in one line.
+
+**Mitigation available today, no code:** Polymarket ships an Auto-Redeem toggle
+(Settings → Trading, one-time gasless approval) that redeems winnings after
+resolution. It is not a substitute for merge — it waits for the oracle where merge
+does not — but it returns arb capital without manual clicking, which downgrades this
+item from *capital gets stuck* to *capital returns slower than it could*.
+
+**Resolved 2026-09-08: use Auto-Redeem, leave merge unbuilt.** The case for merge is
+capital recycling — a $30 bankroll turning over many times an hour instead of once
+per window. That argument is only worth anything if **capital is the binding
+constraint, and it is not.** Live `arb.decision` events show `asksSum` at 1.01
+against a `requiredGap` of 0.0399, i.e. the pair must price at ≤ 0.96 before a
+trade fires, and observed decisions are `skip · gap_below_breakeven` by a wide
+margin. The bot is idle for want of opportunities, not for want of free cash.
+Faster recycling multiplies a number near zero.
+
+**Revisit only when this is measurably false:** if `arb.decision` events start
+showing `insufficient_live_cash` skips at a meaningful rate while gaps are clearing,
+capital has become the constraint and merge earns its cost. Until then this item
+stays open as a recorded defect, not as scheduled work.
+
+**Verified 2026-09-08:** On-chain `eth_call` and Polymarket Data API balance check
+confirmed: Signer EOA `0x2FA8…125d` holds **0 tokens**, while Deposit Safe `0x77AD…d8B0`
+holds 100% of ERC-1155 outcome tokens. Any future merge implementation must use the
+`@polymarket/builder-relayer-client` path.
+
+### 67. Capital Ledger: Decouple external deposits/withdrawals from trading PnL & remove `lifetimeBaseline` UI alarms
+
+**OPEN, UX / Accounting improvement.** Found 2026-09-08 after operator noticed the live
+dashboard card rendering a prominent warning note:
+`Baseline $275.16 is $10.13 BELOW lifetime $285.29 — a past drawdown was rebased over...`.
+
+**The Defect in `lifetimeBaseline`:**
+1. `lifetimeBaseline` (`liveAccount.ts:203`) records only the very first dollar balance seen
+   on the wallet (`$285.29`). Any subsequent deposit (e.g., adding $500) or withdrawal
+   corrupts the calculation, falsely attributing external cash flows to trading profit/loss.
+2. Surfacing forensic rebase notes in the primary operational dashboard card causes severe
+   alarm fatigue—an operator sees red/yellow text and assumes the ledger is broken when
+   `books clean` is true and trading is healthy.
+3. External capital flows (deposits/withdrawals) are currently conflated with strategy
+   alpha.
+
+**The Architecture: Dedicated Capital Ledger & 3-Layer Flow Detection:**
+
+1. **UI Cleanup:** Strip `lifetimeBaseline` warning strings from the live execution header.
+   The main dashboard card reports pure operational metrics: `Spendable Cash`,
+   `Session Realized PnL`, `Realized Trade PnL (closed trades sum)`, and `Open PnL`.
+   Forensic rebase provenance is relegated strictly to `/api/poly/audit`.
+2. **Three-Layer Flow Detection Mechanism:**
+   - **Mechanism 1 (On-Chain ERC-20 Logs):** Query Polygon bor RPC for `Transfer(to: Safe)`
+     and `Transfer(from: Safe)` for USDC (`0x3c49…`) and pUSD (`0xC011…`) (scaffolded in
+     `src/polymarket/deposits.ts:30-48`). Cryptographic proof of on-chain funding.
+   - **Mechanism 2 (Polymarket Activity API):** Query
+     `GET https://data-api.polymarket.com/activity?user=${depositWallet}&type=DEPOSIT,WITHDRAWAL`
+     to capture web UI card/moonpay/bridge transactions.
+   - **Mechanism 3 (Delta Reconciler Fail-Safe):** On every balance sync tick, compute
+     `Unexplained Delta = (Cash_now - Cash_prev) - sum(Trade Fills & Fees)`.
+     Any discrepancy > $5 with 0 trade fills automatically categorizes as `CAPITAL_DEPOSIT`
+     or `CAPITAL_WITHDRAWAL` in SQLite (`data/zinger.db`).
+3. **Account Size Time-Series (Equity Curve):**
+   Record periodic snapshots of `(timestamp, cash, openPositionsValue, equity, netDeposits, cumulativeTradePnl)`
+   allowing an institutional equity curve that separates account size growth from pure
+   time-weighted trading alpha.
+
 ---
 
 ## Handoff — state as of 2026-08-20
