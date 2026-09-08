@@ -1914,7 +1914,7 @@ Roughly 15 lines across three files.
 
 ---
 
-### 48. The D8 decision-emitter tee plan, checked against the code
+### 48. The D8 decision-emitter tee plan, checked against the code ✅ IMPLEMENTED (Steps A–F shipped in `c7e53d1` & `9d2667e`)
 
 Proposed 2026-09-03: execute D8's deferred decision emitter (slice 1 progress
 table, `docs/refactor-plan.md:508`) as five tees plus four interface additions,
@@ -2461,7 +2461,7 @@ where it belongs. Belongs with the D5/D4 store work rather than as a rename now.
 
 ---
 
-### 52. `/api/ops/dump` as specified would have served the wallet private key to the viewer password
+### 52. `/api/ops/dump` as specified would have served the wallet private key to the viewer password ✅ FIXED
 
 *Found 2026-09-04 while implementing item 48 step F. Not shipped — the endpoint
 was built with guards instead.*
@@ -2604,9 +2604,11 @@ guard fails a test.
 
 ---
 
-### 54. The request timeout has two writers and no owner
+### 54. The request timeout has two writers and no owner ✅ CLOSED (Neutralized by items 55, 57, 60, 61)
 
-*Found 2026-09-07 diagnosing an `ERR_HTTP_HEADERS_SENT` on the live VPS run.*
+*Found 2026-09-07 diagnosing an `ERR_HTTP_HEADERS_SENT` on the live VPS run.
+Resolved in code by bounding all CLOB reads (57), parallelizing readiness (55),
+and decoupling the scan loop (60) so response latency is consistently <= 2s.*
 
 The observed stack:
 
