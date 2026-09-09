@@ -1180,9 +1180,10 @@ function PolyShell({
   const portfolio = poly.portfolio || {}
   const markets = poly.markets || []
   const liveMarkets = markets.filter((m) => m.isCurrent !== false && m.prices?.up)
-  const openPositions = poly.positions || []
+  const openPositions = (poly.positions || []).filter(
+    (p) => !(p.redeemable && Number(p.currentValue ?? 0) < 0.01),
+  )
   const botPositions = poly.botPositions || []
-  const pending = poly.pendingTrades || []
   const openBot = botPositions.filter((p) => !p.closed)
   const remMs = poly.cycle?.remainingMs ?? poly.windows?.current?.remainingMs ?? 0
   const remSecNav = Math.max(0, Math.ceil(remMs / 1000))
@@ -2090,7 +2091,7 @@ function PolyShell({
                               size {kind === 'wallet' ? p.size : (p.shares || 0).toFixed(2)} ·{' '}
                               {money(kind === 'wallet' ? p.currentValue : p.markValue)}
                             </span>
-                            {kind === 'wallet' && p.asset && Number(p.size) > 0 && (
+                            {kind === 'wallet' && p.asset && Number(p.size) > 0 && !p.redeemable && (
                               <Button size="sm" className="h-8" variant="destructive"
                                 onClick={() => act('/api/poly/sell-pm', { assetId: p.asset, size: p.size }, 'Sold')}>
                                 Dump
@@ -2164,7 +2165,7 @@ function PolyShell({
                                   {money(p.cashPnl)}
                                 </TableCell>
                                 <TableCell>
-                                  {p.asset && Number(p.size) > 0 && (
+                                  {p.asset && Number(p.size) > 0 && !p.redeemable && (
                                     <Button size="xs" variant="destructive"
                                       onClick={() => act('/api/poly/sell-pm', { assetId: p.asset, size: p.size }, 'Sold')}>
                                       Dump

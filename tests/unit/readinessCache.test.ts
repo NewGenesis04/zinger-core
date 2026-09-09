@@ -250,3 +250,49 @@ describe('INVARIANT: a fill is deducted synchronously, before the next sizing re
     expect(clobBalanceSpy).toHaveBeenCalledTimes(1);
   });
 });
+
+/**
+ * INVARIANT: the wallet scan is ground truth, not a display feed.
+ *
+ * Item 68. `readiness.positions` answers "does the wallet actually hold this".
+ * Two live exit paths gate on it (`bot.ts:2464`, `:2865`) through
+ * `pmSharesForPosition`, and an ABSENT row means "you never held it" —
+ * `reconcileLiveGhostPosition` then closes the position at ENTRY price with
+ * `unrealizedPnl = 0`.
+ *
+ * A resolved losing token is PRESENT with size > 0 and value $0. Filtering it
+ * out of this array makes a real loss indistinguishable from a phantom, and the
+ * bot writes the wrong PnL with no error. A display filter belongs in the
+ * display layer; this asserts the source stays whole.
+ */
+describe('INVARIANT: checkReadiness does not filter the wallet scan (item 68)', () => {
+  const resolvedLoser = {
+    asset: 'token-dead', size: 26.33, currentValue: 0,
+    redeemable: true, cashPnl: -12.38, title: 'Bitcoin Up or Down — Aug 27',
+  };
+  const liveWinner = {
+    asset: 'token-live', size: 10, currentValue: 5.2,
+    redeemable: false, cashPnl: 0.2, title: 'Bitcoin Up or Down — today',
+  };
+
+  it('returns a resolved zero-value position rather than dropping it', async () => {
+    fetchSpy.mockResolvedValue({ ok: true, json: async () => [resolvedLoser, liveWinner] });
+
+    const readiness = await checkReadiness({});
+
+    // Both must survive. The dead one is what tells the exit path "you DID hold
+    // this, it is now worth nothing" — as opposed to "this was never real".
+    expect(readiness.positions.map((p) => p.asset)).toEqual(['token-dead', 'token-live']);
+  });
+
+  it('still reports only unresolved positions in the readiness summary', async () => {
+    fetchSpy.mockResolvedValue({ ok: true, json: async () => [resolvedLoser, liveWinner] });
+
+    const readiness = await checkReadiness({});
+
+    // The cosmetic fix this replaces: the operator-facing line counts what is
+    // actually open, without the array behind it being edited.
+    const open = readiness.checks.find((c) => c.id === 'open_positions');
+    expect(open?.detail).toMatch(/^1 open position/);
+  });
+});

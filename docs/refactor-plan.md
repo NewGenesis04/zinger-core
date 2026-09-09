@@ -3188,6 +3188,67 @@ dashboard card rendering a prominent warning note:
    allowing an institutional equity curve that separates account size growth from pure
    time-weighted trading alpha.
 
+### 68. Near-miss: filtering the wallet scan would have booked real losses as phantoms ✅ CAUGHT BEFORE MERGE
+
+**2026-09-09.** Two resolved 27-August tokens (worth $0.00) were showing in the
+positions table with a stale −$15.24, and a `Dump` button that could not work —
+`/api/poly/sell-pm` sells on the CLOB and those books are gone. The display fix was
+correct. A second change, made at the same time, was not.
+
+**What was proposed:** filter `readiness.positions` inside `checkReadiness`, on
+`redeemable && currentValue < 0.01`, so the readiness summary would read
+`0 open position(s)` instead of counting the dead tokens.
+
+**Why that is wrong.** `readiness.positions` is not a display feed — it is the bot's
+ground truth for *does the wallet actually hold this*. Two live exit paths gate on it
+through `pmSharesForPosition` (`bot.ts:1350`, which reads `row.size`):
+
+```
+bot.ts:2464   early-SL   pmShares = pmSharesForPosition(pos, readiness.positions)
+bot.ts:2865   exit path  if (!(pmShares > 0)) → reconcileLiveGhostPosition(...)
+```
+
+An **absent** row means "you never held it", and `reconcileLiveGhostPosition`
+(`bot.ts:1355-1367`) acts on that reading:
+
+```js
+position.closed     = true;
+position.exitReason = 'sync_stale';
+position.exitPrice  = Number(position.currentPrice || position.entryPrice || 0);
+position.unrealizedPnl = 0;
+```
+
+A resolved *losing* token is **present** with `size > 0` and `currentValue = 0`.
+Filtering it out makes it look absent, so a real loss closes at **entry price with
+zero PnL** — silently. The two states the reconciler exists to tell apart:
+
+| wallet row | meaning | correct action |
+|---|---|---|
+| present, value $0 | held it, it lost | book the loss at $0.00 |
+| absent | never held it | phantom, clear the row |
+
+The filter collapses them. It also trades a loud failure for a quiet one: before it,
+a resolved token made the bot attempt a sell that failed visibly; after it, the bot
+writes a wrong number and logs nothing.
+
+**Severity if it had shipped:** latent, not active. `forceArbOnly` mutes directional,
+and arb legs are hold-to-settle with no stop (`bot.ts:519-521`), so neither trigger
+site fires often today. It arms the moment directional is re-enabled.
+
+**Resolution.** Ground truth left whole; the summary line filters a local copy
+(`readiness.ts:285-303`). Two invariants added in `tests/unit/readinessCache.test.ts`
+— a resolved zero-value position survives into `readiness.positions`, and the
+operator-facing line still counts only unresolved ones. Mutation-checked:
+reintroducing the filter fails the first with `expected [ 'token-live' ] to deeply
+equal [ 'token-dead', 'token-live' ]` while the second still passes, which is what
+proves the two concerns are actually separated.
+
+**Why this is recorded rather than just fixed.** It is the CLAUDE.md opening rule
+almost exactly — fluent, plausible, reviewed, `tsc` clean, 457/457 green, and wrong
+in the reconciliation layer. The tests passed because nothing covered the property.
+The display half of the same change was correct and was kept; the lesson is the
+boundary, not the author.
+
 ---
 
 ## Handoff — state as of 2026-08-20

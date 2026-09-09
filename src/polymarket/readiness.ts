@@ -282,13 +282,25 @@ export async function checkReadiness(config = {}) {
       checks.push({ id: 'deposit_pusd', ok: false, detail: `Deposit pUSD check failed: ${pusd.error.message}` });
     }
 
-    positions = await positionsP;
-    if (positions.length) {
-      const openPnl = positions.reduce((sum, p) => sum + Number(p.cashPnl || 0), 0);
+    // `positions` is ground truth for "does the wallet actually hold this", not a
+    // display feed. Two exit paths gate on it (`bot.ts:2464`, `:2865`) via
+    // `pmSharesForPosition`, and a row that is absent means "you never held it" —
+    // which `reconcileLiveGhostPosition` books at ENTRY price with zero PnL.
+    //
+    // A resolved losing token is present with size > 0 and value $0. Filtering it
+    // out here would make a real loss indistinguishable from a phantom and write
+    // the wrong PnL, silently. Item 68. Filter for the summary line only.
+    const rawPositions = await positionsP;
+    positions = Array.isArray(rawPositions) ? rawPositions : [];
+    const unresolved = positions.filter(
+      (p) => !(p.redeemable && Number(p.currentValue ?? 0) < 0.01),
+    );
+    if (unresolved.length) {
+      const openPnl = unresolved.reduce((sum, p) => sum + Number(p.cashPnl || 0), 0);
       checks.push({
         id: 'open_positions',
         ok: true,
-        detail: `${positions.length} open position(s) · unrealized PnL ${openPnl >= 0 ? '+' : ''}$${openPnl.toFixed(2)}`,
+        detail: `${unresolved.length} open position(s) · unrealized PnL ${openPnl >= 0 ? '+' : ''}$${openPnl.toFixed(2)}`,
       });
     }
   }
