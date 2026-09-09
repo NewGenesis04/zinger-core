@@ -3249,6 +3249,75 @@ in the reconciliation layer. The tests passed because nothing covered the proper
 The display half of the same change was correct and was kept; the lesson is the
 boundary, not the author.
 
+### 69. A deleted variable blanked the whole dashboard — and nothing could have caught it ✅ FIXED
+
+**2026-09-09.** The terminal rendered a black page after login. The bot process was
+healthy throughout: `/api/auth/login` returned `operator`, `/api/poly/state?lean=1`
+returned 112 KB of well-formed JSON, and every field the dashboard calls an array
+method on was the right type.
+
+**Cause.** Commit `555ca01` (the item 68 display filter) replaced the
+`openPositions` line and deleted the line below it as collateral:
+
+```diff
+-  const openPositions = poly.positions || []
++  const openPositions = (poly.positions || []).filter(
++    (p) => !(p.redeemable && Number(p.currentValue ?? 0) < 0.01),
++  )
+   const botPositions = poly.botPositions || []
+-  const pending = poly.pendingTrades || []        ← collateral deletion
+   const openBot = botPositions.filter((p) => !p.closed)
+```
+
+`pending` is still read at `PolyDashboard.tsx:1198, 1288, 1368, 1370, 1454`. First
+render hit `pending.length` → `ReferenceError: pending is not defined`. Fixed by
+restoring the declaration.
+
+**This is item 49 a second time** — "a deleted variable shipped to live and crashed
+every live-mode portfolio read". Same shape: a binding removed while editing an
+adjacent line, invisible to the toolchain, found only by loading the page.
+
+#### Why four layers all missed it
+
+| layer | why |
+|---|---|
+| `tsc --noEmit` | `tsconfig.json:35` **excludes `frontend`** — the root typecheck never reads this file |
+| the file itself | `// @ts-nocheck` on line 1 |
+| `vite build` | bundlers do no undefined-variable analysis; a bare identifier is legal JS |
+| `oxlint` | the script existed (`frontend/package.json:10`) but ran in no pipeline, and `no-undef` was not enabled |
+
+The frontend had **no static check whatsoever** on the file being edited. Human
+review missed it too, twice: the diff was read for what it *added* and not for what
+it *removed*, two lines away.
+
+#### Why the failure was silent
+
+`main.tsx` rendered `PolyDashboard` bare. React unmounts the tree on an uncaught
+render error, `#root` empties, and `index.html`'s inline `background: #000000`
+paints the result black — indistinguishable from "still loading" or "logged out".
+Diagnosis took a full session of eliminating the server, the assets, the cache and
+the auth layer before the error was even visible.
+
+#### Resolution
+
+1. **`frontend/src/ErrorBoundary.tsx`** (new), wired in `main.tsx`. Renders the
+   error and component stack on screen with a reload button, and states that the
+   bot process is unaffected. It located this bug in minutes once installed.
+2. **`no-undef` enabled** in `frontend/.oxlintrc.json`, with `env.browser` /
+   `env.es2024` so `window` and friends are not false positives.
+3. **`lint:frontend` added to `ci`** — `npm run typecheck && npm run lint:frontend
+   && npm test && npm run test:perf`.
+
+Verified by mutation, not assumption: with the declaration restored, lint exits 0
+with zero `no-undef`; with it deleted again, lint exits 1 and names
+`'pending' is not defined` at `PolyDashboard.tsx:1198`. 459/459 tests, `tsc` clean.
+
+**Open follow-up.** `@ts-nocheck` at the top of `PolyDashboard.tsx` still disables
+type checking on a 2,900-line file, and `typecheck:frontend` exists but is not in
+`ci` either. Removing the pragma is a large mechanical job and is not this item;
+adding `typecheck:frontend` to the pipeline first would at least cover the files
+that are already clean.
+
 ---
 
 ## Handoff — state as of 2026-08-20

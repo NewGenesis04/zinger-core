@@ -15,8 +15,9 @@
     "check-settlement": "tsx scripts/check-settlement.ts",
     "build:frontend": "npm --prefix frontend run build",
     "typecheck:frontend": "npm --prefix frontend run typecheck",
+    "lint:frontend": "npm --prefix frontend run lint",
     "dry-run": "tsx scripts/dry-run.ts",
-    "ci": "npm run typecheck && npm test && npm run test:perf"
+    "ci": "npm run typecheck && npm run lint:frontend && npm test && npm run test:perf"
   },
   "engines": {
     "node": ">=20"

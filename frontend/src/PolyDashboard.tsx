@@ -1184,6 +1184,7 @@ function PolyShell({
     (p) => !(p.redeemable && Number(p.currentValue ?? 0) < 0.01),
   )
   const botPositions = poly.botPositions || []
+  const pending = poly.pendingTrades || []
   const openBot = botPositions.filter((p) => !p.closed)
   const remMs = poly.cycle?.remainingMs ?? poly.windows?.current?.remainingMs ?? 0
   const remSecNav = Math.max(0, Math.ceil(remMs / 1000))
