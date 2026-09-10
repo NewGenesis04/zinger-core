@@ -37,7 +37,7 @@ const market = {
 };
 
 /** A gap wide enough to clear break-even, so only affordability can refuse it. */
-const depth = { up: { bestAsk: 0.33 }, down: { bestAsk: 0.487 } };
+const depth = { up: { bestAsk: 0.33, bestAskSize: 5000 }, down: { bestAsk: 0.487, bestAskSize: 5000 } };
 
 const baseCfg = {
   clobArbEnabled: true,

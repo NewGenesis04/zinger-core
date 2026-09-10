@@ -58,7 +58,7 @@ const cfg = (over = {}) => ({
 const runArb = (over = {}) =>
   detectAndExecuteArbPackage({
     market: market(),
-    depth: { up: { bestAsk: 0.34 }, down: { bestAsk: 0.62 } },
+    depth: { up: { bestAsk: 0.34, bestAskSize: 5000 }, down: { bestAsk: 0.62, bestAskSize: 5000 } },
     prices: { up: 0.34, down: 0.62 },
     cfg: cfg(),
     mode: 'paper',
@@ -111,7 +111,7 @@ describe('INVARIANT: a full set redeems to exactly $1.00', () => {
     ]) {
       saveAllPackages([]);
       const pkg = await runArb({
-        depth: { up: { bestAsk: up }, down: { bestAsk: down } },
+        depth: { up: { bestAsk: up, bestAskSize: 5000 }, down: { bestAsk: down, bestAskSize: 5000 } },
         prices: { up, down },
       });
       expect(pkg, `no package at ${up}/${down}`).toBeTruthy();
@@ -130,7 +130,7 @@ describe('INVARIANT: a full set redeems to exactly $1.00', () => {
   it('never opens a package when the book offers no gap', async () => {
     // asks summing to >= $1.00 cannot redeem for more than they cost
     const pkg = await runArb({
-      depth: { up: { bestAsk: 0.52 }, down: { bestAsk: 0.49 } },
+      depth: { up: { bestAsk: 0.52, bestAskSize: 5000 }, down: { bestAsk: 0.49, bestAskSize: 5000 } },
       prices: { up: 0.52, down: 0.49 },
     });
     expect(pkg).toBeNull();
@@ -193,7 +193,7 @@ describe('INVARIANT: arb legs are paired or unwound — never left naked', () =>
 
     const pkg = await detectAndExecuteArbPackage({
       market: market(),
-      depth: { up: { bestAsk: 0.34 }, down: { bestAsk: 0.62 } },
+      depth: { up: { bestAsk: 0.34, bestAskSize: 5000 }, down: { bestAsk: 0.62, bestAskSize: 5000 } },
       prices: { up: 0.34, down: 0.62 },
       cfg: cfg(),
       mode: 'paper',
@@ -600,7 +600,7 @@ describe('INVARIANT: a refused arb leg is never recorded as filled', () => {
     const h = harness(accept);
     const pkg = await detectAndExecuteArbPackage({
       market: market(),
-      depth: { up: { bestAsk: 0.34 }, down: { bestAsk: 0.62 } },
+      depth: { up: { bestAsk: 0.34, bestAskSize: 5000 }, down: { bestAsk: 0.62, bestAskSize: 5000 } },
       prices: { up: 0.34, down: 0.62 },
       cfg: cfg({ simulateClobFees: true, feeCategory: 'crypto' }),
       mode: 'paper',
@@ -749,7 +749,7 @@ describe('INVARIANT: an accepted arb package is profitable after fees', () => {
     const down = 0.492;
     expect(1 - up - down).toBeGreaterThan(0.015);            // the old gate let it through
     expect(1 - up - down).toBeLessThan(arbBreakEvenGap(up, down, 'crypto'));
-    const pkg = await runArb({ depth: { up: { bestAsk: up }, down: { bestAsk: down } }, prices: { up, down } });
+    const pkg = await runArb({ depth: { up: { bestAsk: up, bestAskSize: 5000 }, down: { bestAsk: down, bestAskSize: 5000 } }, prices: { up, down } });
     expect(pkg).toBeNull();
   });
 
@@ -763,7 +763,7 @@ describe('INVARIANT: an accepted arb package is profitable after fees', () => {
     expect(gap).toBeLessThan(0.035);                          // a flat 3.5% refuses this
     expect(gap).toBeGreaterThan(arbBreakEvenGap(up, down, 'crypto'));
     const pkg = await runArb({
-      depth: { up: { bestAsk: up }, down: { bestAsk: down } },
+      depth: { up: { bestAsk: up, bestAskSize: 5000 }, down: { bestAsk: down, bestAskSize: 5000 } },
       prices: { up, down },
       cfg: cfg({ minArbGap: 0.005, arbMinMarginPct: 0 }),
     });
@@ -795,7 +795,7 @@ describe('INVARIANT: an accepted arb package is profitable after fees', () => {
           for (const mode of ['paper', 'live']) {
             saveAllPackages([]); // capacity is per-mode and persists across runs
             const pkg = await runArb({
-              depth: { up: { bestAsk: up }, down: { bestAsk: down } },
+              depth: { up: { bestAsk: up, bestAskSize: 5000 }, down: { bestAsk: down, bestAskSize: 5000 } },
               prices: { up, down },
               cfg: cfg({ minArbGap, arbMinMarginPct, mode }),
               mode,
@@ -821,7 +821,7 @@ describe('INVARIANT: an accepted arb package is profitable after fees', () => {
 
     saveAllPackages([]);
     const refused = await runArb({
-      depth: { up: { bestAsk: up }, down: { bestAsk: down } },
+      depth: { up: { bestAsk: up, bestAskSize: 5000 }, down: { bestAsk: down, bestAskSize: 5000 } },
       prices: { up, down },
       cfg: cfg({ minArbGap: 0.03, arbMinMarginPct: 0 }),
     });
@@ -829,7 +829,7 @@ describe('INVARIANT: an accepted arb package is profitable after fees', () => {
 
     saveAllPackages([]);
     const taken = await runArb({
-      depth: { up: { bestAsk: up }, down: { bestAsk: down } },
+      depth: { up: { bestAsk: up, bestAskSize: 5000 }, down: { bestAsk: down, bestAskSize: 5000 } },
       prices: { up, down },
       cfg: cfg({ minArbGap: 0.005, arbMinMarginPct: 0 }),
     });
@@ -839,7 +839,7 @@ describe('INVARIANT: an accepted arb package is profitable after fees', () => {
   it('reports locked profit net of fees, not gross', async () => {
     const up = 0.34;
     const down = 0.62;
-    const pkg = await runArb({ depth: { up: { bestAsk: up }, down: { bestAsk: down } }, prices: { up, down } });
+    const pkg = await runArb({ depth: { up: { bestAsk: up, bestAskSize: 5000 }, down: { bestAsk: down, bestAskSize: 5000 } }, prices: { up, down } });
     const fees = takerFeeUsdc(pkg.shares, up, 'crypto') + takerFeeUsdc(pkg.shares, down, 'crypto');
     // lockedProfitUsd is what the UI and session stats report, and what
     // getArbPackageMetrics falls back to for packages whose trades are gone
@@ -854,7 +854,7 @@ describe('INVARIANT: an accepted arb package is profitable after fees', () => {
     for (const [up, down] of [[0.34, 0.62], [0.10, 0.85], [0.45, 0.48], [0.71, 0.24], [0.83, 0.15]]) {
       saveAllPackages([]);
       const pkg = await runArb({
-        depth: { up: { bestAsk: up }, down: { bestAsk: down } },
+        depth: { up: { bestAsk: up, bestAskSize: 5000 }, down: { bestAsk: down, bestAskSize: 5000 } },
         prices: { up, down },
         cfg: cfg({ minArbGap: 0.005 }),
       });

@@ -51,8 +51,27 @@ export async function detectAndExecuteArbPackage({
   // Never execute arb packages on markets where both legs could lose.
   if (!isComplementaryBinary(market)) return null;
 
-  const upAsk = Number(depth?.up?.bestAsk || prices?.up || 0);
-  const downAsk = Number(depth?.down?.bestAsk || prices?.down || 0);
+  /*
+   * These two numbers become the `maxPrice` of a live fill-or-kill order
+   * (`bot.ts:1011`), so they must be ASKS. This read used to be
+   * `depth?.up?.bestAsk || prices?.up`, and `prices.up` is a MID
+   * (`clob.ts:118` assigns it `wsMid`) — so whenever the book maintainer had no
+   * ask, a midpoint was silently substituted into a variable named `upAsk`.
+   *
+   * That is not a rounding error. With the fallback on one leg,
+   *   computed_sum = mid_up + ask_down = true_sum − spread_up/2
+   * so the "gap" the detector sees is half the spread of the leg that fell
+   * back. The wider the spread, the bigger the phantom edge — the gate
+   * therefore *selected for* the most broken books it could find. On the
+   * 2026-09-09 live run every arb leg was rejected while REST showed 1,386
+   * shares resting: the bot was bidding a midpoint at which nothing rested.
+   *
+   * `clob.ts:120` already publishes the real ask as `prices.upAsk` and nothing
+   * read it. Use that, and when there is no ask from either source, refuse:
+   * no ask → no trade. An arb leg cannot be priced off anything but an ask.
+   */
+  const upAsk = Number(depth?.up?.bestAsk || prices?.upAsk || 0);
+  const downAsk = Number(depth?.down?.bestAsk || prices?.downAsk || 0);
   if (!(upAsk > 0.01 && downAsk > 0.01 && upAsk < 0.99 && downAsk < 0.99)) return null;
 
   const sum = upAsk + downAsk;
@@ -164,7 +183,61 @@ export async function detectAndExecuteArbPackage({
     ),
   );
 
-  const shares = Math.max(0.5, Math.round((shareBudget / sum) * 1000) / 1000);
+  /*
+   * ── Unified share gate (item 73) ────────────────────────────────────────
+   *
+   * Three constraints act on one number, and they pull against each other.
+   * They are resolved together on purpose: applying them as independent
+   * patches is how an arb package turns into a naked directional bet.
+   *
+   *   floor    shares ≥ MIN_LEG_NOTIONAL / min(upAsk, downAsk)   pushes UP
+   *   depth    shares ≤ min(upAskSize, downAskSize)              pushes DOWN
+   *   budget   shares ≤ shareBudget / sum                        pushes DOWN
+   *
+   * The floor exists because the exchange rejects a marketable BUY under
+   * $1.00 notional — settled 2026-09-10 by live rejection, see
+   * research/polymarket-domain-facts.md. Share parity means the *cheap* leg
+   * sets it for the whole package: a $0.04 leg needs 25 shares, so the package
+   * costs ~$24.50 however small the expensive side would rather be.
+   *
+   * The depth ceiling exists because `maxPrice` is signed at exactly the best
+   * ask (`bot.ts:1011`); every deeper level is priced above it and therefore
+   * unreachable, so only top-of-book size can fill. This is why the ladder is
+   * not consulted.
+   *
+   * Why together: capping to depth *alone* can drag the cheap leg back under
+   * $1.00, which fills leg one and gets leg two rejected — the unhedged
+   * position that cost −$12.83 on 2026-08-28 and that this whole package
+   * design exists to prevent. When floor > either ceiling there is no valid
+   * size and the only correct action is to skip.
+   */
+  const MIN_LEG_NOTIONAL_USD = 1.0;
+
+  const budgetShares = shareBudget / sum;
+  const floorShares = MIN_LEG_NOTIONAL_USD / Math.min(upAsk, downAsk);
+
+  // `bestAskSize` is published by both branches of `getDepthForMarket`
+  // (`clob.ts`). Absent means "no depth information", not "infinite depth" —
+  // sizing blind against a fill-or-kill order is what produced nine consecutive
+  // rejections on 2026-09-09 — but the *refusal* is deferred until after the
+  // affordability gate below. An account that cannot fund the trade is refused
+  // for that reason whatever the book looks like; money first, microstructure
+  // second. `Infinity` here only lets sizing proceed to the point where those
+  // gates can speak.
+  const upAskSize = Number(depth?.up?.bestAskSize ?? NaN);
+  const downAskSize = Number(depth?.down?.bestAskSize ?? NaN);
+  const depthKnown = Number.isFinite(upAskSize) && Number.isFinite(downAskSize);
+  const depthShares = depthKnown ? Math.min(upAskSize, downAskSize) : Infinity;
+
+  // Round DOWN to the 3-decimal share grid so rounding can never re-breach a
+  // ceiling, then lift to the floor. Rounding *to nearest* at the floor can
+  // shave a hair off, which on a cheap leg is the difference between $1.00 and
+  // $0.999 — and the exchange rejects the latter. Lifting above a ceiling here
+  // is intentional: the gates below then refuse it by name rather than the
+  // package silently coming out the wrong size.
+  let shares = Math.floor(Math.min(budgetShares, depthShares) * 1000) / 1000;
+  if (shares < floorShares) shares = Math.ceil(floorShares * 1000) / 1000;
+
   const costUp = Math.round(shares * upAsk * 100) / 100;
   const costDown = Math.round(shares * downAsk * 100) / 100;
   const totalCost = Math.round((costUp + costDown) * 100) / 100;
@@ -187,6 +260,57 @@ export async function detectAndExecuteArbPackage({
     arbDecision('skip',
       mode === 'paper' ? 'insufficient_paper_cash' : 'insufficient_live_cash',
       { totalCost, available: arbBank, mode },
+      { breakEvenGap, requiredGap, sizing: { shares, costUp, costDown, capitalUsd: totalCost } });
+    return null;
+  }
+
+  /*
+   * ── Microstructure gates (item 73) ───────────────────────────────────────
+   *
+   * The account can fund this. Whether the *market* can fill it is a separate
+   * question, and these are the three ways it cannot. Each carries its own
+   * skip code so the dashboard can tell "book too thin" from "budget too
+   * small" from "we are flying blind" — during the 2026-09-09 run all three
+   * were indistinguishable from a generic rejection.
+   */
+  if (!depthKnown) {
+    arbDecision('skip', 'depth_unknown',
+      { upAskSize: depth?.up?.bestAskSize ?? null, downAskSize: depth?.down?.bestAskSize ?? null },
+      { breakEvenGap, requiredGap, sizing: { shares, costUp, costDown, capitalUsd: totalCost } });
+    return null;
+  }
+  if (shares > depthShares) {
+    // Only top-of-book is reachable: `maxPrice` is signed at exactly the best
+    // ask, so every deeper level is priced out of range. Taking less than the
+    // floor is not an option — it would put the cheap leg under $1.00 and get
+    // it rejected *after* the first leg filled.
+    arbDecision('skip', 'depth_below_min_size',
+      { shares, depthShares, upAskSize, downAskSize, floorShares, cheapAsk: Math.min(upAsk, downAsk) },
+      { breakEvenGap, requiredGap, sizing: { shares, costUp, costDown, capitalUsd: totalCost } });
+    return null;
+  }
+  if (shares > budgetShares) {
+    // The configured budget cannot reach $1.00 on the cheap leg. Skewed books
+    // are the expensive ones: at a $0.04 leg the floor is 25 shares, so the
+    // package costs ~$24.50 no matter how small `arbMaxUsd` is set.
+    arbDecision('skip', 'budget_below_min_notional',
+      {
+        shares,
+        budgetShares,
+        floorShares,
+        shareBudget,
+        cheapAsk: Math.min(upAsk, downAsk),
+        minPackageUsd: Math.round(floorShares * sum * 100) / 100,
+      },
+      { breakEvenGap, requiredGap, sizing: { shares, costUp, costDown, capitalUsd: totalCost } });
+    return null;
+  }
+  if (costUp < MIN_LEG_NOTIONAL_USD || costDown < MIN_LEG_NOTIONAL_USD) {
+    // Belt and braces against the share-grid rounding above. The rejection this
+    // gate exists to prevent is stated by the exchange in dollars, so the last
+    // word on it is in dollars.
+    arbDecision('skip', 'leg_below_min_notional',
+      { shares, costUp, costDown, min: MIN_LEG_NOTIONAL_USD },
       { breakEvenGap, requiredGap, sizing: { shares, costUp, costDown, capitalUsd: totalCost } });
     return null;
   }
@@ -379,17 +503,36 @@ export async function detectAndExecuteArbPackage({
     // Emergency Rollback Handler if one leg failed
     pkg.status = 'ABORTED';
     pkg.unwoundAt = Date.now();
-    pkg.abortReason = `Leg execution mismatch: UP=${upShares > 0 ? 'OK' : 'FAIL'}, DOWN=${downShares > 0 ? 'OK' : 'FAIL'}`;
+    /*
+     * UP executes first and DOWN only runs `if (upShares > 0)`, so a failed UP
+     * leaves DOWN *never attempted* rather than rejected. The status string
+     * says so, instead of reporting both as FAIL — during the 2026-09-09 run
+     * every abort read "UP=FAIL, DOWN=FAIL" when DOWN was never sent, which
+     * makes a one-sided rejection indistinguishable from a two-sided one.
+     */
+    const upState = upShares > 0 ? 'OK' : 'FAIL';
+    const downState = upShares > 0 ? (downShares > 0 ? 'OK' : 'FAIL') : 'NOT_ATTEMPTED';
+    pkg.abortReason = `Leg execution mismatch: UP=${upState}, DOWN=${downState}`;
 
+    let unwound = false;
     if (upShares > 0 && downShares <= 0) {
       await unwindLeg({ outcome: 'up', pkg, market, mode, cfg, botState, log, adjustPaperCash, saveTrade });
+      unwound = true;
     } else if (downShares > 0 && upShares <= 0) {
       await unwindLeg({ outcome: 'down', pkg, market, mode, cfg, botState, log, adjustPaperCash, saveTrade });
+      unwound = true;
     }
 
     savePackage(pkg);
     if (log) {
-      log(`⚠️ ABORTED ARB PACKAGE ${market.symbol} (${pkg.abortReason}) — emergency unwound filled leg`, 'sl', { packageId, slug: market.slug });
+      // Item 73(b). This suffix was unconditional, so an abort with nothing
+      // filled still claimed an emergency unwind had run — the loudest line in
+      // the feed describing an event that did not happen. Neither leg filled is
+      // the *safe* outcome; say that.
+      const suffix = unwound
+        ? '— emergency unwound filled leg'
+        : '— no leg filled, nothing to unwind';
+      log(`⚠️ ABORTED ARB PACKAGE ${market.symbol} (${pkg.abortReason}) ${suffix}`, 'sl', { packageId, slug: market.slug, unwound });
     }
     return pkg;
   } catch (err) {

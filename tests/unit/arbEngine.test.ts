@@ -18,8 +18,8 @@ describe('Atomic Arb Engine', () => {
     };
 
     const depth = {
-      up: { bestAsk: 0.34 },
-      down: { bestAsk: 0.62 },
+      up: { bestAsk: 0.34, bestAskSize: 5000 },
+      down: { bestAsk: 0.62, bestAskSize: 5000 },
     };
 
     const cfg = {
@@ -70,7 +70,7 @@ describe('Atomic Arb Engine', () => {
 
   it('rejects arbitrage execution when ask sum exceeds 1 - minArbGap', async () => {
     const market = { symbol: 'BTC', slug: 'btc-5m-test', conditionId: '0xbtc5m', outcomes: ['Up', 'Down'], tokenIds: { up: 'u', down: 'd' } };
-    const depth = { up: { bestAsk: 0.51 }, down: { bestAsk: 0.50 } }; // sum = 1.01 (no gap)
+    const depth = { up: { bestAsk: 0.51, bestAskSize: 5000 }, down: { bestAsk: 0.50, bestAskSize: 5000 } }; // sum = 1.01 (no gap)
 
     const cfg = { clobArbEnabled: true, minArbGap: 0.015, maxArbPackages: 4, paperBankroll: 100 };
 
@@ -103,7 +103,7 @@ describe('Atomic Arb Engine', () => {
       tokenIds: { up: 'token-up-1', down: 'token-down-1' },
       negRisk: false,
     };
-    const depth = { up: { bestAsk: 0.34 }, down: { bestAsk: 0.62 } };
+    const depth = { up: { bestAsk: 0.34, bestAskSize: 5000 }, down: { bestAsk: 0.62, bestAskSize: 5000 } };
     const cfg = { clobArbEnabled: true, minArbGap: 0.015, maxArbPackages: 4, paperBankroll: 100, mode: 'paper' };
 
     const pkg = await detectAndExecuteArbPackage({
@@ -122,7 +122,7 @@ describe('Atomic Arb Engine', () => {
     ['both legs sharing one token', { conditionId: '0xabc', outcomes: ['Up', 'Down'], tokenIds: { up: 'u', down: 'u' } }],
   ])('rejects arb execution on a market with %s', async (_label, marketShape) => {
     const market = { symbol: 'ETH', slug: 'eth-not-a-binary', ...marketShape };
-    const depth = { up: { bestAsk: 0.34 }, down: { bestAsk: 0.62 } }; // big gap, would lock if allowed
+    const depth = { up: { bestAsk: 0.34, bestAskSize: 5000 }, down: { bestAsk: 0.62, bestAskSize: 5000 } }; // big gap, would lock if allowed
     const cfg = { clobArbEnabled: true, minArbGap: 0.015, maxArbPackages: 4, paperBankroll: 100, mode: 'paper' };
 
     const pkg = await detectAndExecuteArbPackage({
@@ -139,7 +139,7 @@ describe('Atomic Arb Engine', () => {
     const market2 = { symbol: 'ETH', slug: 'eth-2', conditionId: '0xeth2', outcomes: ['Up', 'Down'], tokenIds: { up: 'u2', down: 'd2' } };
 
     const cfg = { clobArbEnabled: true, minArbGap: 0.015, maxArbPackages: 1, paperBankroll: 100, mode: 'paper' };
-    const depth = { up: { bestAsk: 0.34 }, down: { bestAsk: 0.62 } };
+    const depth = { up: { bestAsk: 0.34, bestAskSize: 5000 }, down: { bestAsk: 0.62, bestAskSize: 5000 } };
 
     // Package 1 fills successfully
     const pkg1 = await detectAndExecuteArbPackage({
@@ -175,7 +175,7 @@ describe('Atomic Arb Engine', () => {
 
   it('passes valid numeric entryPrice in order plans to trade execution', async () => {
     const market = { symbol: 'ETH', slug: 'eth-plan-test', conditionId: '0xethplan', outcomes: ['Up', 'Down'], tokenIds: { up: 'u', down: 'd' } };
-    const depth = { up: { bestAsk: 0.34 }, down: { bestAsk: 0.62 } };
+    const depth = { up: { bestAsk: 0.34, bestAskSize: 5000 }, down: { bestAsk: 0.62, bestAskSize: 5000 } };
     const cfg = { clobArbEnabled: true, minArbGap: 0.015, paperBankroll: 100, mode: 'paper' };
 
     const capturedPlans: any[] = [];
@@ -244,7 +244,7 @@ describe('Arb entry invariants — fill-or-kill share parity', () => {
     tokenIds: { up: 'token-up-p', down: 'token-down-p' },
     acceptingOrders: true,
   };
-  const depth = { up: { bestAsk: 0.33 }, down: { bestAsk: 0.487 } };
+  const depth = { up: { bestAsk: 0.33, bestAskSize: 5000 }, down: { bestAsk: 0.487, bestAskSize: 5000 } };
   const cfg = {
     clobArbEnabled: true,
     minArbGap: 0.01,
@@ -406,7 +406,12 @@ describe('Arb entry invariants — fill-or-kill share parity', () => {
     const executeTrade = async () => ({ ok: false, error: 'blocked' });
     return run(executeTrade).then((pkg) => {
       expect(pkg?.status).toBe('ABORTED');
-      expect(pkg?.abortReason).toMatch(/UP=FAIL, DOWN=FAIL/);
+      // UP executes first and DOWN only runs `if (upShares > 0)`, so a refused
+      // UP leaves DOWN unsent. It used to report `DOWN=FAIL`, which is a claim
+      // about an order that was never placed — and makes a one-sided rejection
+      // read identically to a two-sided one. Item 73(b).
+      expect(pkg?.abortReason).toMatch(/UP=FAIL, DOWN=NOT_ATTEMPTED/);
+      expect(pkg?.abortReason).not.toMatch(/DOWN=FAIL/);
       expect(pkg?.legs.up.filled).toBe(false);
       expect(pkg?.legs.down.filled).toBe(false);
     });

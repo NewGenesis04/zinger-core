@@ -58,6 +58,12 @@ function normalizeLevels(book, levels = 10) {
 
   const bestBid = bids[0]?.price || 0;
   const bestAsk = asks[0]?.price || 0;
+  // Top-of-book resting size. Item 73: the arb depth gate needs this from both
+  // the REST and WS branches of `getDepthForMarket`, and only the WS branch was
+  // ever missing `asks[]` — publishing the scalar here keeps the gate reading
+  // one field name whichever branch produced the book.
+  const bestBidSize = Number(bids[0]?.size) || 0;
+  const bestAskSize = Number(asks[0]?.size) || 0;
   const spread = bestBid > 0 && bestAsk > 0 ? bestAsk - bestBid : null;
   const mid = bestBid > 0 && bestAsk > 0
     ? (bestBid + bestAsk) / 2
@@ -75,6 +81,8 @@ function normalizeLevels(book, levels = 10) {
     asks,
     bestBid,
     bestAsk,
+    bestBidSize,
+    bestAskSize,
     spread: spread ?? 0,
     spreadPct: spreadPct ?? 0,
     mid: mid ?? 0,
@@ -168,10 +176,21 @@ export async function getDepthForMarket(market) {
     if (!tokenId) continue;
     try {
       const wsBook = getClobWsBook(tokenId);
-      if (wsBook && !wsBook.stale && (wsBook.bestBid || wsBook.bestAsk)) {
+      /*
+       * Both sides required. This read `(wsBook.bestBid || wsBook.bestAsk)`, so
+       * a book with a bid and no ask still took the WS branch, and `|| 0` below
+       * turned the missing ask into a number that looks real to every consumer.
+       * `arbEngine.ts:54` then replaced that 0 with a mid. Falling through to
+       * the REST branch instead yields a full `normalizeLevels` book — with the
+       * `asks[]`/`bids[]` arrays the WS shape lacks — or nothing at all, which
+       * is the honest answer when there is no ask. Item 72.
+       */
+      if (wsBook && !wsBook.stale && wsBook.bestBid && wsBook.bestAsk) {
         depth[outcome] = {
-          bestBid: wsBook.bestBid || 0,
-          bestAsk: wsBook.bestAsk || 0,
+          bestBid: wsBook.bestBid,
+          bestAsk: wsBook.bestAsk,
+          bestBidSize: Number(wsBook.bestBidSize) || 0,
+          bestAskSize: Number(wsBook.bestAskSize) || 0,
           mid: wsBook.mid || 0,
           spread: (wsBook.bestBid && wsBook.bestAsk) ? wsBook.bestAsk - wsBook.bestBid : 0,
           source: 'clob-ws',

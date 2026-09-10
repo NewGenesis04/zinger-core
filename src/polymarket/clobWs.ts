@@ -15,6 +15,77 @@ const PING_MS = 20_000;
 
 /** @type {Map<string, { bestBid:number|null, bestAsk:number|null, mid:number|null, lastTrade:number|null, ts:number, source:string }>} */
 const books = new Map();
+
+/*
+ * Per-level resting size, one map per side per token. Item 70.
+ *
+ * `bestBid`/`bestAsk` used to be maintained as two bare scalars, which cannot
+ * answer "what is underneath the top level" — so a `price_change` removing the
+ * best ask set it to `null` even with size still resting one tick down. That
+ * null was coerced to 0 by `clob.ts:174` and then replaced with a MID by
+ * `arbEngine.ts:54`, which is how a live FOK order came to be signed at a price
+ * nothing rested at (2026-09-09 run: every leg rejected against a 1,386-share
+ * book).
+ *
+ * Prices are tick-aligned (0.001 minimum), so they are keyed as integer
+ * ten-thousandths — float keys would make `delete` unreliable.
+ *
+ * @type {Map<string, { bids: Map<number, number>, asks: Map<number, number> }>}
+ */
+const levels = new Map();
+
+const pxKey = (px) => Math.round(px * 10_000);
+const keyPx = (k) => k / 10_000;
+
+function sideMaps(assetId) {
+  let m = levels.get(assetId);
+  if (!m) {
+    m = { bids: new Map(), asks: new Map() };
+    levels.set(assetId, m);
+  }
+  return m;
+}
+
+/** Best resting price on a side, or null when the side is empty. */
+function bestOf(map, pick) {
+  let best = null;
+  for (const [k, size] of map.entries()) {
+    if (!(size > 0)) continue;
+    if (best === null || pick(k, best)) best = k;
+  }
+  return best === null ? null : keyPx(best);
+}
+
+const bestBidOf = (m) => bestOf(m.bids, (k, b) => k > b);
+const bestAskOf = (m) => bestOf(m.asks, (k, b) => k < b);
+
+/*
+ * Resting size at a given price. Published as `bestBidSize`/`bestAskSize` for
+ * the arb depth gate (item 73): a marketable FOK is signed with `maxPrice` set
+ * to exactly the best ask (`bot.ts:1011`), and every other level is by
+ * definition priced above it, so **only top-of-book size is reachable**. The
+ * deeper ladder is irrelevant to that order and is deliberately not published
+ * here.
+ */
+function sizeAt(map, px) {
+  if (px == null) return 0;
+  const s = map.get(pxKey(px));
+  return Number.isFinite(s) && s > 0 ? s : 0;
+}
+
+/** Replace one side's levels from a snapshot array of {price,size} or [price,size]. */
+function loadSide(map, rows) {
+  map.clear();
+  for (const r of rows || []) {
+    const px = parseFloat(r?.price ?? r?.[0]);
+    const size = parseFloat(r?.size ?? r?.[1]);
+    if (!Number.isFinite(px) || px <= 0) continue;
+    // A snapshot row with no parseable size is still a resting level; treat the
+    // price as present rather than dropping it, or a snapshot in an unexpected
+    // shape would silently empty the book.
+    map.set(pxKey(px), Number.isFinite(size) ? size : 1);
+  }
+}
 const listeners = new Set();
 /** @type {Set<string>} */
 let desired = new Set();
@@ -37,16 +108,19 @@ function usablePx(px) {
   return Number.isFinite(n) && n > 0 && n < 1 ? n : null;
 }
 
-function upsertFromBook(assetId, bids, asks, ts) {
+/*
+ * Exported as a test seam only — no call site outside this module and
+ * `handleMessage`. The book maintainer is the price source every live arb leg
+ * is signed against, and it had no coverage because reaching it required a live
+ * WebSocket. Same reasoning as `buildSyncFrame` in telemetry/events.ts.
+ */
+export function upsertFromBook(assetId, bids, asks, ts) {
   if (!assetId) return;
-  const bidPx = (bids || [])
-    .map((b) => parseFloat(b.price ?? b[0]))
-    .filter((p) => Number.isFinite(p) && p > 0)
-    .sort((a, b) => b - a)[0] ?? null;
-  const askPx = (asks || [])
-    .map((a) => parseFloat(a.price ?? a[0]))
-    .filter((p) => Number.isFinite(p) && p > 0)
-    .sort((a, b) => a - b)[0] ?? null;
+  const m = sideMaps(String(assetId));
+  loadSide(m.bids, bids);
+  loadSide(m.asks, asks);
+  const bidPx = bestBidOf(m);
+  const askPx = bestAskOf(m);
   const rawMid = bidPx != null && askPx != null
     ? (bidPx + askPx) / 2
     : (bidPx ?? askPx ?? null);
@@ -54,6 +128,8 @@ function upsertFromBook(assetId, bids, asks, ts) {
   const snap = {
     bestBid: bidPx,
     bestAsk: askPx,
+    bestBidSize: sizeAt(m.bids, bidPx),
+    bestAskSize: sizeAt(m.asks, askPx),
     mid: usablePx(rawMid) ?? usablePx(prev.mid) ?? usablePx(prev.lastTrade),
     lastTrade: prev.lastTrade ?? null,
     ts: Number(ts) || Date.now(),
@@ -63,7 +139,8 @@ function upsertFromBook(assetId, bids, asks, ts) {
   emit(String(assetId), snap);
 }
 
-function applyPriceChange(change, ts) {
+/** Test seam — see `upsertFromBook`. */
+export function applyPriceChange(change, ts) {
   const assetId = String(change.asset_id || change.assetId || '');
   if (!assetId) return;
   const price = parseFloat(change.price);
@@ -72,29 +149,32 @@ function applyPriceChange(change, ts) {
   const prev = books.get(assetId) || {
     bestBid: null, bestAsk: null, mid: null, lastTrade: null, ts: 0, source: 'clob-ws',
   };
-  let { bestBid, bestAsk } = prev;
-  // size 0 = level removed; otherwise update best if this side improves/matches
+  const m = sideMaps(assetId);
+  /*
+   * A delta sets or clears exactly one level; best-of-book is then *derived*,
+   * never carried forward. Carrying it forward is what produced the null on a
+   * still-deep book — see the `levels` comment above.
+   */
   if (Number.isFinite(price) && price > 0) {
-    if (side === 'BUY' || side === 'BID') {
-      if (!Number.isFinite(size) || size <= 0) {
-        if (bestBid === price) bestBid = null;
-      } else if (bestBid == null || price >= bestBid) {
-        bestBid = price;
-      }
-    } else if (side === 'SELL' || side === 'ASK') {
-      if (!Number.isFinite(size) || size <= 0) {
-        if (bestAsk === price) bestAsk = null;
-      } else if (bestAsk == null || price <= bestAsk) {
-        bestAsk = price;
-      }
+    const isBid = side === 'BUY' || side === 'BID';
+    const isAsk = side === 'SELL' || side === 'ASK';
+    if (isBid || isAsk) {
+      const map = isBid ? m.bids : m.asks;
+      const k = pxKey(price);
+      if (!Number.isFinite(size) || size <= 0) map.delete(k);
+      else map.set(k, size);
     }
   }
+  const bestBid = bestBidOf(m);
+  const bestAsk = bestAskOf(m);
   const rawMid = bestBid != null && bestAsk != null
     ? (bestBid + bestAsk) / 2
     : (bestBid ?? bestAsk ?? prev.mid);
   const snap = {
     bestBid,
     bestAsk,
+    bestBidSize: sizeAt(m.bids, bestBid),
+    bestAskSize: sizeAt(m.asks, bestAsk),
     mid: usablePx(rawMid) ?? usablePx(prev.mid) ?? usablePx(prev.lastTrade),
     lastTrade: prev.lastTrade,
     ts: Number(ts) || Date.now(),
@@ -215,6 +295,11 @@ export function setClobMarketTokens(tokenIds = []) {
   );
   const same = next.size === desired.size && [...next].every((id) => desired.has(id));
   desired = next;
+  // Windows rotate every 5 minutes, so `levels` holds a price→size map per side
+  // per token and would grow without bound over a multi-day run. Drop the
+  // level maps for tokens no longer subscribed; their `books` snapshot ages out
+  // via MAX_BOOK_AGE_MS and is already ignored by every consumer.
+  for (const id of levels.keys()) if (!desired.has(id)) levels.delete(id);
   if (!running) return;
   if (!ws || ws.readyState !== WebSocket.OPEN) {
     connect();

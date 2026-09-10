@@ -78,7 +78,7 @@ describe('Feature: Instant On-Chain CTF Merge (mergePositions)', () => {
 
       const pkg = await detectAndExecuteArbPackage({
         market,
-        depth: { up: { bestAsk: 0.35 }, down: { bestAsk: 0.55 } },
+        depth: { up: { bestAsk: 0.35, bestAskSize: 5000 }, down: { bestAsk: 0.55, bestAskSize: 5000 } },
         prices: { up: 0.35, down: 0.55 },
         cfg: {
           clobArbEnabled: true,

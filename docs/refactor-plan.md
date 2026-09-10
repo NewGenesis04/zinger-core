@@ -3320,6 +3320,266 @@ that are already clean.
 
 ---
 
+### 70. The WS book maintainer reported no ask on a book 1,386 shares deep ✅ FIXED
+
+**2026-09-09/10.** The first live arb canary placed nine orders across BTC and
+ETH over ~6 hours. **Every one was rejected.** Cash never moved from $275.16.
+
+```
+❌ LIVE BUY FAILED BTC: CLOB FOK buy $4.01 @<=0.73: order couldn't be fully filled.
+❌ LIVE BUY FAILED ETH: CLOB FOK buy $2.42 @<=0.45: order couldn't be fully filled.
+❌ LIVE BUY FAILED BTC: CLOB FOK buy $0.21 @<=0.04: invalid amount ($0.21), min size: 1
+```
+
+The obvious reading is thin depth, and it is wrong. A REST read of the book —
+`GET /book?token_id=…` — returned **1,386 shares resting at $0.97**, 1,517 at
+$0.98, 9,722 at $0.99, against bids at $0.02/$0.01. The book was deep. The bot
+was bidding a price nothing rested at.
+
+**Cause.** `clobWs.ts` maintained `bestBid`/`bestAsk` as two bare scalars,
+carried forward across deltas. Two scalars cannot answer "what is underneath the
+top level", so a `price_change` removing the best ask set it to `null` even with
+size still resting one tick down:
+
+```js
+} else if (side === 'SELL' || side === 'ASK') {
+  if (!Number.isFinite(size) || size <= 0) {
+    if (bestAsk === price) bestAsk = null;      // ← no next-best to fall to
+  } else if (bestAsk == null || price <= bestAsk) {
+    bestAsk = price;
+  }
+}
+```
+
+**A theory that the evidence killed.** The first diagnosis was a *ratchet* —
+that `bestAsk` could only move downward and was locked at a stale low. Two of
+the five tests written to demonstrate it **passed**: a worse ask does not
+overwrite a better resting one, and a re-quote above a removed level *is*
+accepted. The lock does not exist. What exists is the `null`, and the null is
+enough. Recorded because the wrong theory was fluent and would have produced a
+fix aimed at the wrong line.
+
+**Fix.** `clobWs.ts:35-73` — a per-level `Map<price, size>` per side per token,
+keyed as integer ten-thousandths (prices are tick-aligned; float keys make
+`delete` unreliable). Best-of-book is *derived* from the map on every update
+(`bestOf`, `:50`), never carried forward. `setClobMarketTokens` prunes level
+maps for unsubscribed tokens, since windows rotate every 5 minutes and the maps
+would otherwise grow without bound over a multi-day run.
+
+`tests/unit/clobWsBook.test.ts` — 6 invariants. `upsertFromBook` and
+`applyPriceChange` are exported as a test seam; this layer had no coverage
+because reaching it required a live WebSocket, same problem and same remedy as
+`buildSyncFrame` in item 65. Mutation-verified: inverting `bestAskOf` to pick the
+highest resting ask kills 3 tests; dropping the `size > 0` filter in `bestOf`
+initially killed **none** — the delta path deletes zero-size keys, so only a
+snapshot row can carry a zero into it — which is why `ignores zero-size rows
+carried in a snapshot` exists.
+
+### 71. `upAsk` was a midpoint, and the gap filter selected for it ✅ FIXED
+
+**Where item 70 became money.** `arbEngine.ts:54` read:
+
+```js
+const upAsk = Number(depth?.up?.bestAsk || prices?.up || 0);
+```
+
+`prices.up` is **not an ask**. `clob.ts:118` assigns it `wsMid`. So the moment
+the book maintainer had no ask, a midpoint was substituted into a variable named
+`upAsk` — and that number becomes the `maxPrice` of a live fill-or-kill order at
+`bot.ts:1011`.
+
+```
+clobWs.ts:86     top ask removed              →  bestAsk = null
+clob.ts:180      `bestBid || bestAsk` truthy  →  WS branch taken anyway
+clob.ts:183      `wsBook.bestAsk || 0`        →  emits 0
+arbEngine.ts:54  `0 || prices?.up`            →  substitutes the MID
+bot.ts:1011      maxPrice: entryPx            →  FOK signed at the mid
+```
+
+**This is worse than a bad price — the gate selects for it.** With the fallback
+on one leg:
+
+```
+computed_sum = mid_up + ask_down = (ask_up − spread_up/2) + ask_down
+             = true_sum − spread_up/2
+```
+
+so the "gap" is half the spread of whichever leg fell back. The wider the
+spread, the larger the phantom edge, the more attractive the opportunity looks.
+The detector was **biased toward the most broken books it could find**, which is
+why the failure rate was 100% rather than intermittent. Back-solving the live
+log (`shares = budget / sum`) gives implied sums of 0.910–0.952 against true
+sums of ~1.00 — spreads of 0.10–0.18, ordinary for a 5-minute window. The 4¢
+BTC leg is the midpoint of a book quoted bid 0.01 / ask 0.07.
+
+**Fix.** `arbEngine.ts:73` reads `prices?.upAsk` / `prices?.downAsk` — which
+`clob.ts:120` has published all along and **nothing in the repo ever read** —
+and refuses when neither source yields an ask. No ask → no trade. An arb leg
+cannot be priced off anything but an ask.
+
+### 72. `getDepthForMarket` laundered a missing ask into a real-looking `0` ✅ FIXED
+
+`clob.ts:171` gated the WS branch on `(wsBook.bestBid || wsBook.bestAsk)`, so a
+book with a bid and no ask still took it, and `bestAsk: wsBook.bestAsk || 0`
+turned the absence into a number. Every downstream consumer sees a `0` it cannot
+distinguish from a real quote. Fixed at `clob.ts:180-184`: both sides required,
+no coercion — fall through to the REST branch, which returns a full
+`normalizeLevels` book, or return nothing, which is the honest answer.
+
+**Still open (structural).** The two branches return **different shapes**: the WS
+branch emits `{bestBid, bestAsk, mid, spread, source}` with no `bids[]`/`asks[]`,
+while the REST branch returns the full ladder with per-level `size` and `cum`.
+Any depth-aware consumer written against `depth.up.asks[0].size` is reading
+`undefined` on the live path. This blocks any future depth-aware sizing and
+should be unified before that is attempted. Note the tension: falling through to
+REST more often costs metered proxy bandwidth (items 57–64), though after item 70
+a null ask should be rare.
+
+### 73. Arb legs have no minimum-notional gate, and the abort log lies ✅ FIXED
+
+**Two separate defects, both from the same live run.**
+
+**(a) No $1 leg-notional gate.** `arbEngine.ts:452` passes `minShares: 1`, so the
+floor at `trade.ts:364` (`max(amountUsd, minShares * px)`) evaluates to $0.13 on
+a 4¢ leg and does nothing. The exchange rejects it: `invalid amount for a
+marketable BUY order ($0.21), min size: 1`. The bot should skip the package
+rather than send an order it can know is invalid.
+
+The three constraints are one gate, not three patches — and they can be mutually
+unsatisfiable, in which case the answer is *skip*:
+
+```
+shares ≥ 1 / min(upAsk, downAsk)         ← notional floor, pushes size UP
+shares ≤ min(upAskSize, downAskSize)     ← depth ceiling, pushes size DOWN   (blocked on item 72)
+shares ≤ budget / (upAsk + downAsk)      ← budget ceiling, pushes size DOWN
+```
+
+Treating them independently is actively dangerous: capping to available depth
+alone can push the *cheap* leg under $1, which fills leg one and rejects leg
+two — the unhedged position the package design exists to prevent (2026-08-28,
+−$12.83).
+
+Consequence for config: with `arbMaxUsd: 5`, no book with a leg under ~$0.20 is
+tradeable at all, because 5 shares is the most the budget buys. A 4¢ leg needs
+25 shares — a **$24.50** package — since share parity, not dollar parity, is what
+makes a set redeem to $1.00.
+
+**(b) `arbEngine.ts:411` logs `emergency unwound filled leg` unconditionally**,
+while the unwind at `:403-407` only runs when *exactly one* leg filled. Every
+abort in the live run printed it with nothing filled and nothing unwound. Also
+`:401`: UP executes first and DOWN only runs `if (upShares > 0)`, so `DOWN=FAIL`
+conflates "rejected" with "never attempted". The ordering is correct — it is
+what kept the run at zero risk — but the log misreports it.
+
+**Fix — the unified gate.** `arbEngine.ts:186-250` computes the three bounds
+together and resolves them once. Rounding is directional: `Math.floor` onto the
+3-decimal share grid so no ceiling is re-breached, then `Math.ceil` up to the
+floor — rounding *to nearest* at the floor shaves a cheap leg from $1.00 to
+$0.999, which the exchange rejects.
+
+**Gate order is load-bearing: money first, microstructure second.** The
+affordability gate keeps its position ahead of all three, and `depthShares`
+falls back to `Infinity` when unknown purely so sizing can reach it. An account
+that cannot fund the trade is refused as `insufficient_*_cash` whatever the book
+looks like; putting the new gates first silently usurped that code and broke the
+item 62 invariant, which is how the ordering was found.
+
+Four skip codes, so the dashboard can tell the cases apart — during the
+2026-09-09 run all four were indistinguishable from a generic rejection:
+
+| Code | Meaning |
+|---|---|
+| `depth_unknown` | no `bestAskSize` from either source — absent is not infinite |
+| `depth_below_min_size` | top-of-book cannot cover the $1.00 floor |
+| `budget_below_min_notional` | `arbMaxUsd`/`arbBankrollFrac` cannot reach $1.00 on the cheap leg |
+| `leg_below_min_notional` | dollar-denominated backstop against share-grid rounding |
+
+**Depth plumbing (closes the operative half of item 72).** `clobWs.ts` publishes
+`bestBidSize`/`bestAskSize` off the item 70 level maps, and `normalizeLevels`
+publishes the same two scalars, so both branches of `getDepthForMarket` hand the
+gate one field name. Only *top-of-book* size is published, and that is not a
+shortcut: `maxPrice` is signed at exactly the best ask (`bot.ts:1011`), so every
+deeper level is priced out of reach and cannot fill. The full-ladder shape
+mismatch in item 72 remains open for anything that needs more than top-of-book.
+
+**(b)** `arbEngine.ts:481-511` — `DOWN=NOT_ATTEMPTED` replaces `DOWN=FAIL` when
+UP never filled, and the unwind suffix is conditional on an unwind having run
+(`unwound` also lands in the event payload).
+
+**Tests.** `tests/unit/arbSizingGate.test.ts` — 7 invariants stated over the
+*pair*, so no future edit can satisfy a ceiling by breaching the floor.
+Mutation-verified, six mutations, all killed: dropping the floor lift (2),
+`MIN_LEG_NOTIONAL_USD = 0` (2), unknown-depth skip disabled (1), depth ceiling
+gate removed (1), budget gate removed (1), depth dropped from the sizing `min`
+(1). The 24 pre-existing arb fixtures gained `bestAskSize: 5000` — deep enough
+that depth is not the constraint under test in files testing parity and fees.
+
+### 74. Nothing stops a losing arb loop — the breakers exempt it, and there is no session cap
+
+**Found 2026-09-10** while answering "can I leave this running overnight?". The
+answer is no, and the reason is not the sizing gate — it is that if the gate is
+wrong, **no mechanism in the bot would stop it.** Two independent gaps.
+
+**(a) `holdsToSettlement` cannot tell a hedged pair from an orphaned leg.**
+
+```js
+// positions/policy.ts:108-110
+function hasHedgeMarkers(posOrPlan) {
+  return !!(posOrPlan?.packageId || posOrPlan?.isArbLeg || posOrPlan?.arb);
+}
+```
+
+Every one of those markers **survives the abort**. A leg that filled while its
+complement was killed — and whose `unwindLeg` then failed (`arbEngine.ts:485-492`
+logs and continues) — still carries `packageId` and `isArbLeg`, so
+`holdsToSettlement` returns `true` and it is exempt from every risk exit that
+consults it:
+
+| Site | Exit it skips |
+|---|---|
+| `bot.ts:2802` | portfolio max-drawdown close (`if (holdsToSettlement(op)) continue;`) |
+| `bot.ts:2776` | mid-window exits |
+| `bot.ts:1916` | exit management (stop-loss, trailing, TP) |
+| `bot.ts:408` | overdraft repair |
+
+The exemption is **correct for a real pair** — a hedged set redeems to exactly
+$1.00 and force-closing mid-window forfeits the edge and books the spread, which
+is what the comment at `bot.ts:2800-2801` says. But it is applied on a
+*structural marker*, not on whether the hedge exists. So the single position that
+most needs closing — a naked directional leg the operator never intended to
+hold — is the one position guaranteed to ride to settlement untouched. That is
+the exact shape of the 2026-08-28 −$12.83 loss.
+
+The information to tell them apart already exists and is not consulted:
+`pkg.legs.up.filled` / `pkg.legs.down.filled` (written unconditionally at
+`arbEngine.ts:296-299`, item 27) and `pkg.residualShares` / `pkg.residualOutcome`
+on the parity-breach path. The fix is for the exemption to require a *live
+complement*, not a marker. Belongs with the D4 position manager, which is what
+would own "is this leg still hedged".
+
+**(b) No cumulative loss cap of any kind.**
+
+- `maxArbPackages` caps **concurrent** packages, not attempts. An aborted package
+  frees its slot immediately (`getActivePackages`, `arbEngine.ts:139-145`), so a
+  systematic defect can fail → unwind → retry every window indefinitely.
+  `maxArbPackages: 1` bounds a single package's size; it bounds nothing about a
+  night of them.
+- The **governor drawdown breaker forces the profile to `arb-only`**
+  (`governor.ts:387-406`). If arb is the strategy losing money, the breaker aims
+  the bot harder at it.
+- The **portfolio drawdown breaker** (`bot.ts:2782-2799`) measures unrealised
+  loss on *open* positions. Repeated small realised losses — abort, unwind,
+  spread — never accumulate into an open-position drawdown, so it never fires.
+
+`grep` for `maxDailyLoss|dailyLoss|lossLimit|circuitBreak|killSwitch|maxLossUsd`
+across `src/` returns nothing. There is no session-level or daily brake.
+
+**Operational consequence, stated plainly:** live arb should not run unattended
+until (b) exists. Paper mode exercises the identical sizing gate — `mode` only
+selects the bankroll source and whether orders reach the exchange — so an
+unattended overnight run belongs in paper, where it also yields the skip-code
+distribution needed to set `arbMaxUsd` from evidence rather than arithmetic.
+
 ## Handoff — state as of 2026-08-20
 
 Written so a fresh session can continue without re-deriving any of the above.
