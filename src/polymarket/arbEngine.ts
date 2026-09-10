@@ -213,6 +213,27 @@ export async function detectAndExecuteArbPackage({
    */
   const MIN_LEG_NOTIONAL_USD = 1.0;
 
+  /*
+   * Fraction of top-of-book this bot is willing to ask for (item 76).
+   *
+   * Orders are fill-or-kill and `maxPrice` is signed at exactly the best ask
+   * (`bot.ts:1011`), so only the top level is reachable. Asking for 100% of it
+   * is the most race-prone size that exists: one other participant taking a
+   * single share leaves the level short, the FOK cannot fill in full, and the
+   * package dies with zero fills. 10 of the 15 sampled packages in the
+   * 2026-09-09/10 overnight paper run were sized at exactly 100%.
+   *
+   * **This factor is a hypothesis, not a measurement.** No size-race kill has
+   * ever been observed on this bot — paper fills by definition, and the one
+   * live attempt (9/9 rejected, 2026-09-09) failed earlier in the chain, on a
+   * midpoint reaching `maxPrice` (items 70/71). The cushion is held because it
+   * is cheap, not because it is evidence-backed: on any book deep enough for
+   * the budget to bind it changes nothing at all. `arb.decision` records
+   * `restingShares` alongside `depthShares` on every attempt so the assumption
+   * can eventually be tested against real fills rather than re-asserted.
+   */
+  const DEPTH_UTILISATION = 0.90;
+
   const budgetShares = shareBudget / sum;
   const floorShares = MIN_LEG_NOTIONAL_USD / Math.min(upAsk, downAsk);
 
@@ -227,7 +248,13 @@ export async function detectAndExecuteArbPackage({
   const upAskSize = Number(depth?.up?.bestAskSize ?? NaN);
   const downAskSize = Number(depth?.down?.bestAskSize ?? NaN);
   const depthKnown = Number.isFinite(upAskSize) && Number.isFinite(downAskSize);
-  const depthShares = depthKnown ? Math.min(upAskSize, downAskSize) : Infinity;
+  // `restingShares` is what the book shows; `depthShares` is what this bot will
+  // ask for. The clamp is applied HERE, on the ceiling itself, not inside the
+  // `Math.min` below — sizing at 90% while the gate at :282 still compared
+  // against 100% would mean the gate never fires and the cushion never appears
+  // in telemetry. One value, used by both.
+  const restingShares = depthKnown ? Math.min(upAskSize, downAskSize) : Infinity;
+  const depthShares = depthKnown ? restingShares * DEPTH_UTILISATION : Infinity;
 
   // Round DOWN to the 3-decimal share grid so rounding can never re-breach a
   // ceiling, then lift to the floor. Rounding *to nearest* at the floor can
@@ -236,7 +263,15 @@ export async function detectAndExecuteArbPackage({
   // is intentional: the gates below then refuse it by name rather than the
   // package silently coming out the wrong size.
   let shares = Math.floor(Math.min(budgetShares, depthShares) * 1000) / 1000;
-  if (shares < floorShares) shares = Math.ceil(floorShares * 1000) / 1000;
+  // Which constraint actually set the size, decided here where all three are in
+  // scope. Derived at the emit site instead, it reads as `shares >= depthShares`
+  // — false whenever the grid floor shaved a fraction off, so a depth-bound
+  // package would report itself budget-bound.
+  let sizeBoundBy = depthShares < budgetShares ? 'depth' : 'arbBankrollFrac/arbMaxUsd';
+  if (shares < floorShares) {
+    shares = Math.ceil(floorShares * 1000) / 1000;
+    sizeBoundBy = 'minLegNotional';
+  }
 
   const costUp = Math.round(shares * upAsk * 100) / 100;
   const costDown = Math.round(shares * downAsk * 100) / 100;
@@ -285,7 +320,10 @@ export async function detectAndExecuteArbPackage({
     // floor is not an option — it would put the cheap leg under $1.00 and get
     // it rejected *after* the first leg filled.
     arbDecision('skip', 'depth_below_min_size',
-      { shares, depthShares, upAskSize, downAskSize, floorShares, cheapAsk: Math.min(upAsk, downAsk) },
+      {
+        shares, depthShares, restingShares, utilisation: DEPTH_UTILISATION,
+        upAskSize, downAskSize, floorShares, cheapAsk: Math.min(upAsk, downAsk),
+      },
       { breakEvenGap, requiredGap, sizing: { shares, costUp, costDown, capitalUsd: totalCost } });
     return null;
   }
@@ -342,7 +380,10 @@ export async function detectAndExecuteArbPackage({
     sizing: {
       shares, costUp, costDown, capitalUsd: totalCost,
       expectedPayout, lockedProfitUsd, lockedProfitPct,
-      boundBy: 'arbBankrollFrac/arbMaxUsd',
+      // What the book had vs what we asked for. Item 76's cushion is a
+      // hypothesis; this pair is the evidence that will confirm or kill it.
+      restingShares, depthShares, utilisation: DEPTH_UTILISATION,
+      boundBy: sizeBoundBy,
     },
     packageId,
   });

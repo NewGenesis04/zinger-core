@@ -3580,6 +3580,207 @@ selects the bankroll source and whether orders reach the exchange — so an
 unattended overnight run belongs in paper, where it also yields the skip-code
 distribution needed to set `arbMaxUsd` from evidence rather than arithmetic.
 
+### 75. `arb.decision` is unrecoverable after ~45 minutes — the ring buffer is its only sink ✅ FIXED
+
+**Found 2026-09-10**, forensics on the overnight paper run
+(`docs/overnight-paper-forensics-2026-09-10.html`). The run existed to produce a
+skip-code distribution. It did not produce one.
+
+The telemetry bus is a bounded in-memory ring and nothing else:
+
+```ts
+// telemetry/events.ts:28
+export const DEFAULT_EVENT_BUFFER_CAP = Number(process.env.EVENT_BUFFER_CAP) || 30_000;
+
+// telemetry/events.ts:423-427
+this.buffer.push(event as BaseTelemetryEvent);
+if (this.buffer.length > this.maxCap) {
+  this.buffer.shift();   // Evict oldest
+  this.evicted += 1;
+}
+```
+
+The export showed **`evicted: 354266`**. At 11.06 events/s a 30,000-slot buffer
+retains ~45 minutes, so a 9-hour run yielded 90 seconds of history. Roughly 80%
+of all events are `gap_below_breakeven` (`arbEngine.ts:133`) — the code that
+fires on every market on every scan that finds nothing.
+
+**Read the right field.** `dropped` and `hasMore` were both correctly `false`;
+`evicted` (`events.ts:350`, surfaced at `server.ts:687`) is the field that
+carries the loss. A consumer checking only the first two concludes the export is
+complete.
+
+**Ten skip codes exist, and a sink must not whitelist two of them.**
+`arbEngine.ts:133` `gap_below_breakeven`, `:152` `gap_below_operator_floor`,
+`:161` `package_capacity_full`, `:168` `package_already_on_slug`, `:260`
+`insufficient_paper_cash`/`insufficient_live_cash`, `:277` `depth_unknown`,
+`:287` `depth_below_min_size`, `:296` `budget_below_min_notional`, `:312`
+`leg_below_min_notional`, plus `'open'` at `:338`.
+
+`depth_unknown` is the one that must survive the filter regardless of volume: it
+is the regression canary for item 70. If the per-level WS book maps ever go back
+to publishing no ask, that code is the signal, and a sink that keeps only the
+budget and depth codes would show nothing at all.
+
+**Interaction with item 77.** Raising `minArbGap` moves the noise floor from
+`gap_below_breakeven` to `gap_below_operator_floor` (`:152`) — the same volume
+under a different code. A *whitelist* survives that change; a blacklist of
+`gap_below_breakeven` would silently begin recording ~350k rows a night. The
+sink must whitelist deliberately, and must keep a periodic **count** of what it
+suppressed, or the denominator is lost and no skip *rate* can ever be computed.
+
+**Placement.** `data/zinger.db` already has an open WAL handle and a data
+directory contract (`sqliteStore.ts:65` `DB_PATH`, `:72` `getDb()`,
+`ZINGER_DB_PATH` to relocate). A second `.db` file would be a second backup
+target and a second thing to point at a VPS volume. The existing `docs` table is
+key/value (`:80`), so an append-only decision log is a new table shape either
+way — it belongs in the same file.
+
+**What shipped.** `telemetry/decisionSink.ts`, subscribed at `index.ts` (not in
+`createApp()`, so building the app in a test attaches no writer to the
+operator's `zinger.db`). Two tables in the existing DB:
+
+- `arb_decisions` — one row per actionable decision, extracted columns for
+  querying plus the verbatim payload for questions nobody has thought of yet.
+- `arb_decision_counts` — hourly `(bucket, code, mode)` counts.
+
+Persisted codes are **also** counted, so `rows + counts` reconstructs the true
+event total whatever the whitelist says. `'open'` is never throttled and never
+merely counted — that record has to reconcile against the cash ledger. Other
+persisted codes get one row per `(code, slug)` per `ARB_SINK_THROTTLE_MS`
+(default 300s, one per window rotation); the duplicates are counted, so a
+condition that persists for hours reads as a series, not a stale single row.
+Retention `ARB_SINK_RETENTION_DAYS` (default 90), pruned at startup.
+
+11 tests, `tests/unit/arbDecisionSink.test.ts`. Mutation-verified, seven
+mutations, all killed: persisted codes not counted (4 tests), throttle disabled
+(3), throttle key dropping slug (1), `open` routed through the throttle (2),
+unknown code dropped (1), `depth_unknown` off the whitelist (1), local `catch`
+removed (1).
+
+**One test had to be rewritten — it passed against its own bug.** "absorbs a
+write failure instead of throwing" asserted only `not.toThrow()`, which the bus
+already guarantees for every subscriber (`events.ts:393-408`) — deleting the
+sink's own `catch` left it green. What the local handler actually adds is
+*attribution*: a fault counted against the sink by name rather than one
+anonymous subscriber error. The test now asserts that, and the mutation dies.
+
+The last test in the file is the only one that drives a real package through
+`detectAndExecuteArbPackage` rather than hand-building the payload. Renaming
+`sizing` → `sizingInfo` on the producer leaves all ten synthetic tests green and
+kills exactly that one, which is the point of it: it is the producer/consumer
+contract, and without it a rename would ship a sink writing NULL columns.
+
+---
+
+### 76. The depth gate asks for 100% of top-of-book, the most race-prone size available ✅ FIXED
+
+**Found 2026-09-10.** Sizing takes every resting share at the best ask:
+
+```js
+// arbEngine.ts:230
+const depthShares = depthKnown ? Math.min(upAskSize, downAskSize) : Infinity;
+// arbEngine.ts:238
+let shares = Math.floor(Math.min(budgetShares, depthShares) * 1000) / 1000;
+```
+
+Orders are fill-or-kill and `maxPrice` is signed at exactly the best ask
+(`bot.ts:1011`), so only top-of-book is reachable — established in item 73. A
+request for 100% of that level therefore has zero tolerance: one other
+participant taking a single share leaves the level short, the FOK cannot fill in
+full, and the whole package dies. **10 of the 15 sampled packages in the
+overnight run were sized this way.**
+
+**What this item is not.** The 2026-09-09 run's nine rejections were *not* this.
+Root cause was a midpoint reaching `maxPrice` (items 70/71). **No size-race kill
+has ever been observed on this bot**, in paper or live — paper fills by
+definition and the one live attempt failed earlier in the chain. A utilisation
+factor is therefore a *hypothesis*, cheap to hold and not yet evidence-backed.
+It ships as a named constant with that stated, and item 75's sink records
+requested-vs-available size on every attempt so it can eventually be measured.
+
+**Two implementation traps.**
+
+- The factor belongs at `:230`, on `depthShares` itself. Applying it inside the
+  `Math.min` at `:238` would size at 90% while the skip gate at `:282`
+  (`if (shares > depthShares)`) still tested against 100% — the gate would never
+  fire and the clamp would be invisible in telemetry.
+- Rounding stays on the **3-decimal share grid** (`:238`). Flooring the clamped
+  depth to whole shares is a second, unrelated behaviour change.
+
+**Expected cost.** On deep books the budget binds and nothing changes. On thin
+books this converts some fills into `depth_below_min_size` skips — intended, as
+those are exactly the race-prone ones — which means it compounds with any
+`minArbGap` raise. The two cannot be estimated independently and multiplied.
+
+**What shipped.** `DEPTH_UTILISATION = 0.90` at `arbEngine.ts:214+`, applied on
+the ceiling at `:256-257`: `restingShares` is what the book shows, `depthShares`
+is what this bot will ask for. Both the sizing `min` and the
+`depth_below_min_size` gate read the same clamped value, so the gate still
+fires. `arb.decision` now carries `restingShares`, `depthShares` and
+`utilisation` on both the open and the skip, which is what makes the constant
+falsifiable later.
+
+`boundBy` is now decided at the sizing site (`sizeBoundBy`) rather than derived
+at the emit site. The obvious derivation, `shares >= depthShares`, reads *false*
+whenever the 3-decimal share grid shaves a fraction off — so a depth-bound
+package reported itself budget-bound. Caught by mutation, not by review.
+
+6 tests, `tests/unit/arbDepthUtilisation.test.ts`. Mutation-verified, five
+mutations, all killed: clamp removed (5 tests), `DEPTH_UTILISATION = 1.0` (5),
+`boundBy` derived naively (1), integer share grid instead of 3-decimal (1), and
+the documented trap — clamp moved inside the sizing `min` so the skip gate still
+compares against 100% (2, via the "refuses a book that only clears the floor at
+100% depth" case).
+
+**Still a hypothesis.** Nothing here is evidence that a size race was ever
+killing orders. Item 75's sink records requested-vs-available on every attempt;
+revisit the constant once a live run has produced fills to measure against.
+
+---
+
+### 77. Raising `arbMaxUsd` alone cannot raise the arb budget — `arbBankrollFrac` binds first
+
+**Found 2026-09-10**, checking a proposal to lift live `arbMaxUsd` $5 → $15 to
+"unlock trades down to 7c".
+
+```js
+// arbEngine.ts:178-184
+const shareBudget = Math.max(
+  Number(cfg.minPositionSize ?? 0.5) * 2,
+  Math.min(
+    arbBank * Number(cfg.arbBankrollFrac ?? 0.10),
+    Number(cfg.arbMaxUsd ?? 50),
+  ),
+);
+```
+
+The two caps are a `min`, so the smaller wins. Live is `arbBankrollFrac: 0.03`
+(`modeConfig.ts:163`) against a $275.16 balance:
+
+| `arbMaxUsd` | `arbBank × frac` | `shareBudget` | cheapest reachable leg |
+|---|---|---|---|
+| $5 (today) | $8.25 | **$5.00** | `sum/5` ≈ 19c |
+| $15 | $8.25 | **$8.25** | `sum/8.25` ≈ 11.5c |
+| $15 + frac 0.0545 | $15.00 | **$15.00** | `sum/15` ≈ 6.3c |
+
+The floor follows from item 73: the package needs `budgetShares ≥ floorShares`,
+i.e. `shareBudget/sum ≥ $1.00/cheapAsk`, so `cheapAsk ≥ sum/shareBudget`.
+Raising `arbMaxUsd` to $15 buys $8.25 and an 11.5c floor, **not the 7c the
+proposal assumed**. Both dials have to move together, and they are not
+interchangeable: `arbBankrollFrac` scales with the wallet, `arbMaxUsd` is a flat
+backstop that stops the fraction running away as the balance grows. The
+validator ceiling is $50 (`modeConfig.ts:360-362`), so neither value is near a
+guard.
+
+**Not scheduled.** This is sizing, and it is gated behind item 74(b): it raises
+per-package exposure on a system where **no live arb order has ever filled**
+(9/9 rejected, 2026-09-09) and where no session loss cap exists. Sequence is
+item 75 (measure) → 76 (fill probability) → 74(b) (brake) → one attended live
+fill → then this.
+
+---
+
 ## Handoff — state as of 2026-08-20
 
 Written so a fresh session can continue without re-deriving any of the above.
