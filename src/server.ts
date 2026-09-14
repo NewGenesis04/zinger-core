@@ -1033,6 +1033,16 @@ export async function createApp() {
     }
   });
 
+  // Item 80 — clear an arb halt. POST because it changes what the engine will
+  // do next, and it is an operator assertion, not a query.
+  app.post('/api/poly/arb/resume', async (_req, res) => {
+    try {
+      res.json(poly.resumeArb());
+    } catch (err) {
+      res.status(500).json({ ok: false, error: err.message });
+    }
+  });
+
   app.post('/api/poly/approve', async (req, res) => {
     try {
       const { id } = req.body || {};

@@ -15,6 +15,7 @@ export {
   getAudit,
   setBaseline,
   approveTrade,
+  resumeArb,
   rejectTrade,
   approveAllTrades,
   onStateChange,

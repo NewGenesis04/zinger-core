@@ -330,6 +330,73 @@ async function verifyFilledShares(result, expectedShares, tolerance) {
 }
 
 /**
+ * The dollars, price and share count this module will commit to for a plan.
+ *
+ * Exported because item 80's reconciler has to ask "how many shares should be
+ * in the wallet?" at a call site that never saw these numbers —
+ * `placeMarketBuy` threw before returning them. Re-deriving them there would
+ * fork the arithmetic the order is signed against (`getMarketOrderRawAmounts`
+ * commits `rawTakerAmt = rawMakerAmt / rawPrice`), and a fork that drifts by a
+ * tick makes the reconciler compare the venue's answer to a number the venue
+ * never used. One owner, two readers.
+ */
+export function expectedSharesFor({ amountUsd, maxPrice, tickSize = '0.01', minShares = 5, shareTolerance = 0.05 }) {
+  const px = roundPrice(Number(maxPrice), Number(tickSize));
+  if (!(px > 0)) return null;
+  const amount = Math.round(Math.max(Number(amountUsd) || 0, Number(minShares) * px) * 100) / 100;
+  if (!(amount > 0)) return null;
+  const expectedShares = Number((amount / px).toFixed(2));
+  return {
+    price: px,
+    amountUsd: amount,
+    expectedShares,
+    tolerance: Math.max(Number(shareTolerance) || 0, expectedShares * 0.02),
+  };
+}
+
+/**
+ * Tri-state: how many shares did this order match, per the venue's own record?
+ *
+ * Deliberately NOT `verifyFilledShares` above. That contract is "null means
+ * unknown, never zero" (:311), which is right for the fill path — there a zero
+ * reading is indistinguishable from one it could not scale, and calling it zero
+ * abandons a filled leg.
+ *
+ * Reconciliation needs the opposite resolution. `size_matched: 0` on an order
+ * the venue acknowledges is evidence, not absence: a FOK matches in full or is
+ * killed, so an acknowledged order with nothing matched IS the kill. Refusing
+ * to read it would leave every clean kill stuck in UNKNOWN, and UNKNOWN halts
+ * the engine — the bot would stop itself every time an order was correctly
+ * rejected. So this returns a number (0 included) when the venue answered, and
+ * null only when it did not.
+ *
+ * The caller supplies the band because the acceptable range is one-sided; see
+ * `arbReconcile.ts:shareBand`.
+ */
+export async function getOrderMatchedShares(orderId, band) {
+  if (!orderId) return null;
+  try {
+    const client = await getProxyTradingClient();
+    const open = await captureClobCall(
+      'reconcileArbLeg/getOrder',
+      { orderId: String(orderId), band },
+      () => client.getOrder(String(orderId)),
+    );
+    if (open == null) return null;
+    const raw = Number(open?.size_matched);
+    if (!Number.isFinite(raw) || raw < 0) return null;
+    if (raw === 0) return 0;
+    // Scale resolution inline rather than imported from `arbReconcile`, which
+    // imports this module — the band is already a plain pair of numbers, so the
+    // circular dependency would buy nothing.
+    const fits = [raw, raw / SHARE_SCALE].filter((c) => c >= band.lo && c <= band.hi);
+    return fits.length === 1 ? fits[0] : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Fill-or-kill buy at a bounded price, for arbitrage entry legs.
  *
  * Why this exists: `placeOrder` posts a GTC limit order. If the ask ticks up

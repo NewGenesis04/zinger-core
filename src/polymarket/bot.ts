@@ -48,7 +48,11 @@ import {
   resetPackages,
 } from './arbEngine.js';
 import { persist, persistSync, load, FILES, dataPath } from './persistence.js';
-import { placeOrder, placeMarketBuy, placeMarketSell, sellFloor, cancelOrder, syncClobBalance } from './trade.js';
+import { placeOrder, placeMarketBuy, placeMarketSell, sellFloor, cancelOrder, syncClobBalance, expectedSharesFor } from './trade.js';
+import {
+  reconcileArbLeg, haltArb, isArbHalted, arbHaltState, clearArbHalt,
+  fetchWalletPositions, findUnrecordedHoldings, markOrderInFlight, clearInFlight,
+} from './arbReconcile.js';
 import { checkReadiness, invalidateBalanceCache, applyBalanceDelta } from './readiness.js';
 import { resolveDynamicLimits, setKellyTradeHistory, getKellyStats, buildDynamicPlan, checkTrailingStop, checkPartialProfit, resolveAdaptiveSl } from './kelly.js';
 import {
@@ -562,8 +566,89 @@ function repairPaperOverdraft(reason = 'overdraft repair') {
  * `syncPackageSettlements` had exactly one caller and it was a read path with
  * no timer behind it, so an unattended bot never settled a package at all.
  */
+
+/**
+ * Sell back any wallet holding the bot has no record of — item 80's backstop.
+ *
+ * Reconciliation runs once, in a 4.5-second window, and any window can be
+ * raced. This cannot be: it re-reads ground truth on a schedule, so a fill that
+ * appears after reconciliation gave up is found on the next pass rather than
+ * never. That is the 2026-09-11 failure exactly — the leg landed 1.4s after the
+ * engine had already walked away, and nothing in this process ever looked again.
+ *
+ * Live mode only, and throttled well below the 250ms scan cadence: this is a
+ * safety net, not a hot path, and `/positions` is a network call.
+ */
+const SWEEP_INTERVAL_MS = Number(process.env.ARB_SWEEP_INTERVAL_MS) || 30_000;
+const SWEEP_GRACE_MS = Number(process.env.ARB_SWEEP_GRACE_MS) || 10_000;
+let _lastSweepAt = 0;
+
+async function sweepUnrecordedHoldings(reason = 'scan') {
+  const cfg = botState.config;
+  if (cfg.mode !== 'live') return { swept: 0, skipped: 'paper' };
+  const wallet = botState.readiness?.depositWallet;
+  if (!wallet) return { swept: 0, skipped: 'no deposit wallet' };
+  const now = Date.now();
+  if (now - _lastSweepAt < SWEEP_INTERVAL_MS) return { swept: 0, skipped: 'throttled' };
+  _lastSweepAt = now;
+
+  const rows = await fetchWalletPositions(wallet);
+  // null means the endpoint declined to answer. Absence of evidence is not
+  // evidence of absence here any more than it is inside the reconciler.
+  if (rows == null) return { swept: 0, skipped: 'positions unavailable' };
+
+  const unrecorded = findUnrecordedHoldings({
+    walletRows: rows,
+    botPositions: botState.positions,
+    graceMs: SWEEP_GRACE_MS,
+    now,
+  });
+  if (!unrecorded.length) return { swept: 0 };
+
+  let swept = 0;
+  for (const row of unrecorded) {
+    const tokenId = String(row.asset);
+    const shares = Number(row.size);
+    const price = Number(row.curPrice ?? row.avgPrice ?? 0);
+    const label = `${row.slug || row.title || tokenId.slice(0, 10)} ${String(row.outcome || '').toUpperCase()}`;
+
+    // Without a price there is no floor to bound the sell, and an unbounded
+    // market sell of an unknown token can give the book away. Report and halt
+    // instead — an unsellable unaccounted position is exactly the condition a
+    // human should see.
+    if (!(price > 0)) {
+      haltArb('unpriceable_unrecorded_holding', { tokenId, shares, slug: row.slug || null });
+      log(`🛑 UNACCOUNTED HOLDING ${label} · ${shares}sh — no price available to bound a sell. Arb halted for operator review.`, 'error', { tokenId, shares });
+      continue;
+    }
+
+    try {
+      const flat = await placeMarketSell({
+        tokenId,
+        shares,
+        minPrice: sellFloor(price, { tickSize: '0.01' }),
+        negRisk: false,
+        tickSize: '0.01',
+      });
+      swept += 1;
+      log(`🧹 SWEPT UNACCOUNTED HOLDING ${label} · ${shares}sh @ ~$${price.toFixed(3)} sold back to cash (order: ${flat?.id || 'ok'}) — the bot had no record of this position`, 'sl', {
+        tokenId, shares, price, reason,
+      });
+      syncClobBalance().then(refreshTelemetry).catch(() => {});
+    } catch (sellErr) {
+      // A rejected sell is the harmless half of the asymmetry, but an
+      // unaccounted balance that will not sell is not something to keep retrying
+      // silently every thirty seconds.
+      log(`⚠️ UNACCOUNTED HOLDING ${label} · ${shares}sh — sell rejected: ${String(sellErr?.message || sellErr).slice(0, 120)}`, 'error', { tokenId, shares });
+    }
+  }
+  return { swept };
+}
+
 async function arbHousekeeping(reason = 'scan') {
   const mode = botState.config.mode || 'paper';
+  // Item 80 backstop. Throttled internally, never throws into housekeeping.
+  await sweepUnrecordedHoldings(reason).catch(() => {});
   try {
     const settled = syncPackageSettlements(botState.trades, mode);
 
@@ -1005,6 +1090,10 @@ async function executePendingTrade(pending) {
       // engine hedge against a leg that never filled (the 2026-08-28 -$12.83
       // orphan). Directional entries keep the limit path deliberately: they are
       // single-sided, so a resting bid is a missed trade, not a naked position.
+      // The sweep must never mistake a fill still being written into
+      // `botState.positions` for an unaccounted holding. Marked before the
+      // order leaves, cleared once the position exists or the leg is resolved.
+      markOrderInFlight(pending.tokenId);
       const orderResult = plan.isArbLeg
         ? await placeMarketBuy({
           tokenId: pending.tokenId,
@@ -1074,35 +1163,129 @@ async function executePendingTrade(pending) {
     } catch (err) {
       pending.status = 'failed';
       botState._buyLocks.delete(pending.slug);
-      // An accepted-but-unverifiable arb fill is the one error we cannot simply
-      // report and walk away from — the shares may already be in the wallet, and
-      // no position row exists yet for the rollback path to find. Flatten on the
-      // spot. The payoff is asymmetric: selling shares we do not hold is
-      // rejected harmlessly, while not selling shares we do hold expires them at
-      // zero. Scoped to arb legs so it can never touch a directional position.
-      if (err?.code === 'UNVERIFIED_FILL' && plan.isArbLeg && err.expectedShares > 0) {
-        try {
-          const flat = await placeMarketSell({
-            tokenId: err.tokenId,
-            shares: err.expectedShares,
-            minPrice: sellFloor(entryPx, { tickSize: pending.tickSize || '0.01' }),
-            negRisk: pending.negRisk,
-            tickSize: pending.tickSize || '0.01',
-          });
-          log(`🩹 UNVERIFIED FILL FLATTENED ${pending.symbol} ${pending.outcome.toUpperCase()} · ${err.expectedShares}sh (order: ${flat?.id || 'ok'})`, 'sl', {
-            market: pending.symbol, slug: pending.slug, outcome: pending.outcome,
-            orderId: err.orderId, shares: err.expectedShares,
-          });
-        } catch (flatErr) {
-          log(`⚠️ UNVERIFIED FILL — FLATTEN REJECTED ${pending.symbol} ${pending.outcome.toUpperCase()} (likely never filled): ${String(flatErr?.message || flatErr).slice(0, 120)}`, 'error', {
-            market: pending.symbol, slug: pending.slug, outcome: pending.outcome, orderId: err.orderId,
-          });
+
+      /**
+       * Item 80 — never report a live arb leg as failed without asking the venue.
+       *
+       * What used to be here was a defensive flatten, and it was right about the
+       * asymmetry (selling shares we do not hold is rejected harmlessly; not
+       * selling shares we do hold expires them at zero). What it got wrong was
+       * timing. On 2026-09-11 it fired ~1.5s after the order was signed, the
+       * chain matched at +2.9s, and the sell was rejected for shares that did
+       * not exist yet — then logged "likely never filled" about a leg that was
+       * about to fill. The package aborted, and 4.682223 UP shares sat naked for
+       * 8.2 minutes with no record anywhere in this process.
+       *
+       * So the flatten stays, but it is now the LAST resort rather than the
+       * first move, and it runs after a window long enough for the venue to
+       * have made up its mind.
+       */
+      const reconcilable = plan.isArbLeg && cfg.mode === 'live' && pending.tokenId;
+      const quote = reconcilable
+        ? expectedSharesFor({
+          amountUsd: plan.sizeUsd,
+          maxPrice: entryPx,
+          tickSize: pending.tickSize || '0.01',
+          minShares: pending.minShares || 5,
+        })
+        : null;
+
+      const recon = quote
+        ? await reconcileArbLeg({
+          // Present on UNVERIFIED_FILL (Door B), absent when the transport
+          // dropped before any response came back (Door A only).
+          orderId: err?.orderId || null,
+          tokenId: pending.tokenId,
+          depositWallet: botState.readiness?.depositWallet || null,
+          expectedShares: quote.expectedShares,
+          price: quote.price,
+          tickSize: Number(pending.tickSize || 0.01),
+          tolerance: quote.tolerance,
+          log: (m) => log(m, 'info', { market: pending.symbol, slug: pending.slug }),
+        })
+        : { outcome: 'skipped', shares: null, door: null, probes: [] };
+
+      if (recon.outcome === 'filled') {
+        // The leg is real. Book it and fall through to the common tail, which
+        // pushes the position and returns { ok: true } — so `arbEngine.ts:635`
+        // sizes leg 2 against the shares the venue confirmed, not the plan.
+        pos.orderId = err?.orderId || null;
+        pos.shares = recon.shares;
+        pos.entryPrice = entryPx;   // the limit, not the fill — see below
+        pos.unverifiedFill = true;
+        pos.reconciledFill = { door: recon.door, probes: recon.probes.length, at: Date.now() };
+        markPosition(pos, entryPx);
+        // Entry price is the worst-case bound rather than the achieved price,
+        // which reconciliation does not return. Any price improvement therefore
+        // reads as a slightly overstated cost until `syncLiveAccount` trues it
+        // up — an error in the direction that cannot cause overspending.
+        applyLiveCashDelta(-Number(pos.costBasis || 0), `BUY(reconciled) ${pending.symbol} ${pending.outcome?.toUpperCase()}`);
+        syncClobBalance().then(refreshTelemetry).catch(() => {});
+        log(`🧾 RECONCILED FILL ${pending.symbol} ${pending.outcome.toUpperCase()} · ${recon.shares}sh via ${recon.door} after ${recon.probes.length} probe(s) — leg was live despite: ${String(err?.message || err).slice(0, 90)}`, 'buy', {
+          market: pending.symbol, slug: pending.slug, outcome: pending.outcome,
+          orderId: pos.orderId, shares: recon.shares, door: recon.door, price: entryPx,
+        });
+        traceLiveFill({
+          type: 'bot_entry',
+          message: `RECONCILED BUY ${pending.symbol} ${pending.outcome.toUpperCase()} · ${recon.shares}sh @ <=${entryPx}`,
+          slug: pending.slug, outcome: pending.outcome, side: 'BUY',
+          shares: recon.shares, price: entryPx, usdc: quote.amountUsd,
+          orderId: pos.orderId, verifiedSell: false,
+        });
+        syncLiveAccount({ botTrades: botState.trades, note: 'live_buy_reconciled' }).catch(() => {});
+        // No return: the tail below owns position bookkeeping.
+      } else {
+        if (recon.outcome === 'unknown') {
+          // Unresolved. Sell what may be there either way — the payoff is still
+          // asymmetric, and a rejected sell costs nothing.
+          //
+          // Halting, though, is reserved for `blind`: not one door answered at
+          // any probe. An earlier version halted on every unresolved leg, which
+          // meant an ordinary blip on the order POST stopped arbitrage outright
+          // — the common failure, and the least dangerous one. What makes the
+          // softer line safe is `sweepUnrecordedHoldings` below: a fill that
+          // shows up after this window closes is found and unwound within a
+          // sweep interval, so an abort here is recoverable rather than final.
+          try {
+            const flat = await placeMarketSell({
+              tokenId: pending.tokenId,
+              shares: quote.expectedShares,
+              minPrice: sellFloor(entryPx, { tickSize: pending.tickSize || '0.01' }),
+              negRisk: pending.negRisk,
+              tickSize: pending.tickSize || '0.01',
+            });
+            log(`🩹 BLIND LEG FLATTENED ${pending.symbol} ${pending.outcome.toUpperCase()} · ${quote.expectedShares}sh (order: ${flat?.id || 'ok'})`, 'sl', {
+              market: pending.symbol, slug: pending.slug, outcome: pending.outcome,
+              orderId: err?.orderId || null, shares: quote.expectedShares,
+            });
+          } catch (flatErr) {
+            log(`⚠️ BLIND LEG — FLATTEN REJECTED ${pending.symbol} ${pending.outcome.toUpperCase()}: ${String(flatErr?.message || flatErr).slice(0, 120)}`, 'error', {
+              market: pending.symbol, slug: pending.slug, outcome: pending.outcome, orderId: err?.orderId || null,
+            });
+          }
+          if (recon.blind) {
+            haltArb('reconcile_blind', {
+              slug: pending.slug, symbol: pending.symbol, outcome: pending.outcome,
+              orderId: err?.orderId || null, tokenId: pending.tokenId,
+              expectedShares: quote.expectedShares, probes: recon.probes,
+              error: String(err?.message || err).slice(0, 200),
+            });
+            log(`🛑 ARB HALTED — nothing answered about the leg on ${pending.slug} across ${recon.probes.length} probe(s). No new packages until an operator clears it.`, 'error', {
+              market: pending.symbol, slug: pending.slug, outcome: pending.outcome,
+            });
+          } else {
+            log(`⚠️ LEG UNRESOLVED ${pending.symbol} ${pending.outcome.toUpperCase()} on ${pending.slug} — aborting the package; the wallet sweep will catch it if it fills late.`, 'error', {
+              market: pending.symbol, slug: pending.slug, outcome: pending.outcome,
+              orderId: err?.orderId || null, probes: recon.probes,
+            });
+          }
         }
+        log(`❌ LIVE BUY FAILED ${pending.symbol}: ${err.message.slice(0, 160)}${recon.outcome === 'unfilled' ? ' · confirmed unfilled by venue' : ''}`, 'error', {
+          market: pending.symbol, slug: pending.slug, outcome: pending.outcome,
+          reconcile: recon.outcome,
+        });
+        return { ok: false, error: err.message };
       }
-      log(`❌ LIVE BUY FAILED ${pending.symbol}: ${err.message.slice(0, 160)}`, 'error', {
-        market: pending.symbol, slug: pending.slug, outcome: pending.outcome,
-      });
-      return { ok: false, error: err.message };
     }
   } else {
     markPosition(pos, entryPx);
@@ -1128,6 +1311,7 @@ async function executePendingTrade(pending) {
   }
 
   botState.positions.push(pos);
+  clearInFlight(pending.tokenId);
   botState.stats.signalsToday = (botState.stats.signalsToday || 0) + 1;
   pending.status = 'executed';
   pending.executedAt = Date.now();
@@ -1135,6 +1319,21 @@ async function executePendingTrade(pending) {
   botState.pendingTrades = botState.pendingTrades.filter((p) => p.id !== pending.id);
   saveState();
   return { ok: true, position: pos };
+}
+
+/**
+ * Operator clears an item 80 halt.
+ *
+ * Deliberately a distinct action rather than a side effect of toggling arb off
+ * and on: the halt records a leg whose fate is unknown, and clearing it is an
+ * assertion that someone looked. The returned record is what they should have
+ * looked at.
+ */
+export function resumeArb() {
+  const cleared = clearArbHalt();
+  if (!cleared) return { ok: true, cleared: null, note: 'Arb was not halted.' };
+  log(`▶️ ARB HALT CLEARED — was: ${cleared.reason} on ${cleared.detail?.slug || 'unknown slug'}`, 'system', cleared.detail || null);
+  return { ok: true, cleared };
 }
 
 export async function approveTrade(id) {
@@ -1874,6 +2073,11 @@ export function getState(opts = {}) {
           maxPackages: maxArbPackages,
           full: openArbLegs >= maxArbPackages * 2,
           note: 'Arbitrage buys two sides per trade, so each package uses two of these.',
+          // Item 80. Non-null means the engine stopped itself because a leg's
+          // outcome could not be established, and it stays stopped until an
+          // operator clears it. Surfaced here because a silent halt is
+          // indistinguishable from a quiet market.
+          halt: arbHaltState(),
         },
       };
     })(),

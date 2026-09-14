@@ -7,6 +7,7 @@ import {
 } from './fees.js';
 import { executeCtfMerge } from './ctf/merge.js';
 import { emitEvent } from './telemetry/events.js';
+import { isArbHalted } from './arbReconcile.js';
 import type { ArbPackage } from './arbPersistence.js';
 
 export type { ArbPackage };
@@ -48,6 +49,14 @@ export async function detectAndExecuteArbPackage({
   botState,
 }) {
   if (cfg.clobArbEnabled === false) return null;
+  /**
+   * Item 80. A leg whose outcome could not be established either way halts the
+   * engine (`arbReconcile.ts:reconcileArbLeg`). Placed beside the config gate
+   * and deliberately silent per scan: the halt announces itself once, loudly,
+   * at the moment it is raised, and again on the dashboard. Re-emitting it on
+   * every book every 250ms would bury the decision log it exists to protect.
+   */
+  if (isArbHalted()) return null;
   // Never execute arb packages on markets where both legs could lose.
   if (!isComplementaryBinary(market)) return null;
 

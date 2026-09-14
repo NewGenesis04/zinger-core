@@ -3781,6 +3781,408 @@ fill → then this.
 
 ---
 
+### 78. The arb order is sized in shares and submitted in dollars, and the round trip does not close
+
+**Found 2026-09-11** in `docs/live_canary_packages.json` (21 live packages,
+2026-09-09 → 2026-09-11, all ABORTED, no leg ever filled).
+
+The sizing gate (item 73) computes a **share** count against a **share** depth
+ceiling. The order is then submitted as a **dollar** amount, and the exchange
+converts it back to shares at the signed price:
+
+```
+arbEngine.ts:238   shares   = floor(min(budgetShares, depthShares) * 1000)/1000
+arbEngine.ts:276   costUp   = Math.round(shares * upAsk * 100) / 100    ← to NEAREST cent
+arbEngine.ts:597   plan.sizeUsd = cost
+bot.ts:1011        placeMarketBuy({ amountUsd: plan.sizeUsd, maxPrice: entryPx })
+trade.ts:364       amount   = Math.round(max(amountUsd, minShares*px) * 100)/100
+                   → SDK: rawTakerAmt = rawMakerAmt / rawPrice   (shares demanded)
+```
+
+The last step is confirmed against vendored SDK source in
+`research/polymarket-domain-facts.md` §7: for a BUY, `getMarketOrderRawAmounts`
+sets `rawTakerAmt = rawMakerAmt / rawPrice`, and both are `parseUnits(…, 6)`
+into the signed order — **the share count is cryptographically committed to
+`amount / price`, not to the number the sizing gate computed.**
+
+`Math.round` at `:276` is round-to-*nearest*, so the committed share count lands
+either side of the planned one. Measured across all 21 packages:
+
+| | packages | worst case |
+|---|---|---|
+| demanded **more** shares than planned | 14 | +0.0950 (2026-09-10 00:53) |
+| demanded **exactly** the planned count | 1 | 0 |
+| demanded **fewer** shares than planned | 6 | −0.0059 |
+
+Worked example, the 2026-09-11 06:27 BTC package: `shares 4.500 × $0.59 =
+$2.655`, rounded to `$2.66`, committed as `2.66 / 0.59 = 4.5085` shares. If that
+package was depth-bound at 4.500 the book was 0.0085 shares short and the FOK
+had to die.
+
+**The defect is the unit change, not the rounding.** Flooring the cents would
+bias the error one way; it would not make the submitted share count equal the
+computed one, because a 2-decimal dollar amount divided by a 2-decimal price is
+not generally a 3-decimal share count. The structural fix is to stop round
+tripping — submit the arb leg by share count against a limit FOK, so the number
+the depth gate computed is the number that reaches the book. That is an
+execution-path change, so it belongs to whoever owns order routing, not to a
+patch at `:276`.
+
+**Do not treat this as the explanation for the canary failures — see item 79.**
+
+---
+
+### 79. Every live arb leg has been FOK-killed across two code versions, and nothing in the repo explains why
+
+**Found 2026-09-11.** `docs/live_canary_packages.json`: **21 packages, 21
+aborted, zero legs filled, zero orphans, zero capital moved.** Two distinct eras
+in one file:
+
+| Era | n | `abortReason` | Notes |
+|---|---|---|---|
+| 09-09 19:59 → 09-10 01:05 | 14 | `UP=FAIL, DOWN=FAIL` | pre-item-73 label |
+| 09-11 00:59 → 09-11 06:27 | 7 | `UP=FAIL, DOWN=NOT_ATTEMPTED` | item 73 labelling live |
+
+Item 73's sequencing holds: **no leg has ever filled, so no orphan has ever been
+created.** `legs.up.filled` and `legs.down.filled` are `false` on all 21.
+
+**Why item 78 is not the answer.** The dollar round trip can only kill an order
+that demands *more* shares than the book holds. It does not fit the data:
+
+- **6 of 21 demanded fewer shares than planned** and still died — including
+  **2026-09-11 01:38 BTC**, which planned 5.263 shares, committed 5.2571, and
+  was *budget*-bound (`totalCost` exactly $5.00, so the depth ceiling was not
+  binding and the book had slack above the order). An order asking for less than
+  planned, against a book with room, was still killed.
+- **2026-09-11 04:20 ETH** committed exactly 4.5000 shares — zero excess — and
+  died.
+- Failures span both code versions, both symbols, both bound types, and three
+  days.
+
+That is a systematic failure, not a sizing-precision race. Item 78 explains at
+most 14 of 21 and at most 5 of the recent 7.
+
+**What is NOT yet known, and must not be guessed:**
+
+1. Whether the item 76 depth clamp was deployed during the 09-11 run. It is
+   committed (`a151ffe`) but the VPS runs its own checkout. If it *was* live,
+   the depth-bound orders carried a 10% cushion — 0.5 shares on a 5-share
+   level — which dwarfs the ~0.01-share round-trip error and rules item 78 out
+   entirely for those. **One `git log -1` on the VPS settles this and nothing in
+   this repo can.**
+2. The exchange's error string per attempt. All 21 records carry the same
+   generic `Leg execution mismatch`; the CLOB's actual response lives in the
+   receipt capture (`captureClobCall`, `trade.ts:371`), which is not in this
+   export. At least two *different* rejections are known to be mixed into these
+   21 — the $0.38 and $0.21 packages (09-09 21:37, 09-10 00:53) are the
+   `invalid amount for a marketable BUY order … min size: 1` rejections that
+   settled the $1.00 notional fact, **not** FOK kills. The abort reason hides
+   the distinction.
+3. Book age at submission. The size is computed from a WS snapshot and the order
+   crosses a metered Webshare proxy before reaching the matching engine. Nothing
+   records the interval between the book read and the order landing, so
+   "the level was gone" is currently unfalsifiable.
+
+**Prior art against a structural block:** the 2026-08-27/28 canary *did* fill a
+hedged pair (`docs/live-canary-forensic-audit.md`, Episode 2: 27 UP @ $0.58 +
+27 DN @ $0.21, +$5.56 net). Fills are possible on this account. Whatever changed
+since is in the order path, not in the venue.
+
+**Next step is instrumentation, not another fix.** The receipt capture already
+exists; item 75's sink now persists `restingShares`/`depthShares` per decision.
+Add the exchange's raw error and a book-age stamp to the package record so the
+next attempt produces a diagnosis instead of a fourth theory.
+
+> **SUPERSEDED IN PART, 2026-09-11 — see item 80.** The premise above ("zero
+> legs filled") is **false**. On-chain activity shows the 03:38 package's UP leg
+> *did* fill, 1.4 seconds after the bot had already aborted it. The question is
+> not why nothing filled; it is how many of these 21 "failures" were real.
+
+> **Narrowed, 2026-09-14.** The reconciliation the supersede note calls for has
+> now been done, against the corrected chronology. **Exactly one of the 21
+> filled.** The wallet's full on-chain history for the canary period is eight
+> rows; between 2026-08-28 08:46 and 2026-09-11 03:38 there is nothing at all.
+> So "how many of these 21 failures were real" has an answer: **20 of them.**
+>
+> The mechanism behind the one that was not real is item 81 — the fill came in
+> 0.0004 shares outside a symmetric verification band, was thrown as
+> `UNVERIFIED_FILL`, and the defensive flatten that followed raced the match and
+> lost (item 80).
+>
+> **Item 81 cannot explain the other 20.** If they had filled and been flattened
+> successfully, each flatten would appear on-chain as a sell. None do. Those 20
+> legs genuinely never matched.
+>
+> **So item 79 stays open, and is now sharper rather than broader:** 20 live FOK
+> buys, across two code versions, against books that REST showed were deep
+> enough, matched nothing — and the repo still records no venue error string for
+> any of them. That is what the raw-error and book-age instrumentation in this
+> item is for, and it remains the only way to find out.
+>
+> **Sequencing note.** Item 78 (submit in shares rather than dollars) would
+> dissolve item 81 rather than fix it: an order that specifies a share count has
+> no dollars→shares round trip to verify, so the tolerance band has nothing to
+> do. Worth resolving 78 before spending effort on 81.
+
+---
+
+### 80. GHOST FILL — the bot abandoned a leg that then filled on-chain, and held a naked position it had no record of ✅ FIXED
+
+**Found 2026-09-11** by reconciling `docs/live_canary_packages.json` against the
+Polymarket public activity API for the Safe wallet. **This is the most serious
+finding in this document. Live arb must not run until it is addressed.**
+
+**The package record and the chain disagree about whether money moved.**
+
+```
+03:38:24.114  package pkg-btc-mtwep5v2 created   btc-updown-15m-1789097400
+                                                  UP $1.24 @ maxPrice 0.27
+03:38:25.612  package ABORTED
+                abortReason  "Leg execution mismatch: UP=FAIL, DOWN=NOT_ATTEMPTED"
+                legs.up.filled = false     legs.up.shares = 0
+03:38:27      ON-CHAIN BUY  4.682223 sh @ 0.26483147   ← 1.388 s AFTER the abort
+03:46:39      ON-CHAIN REDEEM  4.682223 sh → $4.682223  (8.2 min unhedged)
+```
+
+**The identification is not circumstantial.** Same `slug`
+(`btc-updown-15m-1789097400`), same side (`outcomeIndex: 0`, "Up"), three
+seconds apart, and the money reconciles exactly:
+
+| | |
+|---|---|
+| `size × price` = 4.682223 × 0.26483147 | **$1.24000** — the package's `upCost` to the cent |
+| taker fee, `0.07 × p(1−p) × shares` | $0.06381 |
+| sum | **$1.30381** — the reported `usdcSize` exactly |
+| redeem − spend | **+$3.3784** — the $275.16 → $278.54 balance delta exactly |
+
+**What actually happened.** The bot submitted the UP leg, concluded within 1.5
+seconds that it had failed, aborted the package, and never attempted DOWN. The
+order then matched. The result was a **4.682223-share naked directional
+position, unhedged and absent from the local ledger, held for eight minutes to
+settlement.** It won. Had BTC resolved DOWN it would have been −$1.30 against a
+package whose entire purpose was a $0.27 locked profit.
+
+**It also cuts against item 78.** The order was sized at 4.581 shares and filled
+**4.682223** — *more* than planned, because the book was at $0.2648 against a
+`maxPrice` of $0.27 and a dollar-denominated buy converts the whole amount at
+the better price. So a market buy priced in dollars fills, and benefits from
+price improvement; the round-trip precision loss is real but is demonstrably not
+a blocker on its own. (The over-fill is handled: leg two is sized from
+`res.position.shares`, `arbEngine.ts:635`, not from the plan — item 27.)
+
+**This falsifies three standing claims:**
+
+1. **"Zero orphans."** There was an orphan. It is the exact shape item 74(a)
+   describes, reached by a different route — not a hedge that broke, but a leg
+   the bot does not know it owns.
+2. **Item 79's premise.** At least one of the 21 "failures" was a fill. The
+   balance delta matches this trade alone, so probably only one — but *probably*
+   is doing real work in that sentence and only a full activity-API
+   reconciliation can replace it.
+3. **"Nothing has ever been redeemed"** (handoff §6, never-validated list). This
+   redemption is the first confirmed on-chain settlement: auto-redeem paid
+   4.682223 shares → $4.682223, **fee-free and exactly 1:1**, which is the
+   `$1.00`-per-set invariant holding against the chain.
+
+**Bonus: the fee model is now validated against on-chain data.** `usdcSize`
+carries the taker fee *on top of* notional, and the repo's
+`0.07 × p(1−p) × shares` reproduces it to five decimal places. Two consequences:
+`FEE_RATES.crypto = {r:0.07, e:1}` is confirmed live, and **the affordability
+gate is understated** — `arbEngine.ts:294` tests `arbBank < totalCost + 0.01`
+where `totalCost` is notional only, but the true debit is notional + fees
+(`feesEstUsd` is computed at `:368` and not used in the check).
+
+**Where the defect lives.** `arbEngine.ts:631`:
+
+```js
+const res = await executeTrade(pending);
+if (res?.ok !== true) return 0;      // ← "not ok" is treated as "zero shares"
+```
+
+A refusal, an HTTP error and a timeout are all collapsed into "nothing filled".
+That is sound for a refusal and **wrong for the other two**: a POST that errors
+or times out may still have reached the matching engine. The previous session
+recorded this exact hazard as a standing constraint — *"never set
+`axios.defaults.timeout`; a timed-out order POST may have reached the book"* —
+and the failure arrived through the same door anyway, because nothing
+*confirms* the negative.
+
+**The fix is not a longer timeout.** An order's outcome is a fact about the
+exchange, not about our HTTP call. Before a package may be declared unfilled,
+the leg's true state has to be read back — order status by `orderID`, or
+positions for that `tokenId` — and a leg whose state cannot be established is
+not "failed", it is **unknown**, which is a different and more dangerous
+condition requiring an explicit reconcile-then-hedge-or-unwind path. That is an
+execution-path ownership question (D4 position manager territory) and needs a
+design decision, not a patch.
+
+**Immediate operational consequence:** the ledger cannot currently be trusted to
+say whether the bot owns a position. Reconcile local positions against the
+activity API for the whole canary period before any further live run.
+
+---
+
+**RESOLVED 2026-09-14** — `src/polymarket/arbReconcile.ts`, wired at
+`bot.ts:1074`, gated at `arbEngine.ts:51`, 13 invariant tests in
+`tests/unit/arbReconcile.test.ts`, 9 mutations killed. See the addendum below;
+the root cause turned out not to be the one described above.
+
+**Plain-English write-up:** `docs/ghost-fill-and-reconciliation.md` — the
+narrative version of this item, the amendment below, and items 81/82.
+
+**Addendum — what actually happened, found while building the fix.**
+
+The diagnosis above assumed the leg took the generic `{ ok: false }` path. It
+did not. It took the `UNVERIFIED_FILL` path, and the defensive flatten at
+`bot.ts:1083` *fired* — it just lost a race it could not have won.
+
+```
+expectedShares = 1.24 / 0.27          = 4.59
+tolerance      = max(0.05, 4.59×0.02) = 0.09180
+actual fill                           = 4.682223
+|actual − expected|                   = 0.09222   ← over by 0.0004 shares
+```
+
+`resolveAgainstExpected` (`trade.ts:290`) therefore returned null,
+`placeMarketBuy` threw `UNVERIFIED_FILL`, and the flatten submitted a sell at
+~03:38:25.6 — **1.4 s before the venue matched the buy at 03:38:27**. It sold
+shares that did not exist yet, was rejected, and logged *"likely never filled"*
+about a leg that was about to fill.
+
+So the machinery was not missing. It was early, and it was reading a band that
+could not contain the fill. Both are fixed here: reconciliation probes at
+0 / 2250 / 4500 ms so the last probe clears the observed 2.9 s settle latency,
+and the band is one-sided (see item 81).
+
+**Design as built.** Two doors, because the two failure shapes leave different
+evidence: the venue's own record of our order (`getOrder(id).size_matched`,
+exact but needs an orderID) and the wallet's token balance (uncached data-api
+`/positions`, works when the transport dropped before any orderID came back).
+Three answers:
+
+| outcome | requires | action |
+|---|---|---|
+| `filled` | either door reports shares | book the position, `{ ok: true }`, `arbEngine.ts:635` hedges leg 2 against the confirmed count |
+| `unfilled` | **only** `size_matched: 0` on the final probe | clean abort, unchanged behaviour |
+| `unknown` | neither door answered | defensive flatten, then halt the engine |
+
+**Wallet silence never resolves to `unfilled`.** A wallet that has not indexed
+the fill is indistinguishable from a wallet with nothing to index, and guessing
+between them is precisely what produced the ghost. Only the venue speaking about
+our own order id is evidence of a kill.
+
+**Stated consequence:** a transport failure that returns no orderID can never
+resolve to `unfilled`, so it always halts. That is intended — without an order
+id nothing in the world can say "your order did not reach the book" — but it
+means proxy instability now stops the arb engine rather than silently retrying.
+Cleared by an operator via `POST /api/poly/arb/resume`; state visible at
+`getState().limits.arb.halt`. Paper mode is untouched (the path is gated on
+`cfg.mode === 'live'`).
+
+---
+
+**Amended 2026-09-14 (same day), after operator review.** The first cut halted
+arbitrage on *any* unresolved leg. The operator's objection was correct and the
+design was too blunt: the commonest failure — a blip on the order POST where
+nothing filled — is also the least dangerous one, and stopping the engine for it
+trades a rare risk for a frequent outage.
+
+Two changes:
+
+**1. `unfilled` now has a second qualifying condition.** Door A answering on
+*every* probe, each time reporting no shares, resolves to a clean abort. Not one
+answer — every one, across a window that outlasts the observed settle latency.
+Wallet *silence* still never qualifies: a request that failed has told us
+nothing, and the distinction between "answered nothing" and "did not answer" is
+made in exactly one place (`arbReconcile.ts:fetchWalletPositions`, on `res.ok`).
+Only `blind` — no door answered at any probe — halts.
+
+**2. The sweep, which is what makes that safe.** Reconciliation is a 4.5-second
+window and any window can be raced. `findUnrecordedHoldings` +
+`sweepUnrecordedHoldings` (`bot.ts`, called from `arbHousekeeping`, throttled to
+30s, live mode only) re-read the wallet against `botState.positions` on a
+schedule. A holding no position claims is sold back to cash. A fill that appears
+after reconciliation gave up — the exact 2026-09-11 shape — is therefore caught
+on the next pass rather than never.
+
+**This gap had no backstop at all before now.** The pre-existing orphan sweep
+(`arbEngine.ts:825`) iterates `botState.positions`, so it can only find legs the
+bot already recorded; a ghost fill is by definition one it did not. Nothing in
+the repo compared wallet ground truth against bot records.
+
+Sweep guards, each pinned by a test: a 10s grace window keyed on order
+submission (`markOrderInFlight`) so a fill still being written into
+`botState.positions` is never swept out from under itself; resolved-worthless
+tokens skipped (item 68 — they sit in the feed with size > 0 and value $0, and
+there is nothing to sell); tokens referenced by any bot position, open *or
+closed*, left alone; an unavailable feed treated as no information rather than
+as an empty wallet. A holding with no usable price is not sold at all — it
+halts for operator review, because an unbounded market sell of an unknown token
+can give the book away.
+
+Halt scope, stated precisely because the first write-up was vague about it: the
+flag is read at `arbEngine.ts:51` only. It blocks opening new arb packages
+across all symbols and windows. Directional trading, exits, settlement,
+redemption and paper mode are unaffected — except in arb-only mode, where the
+directional pipeline is skipped anyway (`bot.ts:2707`) and a halt therefore does
+mean nothing new opens.
+
+Tests: 27 invariants in `tests/unit/arbReconcile.test.ts`. 20 mutations applied,
+20 killed. One mutation initially survived — Door A returning `[]` instead of
+`null` on a non-200, which would have made three dead responses resolve to
+`unfilled` and reintroduced silent abandonment. Every reconciler test injects
+`getWalletShares`, so none of them reached that boundary; five tests were added
+for the HTTP contract itself.
+
+---
+
+### 81. `verifyFilledShares` uses a symmetric tolerance for a one-sided quantity
+
+**Found 2026-09-14** while building item 80. This is the root cause behind the
+ghost fill, and it is still live on the fill path.
+
+`placeMarketBuy` commits a fixed dollar `amount` at a limit `px`, so the share
+count is `amount / fillPrice` where `fillPrice ≤ px`. The fill can therefore only
+ever come in **at or above** `expectedShares = amount / px` — FOK does not
+partially fill, and price improvement only adds shares. The verification band at
+`trade.ts:293` is symmetric:
+
+```js
+const fits = [raw, raw / SHARE_SCALE].filter((c) => Math.abs(c - expectedShares) <= tolerance);
+```
+
+with `tolerance = max(0.05, expectedShares * 0.02)` (`trade.ts:369`). A fill
+better than 2% of the limit price falls outside it and is reported as
+unverifiable. At $0.27 against a $0.01 tick the achievable improvement reaches
+27×; 2% is consumed by a single sub-tick of price improvement.
+
+**Evidence it is not theoretical:** the 2026-09-11 fill (4.682223 against 4.59
+expected) missed the band by 0.0004 shares and was thrown as `UNVERIFIED_FILL`.
+
+The correct ceiling is what the venue could actually have done — every share
+filling a full tick better — which is what `arbReconcile.ts:shareBand`
+implements. Not applied to `trade.ts` inline because that is the live fill path
+and widening its acceptance band changes what gets booked as a confirmed fill;
+it wants its own decision. **Until it is fixed, every well-improved arb fill
+will keep routing through reconciliation** — which is now correct, but slower
+and noisier than it needs to be.
+
+---
+
+### 82. `data/clob_receipts.jsonl` on the VPS is still the unread primary source
+
+**Filed 2026-09-14.** The item 80 addendum reconstructs the 03:38:24–27 sequence
+from package JSON, the activity API and the verification arithmetic. It is
+consistent to five decimals but it is still a reconstruction. `captureReceipt`
+(`trade.ts:389`) wrote a `placeMarketBuy/verified` record for that call carrying
+`verificationOutcome`, `takingAmountRaw` and `statusString` — the three fields
+that would settle it outright.
+
+Local `data/` is not the running instance, and VPS measurements are the
+operator's to run. One `grep` on the 03:38 window closes this.
+
+---
+
 ## Handoff — state as of 2026-08-20
 
 Written so a fresh session can continue without re-deriving any of the above.
