@@ -16,6 +16,7 @@ import { chat, llmStatus } from './llm.js';
 import { loadFileOrStore, saveFileOrStore } from '../polymarket/sqliteStore.js';
 import { dataPath } from '../polymarket/dataDir.js';
 import { loadRegimeSignal } from '../polymarket/regimeSignal.js';
+import { lossCapStatus } from '../polymarket/lossCap.js';
 
 const GOV_FILE = dataPath('governor_state.json');
 
@@ -387,6 +388,38 @@ export async function runGovernor({
     const breakerPct = Number(config.governorDrawdownPct ?? DEFAULTS.drawdownBreakerPct);
     const modePeak = Number(_state.peakEquityByMode?.[mode] ?? 0);
     const dd = modePeak > 0 ? (modePeak - equity) / modePeak : 0;
+    /**
+     * Item 74b. The breaker's response to a drawdown is to force `arb-only`.
+     * If arb is what produced the drawdown, that aims the bot harder at the
+     * thing losing the money — a safety mechanism wired to the accelerator.
+     *
+     * While the loss cap is tripped, no new entries happen either way, so the
+     * profile switch is cosmetic *now*. The damage is later: the profile would
+     * still be `arb-only` when an operator clears the cap, so trading would
+     * resume pointed at arb without anyone choosing that. Leave the profile
+     * where it is and say so.
+     */
+    const brake = lossCapStatus({
+      trades,
+      mode,
+      capUsd: Number(config.maxDailyLossUsd ?? 0),
+    });
+    if (dd >= breakerPct && brake.tripped) {
+      const res = record({
+        action: 'breaker_suppressed',
+        regime: _state.profile,
+        reasons: [
+          `drawdown ${round(dd * 100, 1)}% ≥ ${round(breakerPct * 100, 0)}% off peak`,
+          `loss cap tripped ($${brake.lossUsd.toFixed(2)} of $${brake.capUsd.toFixed(2)}${brake.worstEngine ? `, worst: ${brake.worstEngine}` : ''})`,
+          'holding profile — forcing arb-only would aim the bot at the engine that is losing',
+        ],
+        changed: false,
+        mode,
+        source: 'guardrail',
+      });
+      if (log) log(`⛔ GOVERNOR breaker held — loss cap already tripped; not switching to arb-only (${round(dd * 100, 1)}% off peak)`, 'system', res);
+      return res;
+    }
     if (dd >= breakerPct) {
       const changed = applyProfile('arb-only', { saveConfig, config });
       if (changed || _state.profile !== 'arb-only') {

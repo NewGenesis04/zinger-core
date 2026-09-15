@@ -3514,7 +3514,7 @@ gate removed (1), budget gate removed (1), depth dropped from the sizing `min`
 (1). The 24 pre-existing arb fixtures gained `bestAskSize: 5000` — deep enough
 that depth is not the constraint under test in files testing parity and fees.
 
-### 74. Nothing stops a losing arb loop — the breakers exempt it, and there is no session cap
+### 74. Nothing stops a losing arb loop — the breakers exempt it, and there is no session cap · (a) OPEN · (b) ✅ FIXED
 
 **Found 2026-09-10** while answering "can I leave this running overnight?". The
 answer is no, and the reason is not the sizing gate — it is that if the gate is
@@ -3573,6 +3573,55 @@ would own "is this leg still hedged".
 
 `grep` for `maxDailyLoss|dailyLoss|lossLimit|circuitBreak|killSwitch|maxLossUsd`
 across `src/` returns nothing. There is no session-level or daily brake.
+
+> **(b) FIXED 2026-09-14.** `src/polymarket/lossCap.ts`, gated at
+> `bot.ts:executePendingTrade` (both engines) and `arbEngine.ts:60` (per-scan
+> snapshot), governor loop broken at `governor.ts:387`, 14 invariant tests in
+> `tests/unit/lossCap.test.ts`, 8 mutations killed.
+>
+> **Design, as decided with the operator:**
+>
+> | decision | choice |
+> |---|---|
+> | basis | realised P&L net of fees, rolling 24h |
+> | trip action | halt **all** new entries, both engines |
+> | governor | suppress the arb-only forcing while tripped |
+> | persistence | survives restart; explicit operator reset |
+>
+> **Derived, not counted.** The cap reads closed trades rather than
+> incrementing a tally. A counter is a second source of truth that drifts from
+> the ledger the moment anything is replayed, deduped or reconciled — silently,
+> and in the direction of not firing. Deriving also makes it restart-proof for
+> free: the trades outlive the process, so a crash-loop cannot wipe the window.
+> What persists is the *reset marker* (`zinger.db`, key `loss_cap_reset`), not
+> the figure — the window is `max(now − 24h, resetAt)`.
+>
+> **The governor loop is the part that was not just a missing feature.** While
+> the cap is tripped no new entries happen anyway, so the profile switch is
+> cosmetic *at that moment*. The damage is later: the profile would still read
+> `arb-only` when an operator clears the cap, so trading resumes aimed at the
+> engine that caused the loss without anyone having chosen that. The breaker now
+> holds the profile and records `breaker_suppressed` with the reason.
+>
+> **Defaults.** Live `maxDailyLossUsd: 10` — about 3.6% of the ~$278 balance,
+> and at live `arbMaxUsd: 1` that is dozens of consecutive losing round trips
+> rather than one bad trade, which is the failure shape this exists for. Paper
+> ships at `0` (disabled) **on purpose**: a paper run exists to find out how bad
+> a defect gets and to produce the distribution that sizes the live dials, and a
+> brake there truncates the evidence it is being run to collect. `0` disables
+> stopping, never reporting — `lossCapStatus` still computes the loss.
+>
+> Reset: `POST /api/poly/trading/resume`. Deliberately separate from
+> `/api/poly/arb/resume` (item 80): one says "I checked a leg whose fate was
+> unknown", the other says "I accept the last 24 hours of losses". Collapsing
+> them would let an operator dismiss the second while intending only the first.
+>
+> **Status visible at** `getState().limits.lossCap`, reported whether or not it
+> has fired — `remainingUsd` is the number worth watching before it does.
+>
+> **(a) remains open.** `holdsToSettlement` still exempts a naked leg from every
+> risk exit on a structural marker rather than on whether the hedge exists.
+
 
 **Operational consequence, stated plainly:** live arb should not run unattended
 until (b) exists. Paper mode exercises the identical sizing gate — `mode` only
@@ -3781,7 +3830,7 @@ fill → then this.
 
 ---
 
-### 78. The arb order is sized in shares and submitted in dollars, and the round trip does not close
+### 78. The arb order is sized in shares and submitted in dollars, and the round trip does not close ✅ FIXED & ENABLED
 
 **Found 2026-09-11** in `docs/live_canary_packages.json` (21 live packages,
 2026-09-09 → 2026-09-11, all ABORTED, no leg ever filled).
@@ -3830,9 +3879,85 @@ patch at `:276`.
 
 **Do not treat this as the explanation for the canary failures — see item 79.**
 
+**VERIFIED AND ENABLED 2026-09-15.** The live probe answered in the venue's own
+words, at zero cost — a limit FOK bid far below the market, on a book whose best
+ask was $1.00:
+
+```
+{ "error":   "order couldn't be fully filled. FOK orders are fully filled or killed.",
+  "orderID": "0xf01fbbee3188825dfcaef47e3be2f0a51d4075bb67077d95e9a97b0e9358eeb1",
+  "status":  400 }
+```
+
+Nothing rested, $0.00 moved. Of the three outcomes specified in advance —
+honoured / silently downgraded to a resting order / order type rejected — this is
+the first. Recorded as **fact 8** in
+`docs/research/polymarket-domain-facts.md`; `arbExactShareRouting` is now `true`
+for live.
+
+**Scope limit, because it is easy to over-read.** The probe proves FOK is
+honoured when the order **cannot** fill. It does not exercise the branch where a
+limit FOK **can** fill — that `roundDown(size, 2)` delivers that exact share
+count on a real match is still SDK-source inference. The first live fill is the
+observation, and item 79's `requestedShares` records it beside what came back.
+`placeLimitFokBuy` still treats a resting response as a failure; that check is
+now a contradiction-detector rather than a live hazard, and is kept for exactly
+this reason.
+
+**Follow-on: see item 84.** Making kills a correctly-reported outcome exposed
+that reconciliation stalls the scan loop for 4.5s on every one of them.
+
+**BUILT 2026-09-14, ORIGINALLY GATED OFF.** `placeLimitFokBuy` + `venueShareCount`
+(`trade.ts`), wired at `bot.ts` behind `cfg.arbExactShareRouting`, default
+`false` (`modeConfig.ts`). 6 tests in `tests/unit/arbExactShareRouting.test.ts`,
+4 mutations killed.
+
+**The mechanism is confirmed from primary source.** The two SDK amount builders
+are mirror images:
+
+```js
+// getMarketOrderRawAmounts.js — what we use today. Dollars in, shares derived.
+const rawMakerAmt = roundDown(amount, roundConfig.size);   // dollars, 2dp
+let   rawTakerAmt = rawMakerAmt / rawPrice;                // shares FALL OUT
+
+// getOrderRawAmounts.js — the limit builder. Shares in, dollars derived.
+const rawTakerAmt = roundDown(size, roundConfig.size);     // shares, CONTROLLED
+let   rawMakerAmt = rawTakerAmt * rawPrice;                // dollars fall out
+```
+
+So the fix works, and the 2026-09-11 06:27 package is the worked example:
+`$2.66 / 0.59 = 4.5085` shares demanded against a plan of `4.500` — versus
+`roundDown(4.500, 2) = 4.50` on the limit route. Zero excess.
+
+**⚠️ WHY IT IS OFF.** `createAndPostOrder` is typed
+`OrderType.GTC | OrderType.GTD` in this SDK version (`client.d.ts:127`). FOK on
+a limit order is only reachable as `createOrder` + `postOrder(order,
+OrderType.FOK)`, which `postOrder`'s signature accepts (`client.d.ts:139`).
+**Nothing in this repo or in `docs/research/polymarket-domain-facts.md`
+establishes that the exchange honours FOK on a limit order.** A confident
+reading of an SDK type is precisely the shape of the Aug 2026 `negRisk`
+regression, and the downside is not symmetric: if the venue silently downgrades
+FOK to GTC the leg **rests** instead of dying, which is the -$12.83 orphan from
+2026-08-28. `placeLimitFokBuy` returns `resting: true` rather than swallowing it,
+and the existing cancel-on-rest path at `bot.ts` catches it — but that is a net,
+not a verification.
+
+**The zero-cost live probe that settles it.** Post a limit FOK far from the
+market — buy 5 shares at $0.01 when the ask is $0.60. Nothing can match, so no
+money moves either way. Three possible answers, and item 79's instrumentation
+now records which:
+
+| response | meaning |
+|---|---|
+| accepted, killed unmatched | FOK honoured on a limit order → turn the flag on |
+| accepted, **rests on the book** | FOK silently downgraded → do NOT enable; cancel immediately |
+| rejected, "unsupported order type" or similar | route unavailable in this SDK version |
+
+Operator's to run; a VPS measurement.
+
 ---
 
-### 79. Every live arb leg has been FOK-killed across two code versions, and nothing in the repo explains why
+### 79. Every live arb leg has been FOK-killed across two code versions, and nothing in the repo explains why ✅ INSTRUMENTED
 
 **Found 2026-09-11.** `docs/live_canary_packages.json`: **21 packages, 21
 aborted, zero legs filled, zero orphans, zero capital moved.** Two distinct eras
@@ -3923,6 +4048,43 @@ next attempt produces a diagnosis instead of a fourth theory.
 > dissolve item 81 rather than fix it: an order that specifies a share count has
 > no dollars→shares round trip to verify, so the tolerance band has nothing to
 > do. Worth resolving 78 before spending effort on 81.
+
+**INSTRUMENTATION SHIPPED 2026-09-14.** The diagnosis this item asks for is now
+recorded on the package itself, not only in the receipt log.
+
+`ArbLegInfo` (`arbPersistence.ts`) gained, per leg:
+
+| field | answers |
+|---|---|
+| `error` | what the venue actually said — a FOK kill, a $1.00-notional rejection and a transport drop are now distinguishable |
+| `bookAgeMs` | snapshot → dispatch, so "the level was gone by the time we arrived" becomes falsifiable |
+| `bookSource` | whether the size came from `clob-ws` or a REST fallback |
+| `submittedAt` | dispatch wall-clock, so age can be recomputed against anything later |
+| `requestedShares` | what the gate asked for, before the venue's rounding |
+| `reconcile` | item 80's verdict: `filled` / `unfilled` / `unknown`, which door, how many probes |
+
+Plumbing: `clob.ts` now carries `bookTs` on the depth object (the WS snapshot's
+own `ts`, or `Date.now()` for a freshly fetched REST book — previously dropped
+at the merge); `trade.ts:assertOrderAccepted` attaches `venueError`, `orderId`
+and `venueStatus` to what it throws instead of flattening them into a message;
+`bot.ts` returns `rawError` / `orderId` / `reconcile` alongside `{ ok: false }`;
+`arbEngine.ts:executeArbLeg` stamps before dispatch and records after.
+`abortReason` now reads e.g.
+
+```
+Leg execution mismatch: UP=FAIL, DOWN=NOT_ATTEMPTED — UP: invalid amount for a
+marketable BUY order ($0.38), min size: 1 — up book 412ms old
+```
+
+**Side effect worth knowing:** `assertOrderAccepted` now attaches the `orderId`
+even on a *failed* response. That is exactly what item 80's Door B needs — an
+error-shaped reply that still carries an order id is now reconcilable by order
+id rather than falling to the wallet door.
+
+**Still open, and still the operator's:** whether the item 76 depth clamp was
+deployed during the 09-11 run (`git log -1` on the VPS). Nothing in this repo
+can answer it, and it decides whether item 78 was ever a candidate explanation
+for the depth-bound kills.
 
 ---
 
@@ -4136,10 +4298,11 @@ for the HTTP contract itself.
 
 ---
 
-### 81. `verifyFilledShares` uses a symmetric tolerance for a one-sided quantity
+### 81. `verifyFilledShares` uses a symmetric tolerance for a one-sided quantity ⏸️ DORMANT (unreachable while item 78 is on)
 
 **Found 2026-09-14** while building item 80. This is the root cause behind the
-ghost fill, and it is still live on the fill path.
+ghost fill. It was live on the fill path when filed; see the status note below
+for what changed.
 
 `placeMarketBuy` commits a fixed dollar `amount` at a limit `px`, so the share
 count is `amount / fillPrice` where `fillPrice ≤ px`. The fill can therefore only
@@ -4161,11 +4324,43 @@ expected) missed the band by 0.0004 shares and was thrown as `UNVERIFIED_FILL`.
 
 The correct ceiling is what the venue could actually have done — every share
 filling a full tick better — which is what `arbReconcile.ts:shareBand`
-implements. Not applied to `trade.ts` inline because that is the live fill path
-and widening its acceptance band changes what gets booked as a confirmed fill;
-it wants its own decision. **Until it is fixed, every well-improved arb fill
-will keep routing through reconciliation** — which is now correct, but slower
-and noisier than it needs to be.
+implements.
+
+**STATUS 2026-09-15: DORMANT, NOT FIXED.** Item 78 shipped and
+`arbExactShareRouting` is `true`, so the defective path is no longer reached —
+but the code is untouched and one config flag away from being live again.
+
+Reachability, traced rather than assumed:
+
+```
+resolveAgainstExpected (trade.ts:396)
+  └── verifyFilledShares (trade.ts:419)          ← sole caller
+        └── placeMarketBuy (trade.ts:554)        ← sole caller
+              └── bot.ts:1139                    ← only when arbExactShareRouting !== true
+```
+
+Set the flag back to `false` and the 2026-09-11 ghost is re-armed. The comment
+at `trade.ts:396` should say so; until it does, this item is the record.
+
+**Why item 78 dissolved it rather than papering over it — and the trap this
+creates for a future reader.** The symmetric band was wrong *because the share
+count was derived*: a fixed-dollar market BUY gets `amount / fillPrice` shares,
+and a better fill price means MORE shares than `amount / maxPrice`. One-sided
+deviation, symmetric band, 0.0004 shares outside it.
+
+Under limit + FOK the share count is the **input**, and fill-or-kill makes the
+result `{ 0, size }` with nothing in between. So `readGtcFill`'s
+identical-looking symmetric band (`trade.ts:329`) is **correct** on that path,
+and correcting it "for consistency with item 81" would be a change made by
+analogy rather than from the mechanism — the exact habit this file exists to
+discourage.
+
+The same band on the *GTC* path is wrong again, in the opposite direction. See
+item 85.
+
+Still not applied to `trade.ts` inline: that is the live fill path, and widening
+its acceptance band changes what gets booked as a confirmed fill. Dormant code
+does not earn a live-money edit.
 
 ---
 
@@ -4180,6 +4375,242 @@ that would settle it outright.
 
 Local `data/` is not the running instance, and VPS measurements are the
 operator's to run. One `grep` on the 03:38 window closes this.
+
+---
+
+### 83. The arb sizing gate computes on a finer grid than the venue accepts — latent, no live defect
+
+**Found 2026-09-14** while building item 78, from the vendored SDK.
+
+`ROUNDING_CONFIG[tick].size` is **2** for *every* tick size
+(`order-builder/helpers/roundingConfig.js`), and both amount builders
+`roundDown` the share count to it. The arb sizing gate computes on a 3-decimal
+grid:
+
+```js
+// arbEngine.ts:265
+let shares = Math.floor(Math.min(budgetShares, depthShares) * 1000) / 1000;
+```
+
+The third decimal is discarded by the venue. It is not a finer order; it is the
+same order with a digit nobody reads.
+
+**Corrected on the same day it was filed.** The first draft of this item claimed
+"the gate can believe it cleared a minimum it did not". That is **false**, and
+the claim was made from the shape of the arithmetic rather than from running it.
+Swept across every cent price from $0.02 to $0.98, at a leg sized exactly to the
+minimum-notional floor:
+
+| route | $1.00 breaches |
+|---|---|
+| dollar (current) | **0 of 97** — the notional is transmitted *as dollars*, so share-grid truncation never touches it |
+| limit (item 78) | **0 of 97** — `venueShareCount` rounds up when truncation would breach |
+
+So there is no live defect here. What remains is real but narrower:
+
+1. **The third decimal is discarded.** The gate reasons on a grid finer than the
+   venue's, so any argument that depends on the third digit — including the
+   comment at `arbEngine.ts:268` about `$1.00` versus `$0.999` — is reasoning
+   about a number that does not reach the book.
+2. **The depth clamp is slightly more conservative than it says.** 3-decimal
+   floor, then the venue truncates to 2 decimals. Both reductions, so the error
+   is in the safe direction, but the effective utilisation is not exactly 90%.
+3. **Under exact-share routing the floor case rounds UP** — measured, the
+   up-branch fires at **81 of 97** price points. At the minimum-notional floor,
+   exact-share routing therefore asks for up to 0.0099 shares *more* than the
+   gate computed. That is within behaviour the gate already accepts on purpose
+   ("Lifting above a ceiling here is intentional: the gates below then refuse it
+   by name", `arbEngine.ts:270`), but it is new, it only exists once item 78 is
+   enabled, and it is the one interaction to watch on the first live run with
+   the flag on.
+
+Not fixed: changing the sizing grid touches item 73's unified gate and every
+test that pins it, for no behavioural gain today. Filed so the next change to
+that gate knows the constraint exists — and so point 3 is on the record before
+item 78 is switched on, not after.
+
+---
+
+### 84. Reconciliation runs inside the scan loop, so every FOK kill stalls it for 4.5s ✅ FIXED
+
+**Found 2026-09-15**, immediately after the item 78 probe made FOK kills a
+first-class, correctly-reported outcome rather than a mystery.
+
+The markets loop is sequential and the arb call is awaited inside it:
+
+```js
+// bot.ts:2675
+for (const market of tradableMarkets) {
+  ...
+  // bot.ts:2874
+  const pkg = await detectAndExecuteArbPackage({ ... });
+```
+
+A failed live arb leg now triggers `reconcileArbLeg` — three probes across
+**4,500 ms** (`arbReconcile.ts:45`) — before the package aborts. That await is
+inside the loop, so the rest of the cycle waits on it.
+
+**Correction to the first draft of this item.** It claimed stop-losses stop
+running during the stall. They do not. `scanOpenExitsFast()` runs at the *top*
+of `scan()` (`bot.ts:2470`), before the markets loop, so exits are **delayed by
+a cycle, not skipped**. The accurate statement is that a stall lengthens the
+cycle, and exit frequency is the reciprocal of cycle length.
+
+**That is still severe, because the stalls compound.** Default durations are
+`['5m','15m','30m','1h']` (`bot.ts:208`) across two symbols — up to **eight
+markets per cycle**, each able to burn its own 4.5 s:
+
+| | exit checks |
+|---|---|
+| normal cycle (~250 ms) | ~4 per second |
+| one failing market | one per ~4.75 s |
+| eight failing markets | one per **~36 s** |
+
+Over a 5-minute window that is roughly **8 exit checks instead of ~1,200**.
+`botState._scanning` (`bot.ts:2575`) skips overlapping ticks, so the timer
+cannot make up the difference.
+
+**Why this is not a corner case.** Twenty of the twenty-one live canary packages
+were genuine kills (item 79), and kills are exactly what triggers the stall.
+
+**It is worse than "one extra call", because Door B probably cannot answer.**
+The probe response was `status: 400` with an `error` — the order was *rejected*,
+not accepted-then-killed. `getOrder(orderId)` on a rejected order most likely
+returns nothing, so Door B is silent and resolution falls to Door A, which by
+design requires an answer on **every** probe. So a routine kill costs the full
+4.5 s *and* three `data-api /positions` calls, every time.
+
+**Do not fix by weakening the reconciler.** It has already been softened once
+(item 80 amendment) and the remaining strictness is what stops a ghost fill.
+
+Two candidate fixes, in preference order:
+
+1. **Short-circuit on a recorded venue string.** Fact 8 in
+   `docs/research/polymarket-domain-facts.md` now records the exact wording:
+   `"order couldn't be fully filled. FOK orders are fully filled or killed."`
+   That is a definitive statement of no-fill from the venue about our own order,
+   which is exactly the evidence `unfilled` requires — it just arrives in the
+   rejection instead of from `getOrder`. Treating it as such skips
+   reconciliation entirely for the common case.
+
+   **Caveat that must not be skipped:** this is gating execution on an error
+   string, which is the hazard `verifyFilledShares` documents at `trade.ts:311`
+   and refuses to do. The difference is that this string is now *observed
+   primary source* rather than assumed vocabulary — but it is **one** observation
+   of **one** wording. Match it narrowly, treat any non-match as today's
+   behaviour, and count non-matches so the vocabulary can be widened from
+   evidence.
+
+2. **Reconcile off the scan loop.** Leave the package `PENDING_FILL` and let
+   housekeeping resolve it. Architecturally cleaner and removes the stall
+   entirely, but it means a package exists in an unresolved state across scan
+   cycles, which is the condition items 9 and 10 were about. Bigger change.
+
+**Not fixed here:** both options change the behaviour of the safety mechanism
+that was built this week, and the operator has already had to correct one
+over-eager version of it. This wants a decision, not a patch.
+
+**FIXED 2026-09-15.** Option A with the fallback preserved, plus the exit
+decoupling, as specified by the operator.
+
+**1. Fast abort on an announced kill.** `isSyncFokKill(status, message)`
+(`trade.ts`) requires **both** HTTP 400 **and** a phrase this project has
+observed from the live CLOB. On a match, `executePendingTrade` resolves the leg
+as `unfilled` immediately — `door: 'venue_sync'`, zero probes, zero delay.
+
+**2. Fallback preserved.** A 5xx, a timeout, a dropped connection, an
+unrecognised message, or a 400 with different wording all take the full 4.5 s
+dual-door path exactly as before.
+
+**Why an error-string match is admissible here, when `verifyFilledShares`
+refuses to gate on `status` (`trade.ts:311`) for the same reason the Aug 2026
+`negRisk` regression happened:** the direction of failure. A match skips
+reconciliation for a leg the venue has explicitly said did not fill. A non-match
+changes nothing. If Polymarket rewords the message, the bot gets **slower, never
+wrong**. That asymmetry is the entire justification and does not extend to any
+other use of these strings — which is why the patterns live in exactly one
+place and every other consumer reads the boolean, not the text.
+
+**3. Vocabulary counters.** `fokKillStats()` reports `fastAborts`,
+`unmatchedFailures`, and the top unrecognised messages by frequency; surfaced at
+`getState().limits.fokKills`. **`unmatchedFailures` rising against a flat
+`fastAborts` is the staleness alarm** — without it the fast path would silently
+stop engaging and the 4.5 s cost would return unexplained.
+
+**4. Exits decoupled.** `scanOpenExitsFast` now runs on its own
+`POLY_SCAN_INTERVAL_MS` timer (`bot.ts`), not at the top of `scan()`. Risk
+management is no longer downstream of order-dispatch latency.
+
+**That move created a hazard that had to be closed first.** Every exit path
+previously ran inside `scan()`, serialised by `_scanning`, so "two sellers for
+one position" was impossible *by accident*. `scanOpenExitsFast` sets
+`pos.closed = true` only AFTER awaiting `placeMarketSell`, so two overlapping
+runs would both read `closed === false`, both dispatch, and the second would
+sell shares the first had already sold — an unhedged short, the mirror image of
+the ghost fill. `claimPositionExit` / `releasePositionExit` make **one position,
+one exit in flight** an invariant rather than a side effect of the call graph;
+claimed synchronously before any await, released on both success and rejection,
+applied at all five position-closing sell sites plus `executeSell`. The timer
+also carries its own re-entrancy guard and is cleared when the bot stops.
+
+Tests: 10 invariants in `tests/unit/fokFastAbort.test.ts`. 5 mutations applied,
+5 killed. **One survived the first pass and it was the important one:**
+broadening the pattern to `/filled/i` passed every test, because no negative
+case contained the word. That mutation reads a message saying the order *did*
+fill as "confirmed nothing filled" — the 2026-09-11 ghost with the safety net
+switched off. Three negative cases added (`order filled`, `order partially
+filled…`, `order was fully filled`); it dies now.
+
+
+---
+
+### 85. A partially-filled directional entry is booked at its full requested size
+
+**Found 2026-09-15** while confirming whether item 78 had made item 81
+unreachable. Same family, different order type, opposite direction.
+
+`readGtcFill` resolves the wire scale against a **symmetric** band:
+
+```js
+// trade.ts:329
+const tolerance = Math.max(0.05, Math.abs(want) * 0.02);
+const shares = [rawShares, rawShares / 1e6]
+  .find((c) => Number.isFinite(want) && want > 0 && Math.abs(c - want) <= tolerance) ?? null;
+```
+
+For a **GTC limit** order — which is every directional entry (`placeOrder`,
+`trade.ts:358`) — a partial fill is legitimate and can be arbitrarily smaller
+than the request. Anything more than 2% short fails the band, so `filledShares`
+comes back `null`, and:
+
+```js
+// bot.ts:1176
+pos.shares = orderResult.filledShares ?? orderResult.size;   // `size` is what was ASKED for
+```
+
+**A 50%-filled entry is booked as 100% filled.** The position record then
+overstates holdings until something else corrects it: mark-to-market, equity,
+per-trade P&L and Kelly sizing all read the inflated number.
+
+**Why this is not as bad as it sounds, and why it still matters.** The live exit
+paths clamp against real inventory before selling
+(`adjustedShares = Math.min(sellShares, pmShares)`, `bot.ts:2578` and the
+in-scan exits), so the bot does not try to sell shares it never received — that
+guard is item 68's. The damage is to the *ledger*, not the order: overstated
+equity, overstated realised P&L on close, and a Kelly input computed from a
+position size that never existed.
+
+**The family, stated once so the next reader does not fix the wrong one:**
+
+| path | order type | legitimate deviation | correct band |
+|---|---|---|---|
+| `placeMarketBuy` | market FOK, dollars in | fill can only be **larger** (price improvement) | one-sided **up** — item 81, dormant |
+| `placeLimitFokBuy` | limit FOK, shares in | none; result is `{0, size}` | symmetric is **correct** |
+| `placeOrder` | GTC limit | fill can be **smaller** (partial) | one-sided **down** — this item |
+
+Not fixed inline: the fallback at `bot.ts:1176` is the load-bearing half, and
+changing what an unverified directional fill books is an execution-path decision
+on the directional engine, which this week's work has deliberately not touched.
 
 ---
 

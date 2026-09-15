@@ -48,7 +48,8 @@ import {
   resetPackages,
 } from './arbEngine.js';
 import { persist, persistSync, load, FILES, dataPath } from './persistence.js';
-import { placeOrder, placeMarketBuy, placeMarketSell, sellFloor, cancelOrder, syncClobBalance, expectedSharesFor } from './trade.js';
+import { placeOrder, placeMarketBuy, placeMarketSell, placeLimitFokBuy, venueShareCount, sellFloor, cancelOrder, syncClobBalance, expectedSharesFor, fokKillStats } from './trade.js';
+import { lossCapStatus, resetLossCap } from './lossCap.js';
 import {
   reconcileArbLeg, haltArb, isArbHalted, arbHaltState, clearArbHalt,
   fetchWalletPositions, findUnrecordedHoldings, markOrderInFlight, clearInFlight,
@@ -987,6 +988,21 @@ function announceTrade(plan, market, outcome) {
   return announcement;
 }
 
+/**
+ * Item 74b. Recomputed from the ledger rather than tallied, so it cannot drift
+ * and cannot be reset by a restart. Called once per scan (a filtered reduce over
+ * closed trades) and cached on botState for the hot arb path;
+ * `executePendingTrade` reads it fresh, because that is the moment money moves
+ * and a stale answer there is the one that matters.
+ */
+function currentLossCap() {
+  return lossCapStatus({
+    trades: botState.trades,
+    mode: botState.config.mode || 'paper',
+    capUsd: Number(botState.config.maxDailyLossUsd ?? 0),
+  });
+}
+
 async function executePendingTrade(pending) {
   const cfg = botState.config;
   const plan = pending.plan;
@@ -995,6 +1011,19 @@ async function executePendingTrade(pending) {
   // legs used to be charged against maxOpenPositions, which is the directional
   // risk dial — so a hedged pair ate two directional slots, and arb's effective
   // capacity was maxOpenPositions/2 no matter what maxArbPackages said.
+  // Item 74b — the brake, ahead of every other gate. Both engines: the cap
+  // measures the account, and an account bleeding from one engine is not made
+  // safer by continuing to trade the other.
+  const brake = currentLossCap();
+  if (brake.tripped) {
+    pending.status = 'skipped';
+    botState._buyLocks.delete(pending.slug);
+    log(`🛑 LOSS CAP — no new entries. Realised $${brake.realisedUsd.toFixed(2)} in 24h against a $${brake.capUsd.toFixed(2)} cap${brake.worstEngine ? ` (worst: ${brake.worstEngine})` : ''}. Clear it deliberately to resume.`, 'error', {
+      market: pending.symbol, slug: pending.slug, lossUsd: brake.lossUsd, capUsd: brake.capUsd,
+    });
+    return { ok: false, error: 'daily loss cap' };
+  }
+
   const budget = capacityFor(plan, cfg);
   const engine = budget.engine;
   if (countOpenPositions(cfg.mode, engine) >= budget.max) {
@@ -1094,7 +1123,19 @@ async function executePendingTrade(pending) {
       // `botState.positions` for an unaccounted holding. Marked before the
       // order leaves, cleared once the position exists or the leg is resolved.
       markOrderInFlight(pending.tokenId);
-      const orderResult = plan.isArbLeg
+      const exactShares = plan.isArbLeg && cfg.arbExactShareRouting === true && Number(plan.shares) > 0;
+      const orderResult = exactShares
+        // Item 78. The sizing gate computed a share count against a share depth
+        // ceiling; this is the only route that delivers that number to the book
+        // intact. Gated off by default — see `modeConfig.ts`.
+        ? await placeLimitFokBuy({
+          tokenId: pending.tokenId,
+          shares: plan.shares,
+          maxPrice: entryPx,
+          negRisk: pending.negRisk,
+          tickSize: pending.tickSize || '0.01',
+        })
+        : plan.isArbLeg
         ? await placeMarketBuy({
           tokenId: pending.tokenId,
           amountUsd: plan.sizeUsd,
@@ -1181,7 +1222,15 @@ async function executePendingTrade(pending) {
        * have made up its mind.
        */
       const reconcilable = plan.isArbLeg && cfg.mode === 'live' && pending.tokenId;
-      const quote = reconcilable
+      // Under exact-share routing the expected count is simply what we asked
+      // for — there is no dollars→shares round trip left to re-derive, which is
+      // also why item 78 dissolves item 81 rather than fixing it.
+      const routed = reconcilable && cfg.arbExactShareRouting === true
+        ? venueShareCount(plan.shares, entryPx)
+        : null;
+      const quote = routed
+        ? { price: entryPx, amountUsd: routed.notionalUsd, expectedShares: routed.shares, tolerance: 0.005 }
+        : reconcilable
         ? expectedSharesFor({
           amountUsd: plan.sizeUsd,
           maxPrice: entryPx,
@@ -1190,7 +1239,27 @@ async function executePendingTrade(pending) {
         })
         : null;
 
-      const recon = quote
+      /**
+       * Item 84 — fast path for a kill the venue has already told us about.
+       *
+       * `err.fokKill` is set only on an HTTP 400 carrying a phrase this project
+       * has observed from the live CLOB (`trade.ts:isSyncFokKill`). That is a
+       * direct statement, about our own order, that nothing matched — which is
+       * exactly the evidence `unfilled` requires; it simply arrived in the
+       * rejection instead of from a follow-up `getOrder`.
+       *
+       * Skipping reconciliation here is worth 4.5 seconds per kill, and kills
+       * are the common case: 20 of the 21 live canary packages. Inside a
+       * sequential market loop that delay multiplies across every market in the
+       * cycle.
+       *
+       * The fallback is the safety property: anything not matched — a 5xx, a
+       * timeout, a dropped connection, a reworded message — still takes the full
+       * dual-door path. A stale pattern list makes the bot slower, never wrong.
+       */
+      const recon = (reconcilable && err?.fokKill)
+        ? { outcome: 'unfilled', shares: 0, door: 'venue_sync', probes: [], blind: false, fast: true }
+        : quote
         ? await reconcileArbLeg({
           // Present on UNVERIFIED_FILL (Door B), absent when the transport
           // dropped before any response came back (Door A only).
@@ -1284,7 +1353,17 @@ async function executePendingTrade(pending) {
           market: pending.symbol, slug: pending.slug, outcome: pending.outcome,
           reconcile: recon.outcome,
         });
-        return { ok: false, error: err.message };
+        // Item 79. The venue's own rejection text, and how the ambiguity was
+        // resolved, travel back to the package record. Before this the arb
+        // engine received a bare `{ ok: false }` and wrote `Leg execution
+        // mismatch` — which is what 21 aborted packages say, and it says nothing.
+        return {
+          ok: false,
+          error: err.message,
+          rawError: err?.venueError || err?.errorMsg || err?.message || null,
+          orderId: err?.orderId || null,
+          reconcile: { outcome: recon.outcome, door: recon.door, probes: recon.probes.length },
+        };
       }
     }
   } else {
@@ -1329,6 +1408,28 @@ async function executePendingTrade(pending) {
  * assertion that someone looked. The returned record is what they should have
  * looked at.
  */
+/**
+ * Operator clears the item 74b loss cap.
+ *
+ * Separate from `resumeArb` on purpose: one says "I have looked at a leg whose
+ * fate was unknown", the other says "I accept the last 24 hours of losses and
+ * want trading to continue". Collapsing them would let an operator dismiss the
+ * second while intending only the first.
+ */
+export function resumeTrading() {
+  const mode = botState.config.mode || 'paper';
+  const res = resetLossCap({
+    trades: botState.trades,
+    mode,
+    capUsd: Number(botState.config.maxDailyLossUsd ?? 0),
+  });
+  botState._lossCap = currentLossCap();
+  if (res.cleared?.tripped) {
+    log(`▶️ LOSS CAP CLEARED — was $${res.cleared.realisedUsd.toFixed(2)} realised against a $${res.cleared.capUsd.toFixed(2)} cap over ${res.cleared.tradesCounted} trade(s)`, 'system', res.cleared);
+  }
+  return res;
+}
+
 export function resumeArb() {
   const cleared = clearArbHalt();
   if (!cleared) return { ok: true, cleared: null, note: 'Arb was not halted.' };
@@ -2079,6 +2180,13 @@ export function getState(opts = {}) {
           // indistinguishable from a quiet market.
           halt: arbHaltState(),
         },
+        // Item 74b. The account-level brake, reported whether or not it has
+        // fired — `remainingUsd` is the number worth watching before it does.
+        lossCap: currentLossCap(),
+        // Item 84. `unmatchedFailures` rising against a flat `fastAborts` is the
+        // signal that the venue reworded its kill message and the fast path has
+        // gone stale — the bot would still be correct, just slow again.
+        fokKills: fokKillStats(),
       };
     })(),
     // Who last changed each setting, and what changed recently (D3).
@@ -2383,6 +2491,42 @@ export function setBaseline(balanceUsd) {
 }
 
 /** Lightweight exit pass used when the main scan is busy — prevents SL gaps. */
+/**
+ * One position, one exit in flight — item 84, part 4.
+ *
+ * Until now every exit path ran inside `scan()`, serialised by `_scanning`, so
+ * "two sellers for one position" was impossible by accident rather than by
+ * design. Moving the fast stop-loss onto its own timer removes that accident.
+ *
+ * The hazard is concrete: `scanOpenExitsFast` sets `pos.closed = true` only
+ * AFTER awaiting `placeMarketSell`. Two overlapping runs would both read
+ * `closed === false`, both dispatch a sell, and the second would sell shares the
+ * first had already sold — the mirror image of the ghost fill, and worse,
+ * because it is an unhedged short.
+ *
+ * Claimed synchronously before any await, released in a `finally`. A claim that
+ * outlives its run cannot deadlock the position: `closed` is the durable state,
+ * and the claim is only consulted while a sell is actually in flight.
+ */
+const _exitsInFlight = new Set<string>();
+
+function claimPositionExit(pos) {
+  const id = String(pos?.id || '');
+  if (!id || pos.closed || _exitsInFlight.has(id)) return false;
+  _exitsInFlight.add(id);
+  return true;
+}
+
+function releasePositionExit(pos) {
+  const id = String(pos?.id || '');
+  if (id) _exitsInFlight.delete(id);
+}
+
+export function __exitsInFlightForTest() { return _exitsInFlight; }
+
+/** Re-entrancy guard for the exit timer itself (item 84, part 4). */
+let _exitScanRunning = false;
+
 async function scanOpenExitsFast() {
   const cfg = botState.config;
   if (!cfg?.enabled) return;
@@ -2438,6 +2582,9 @@ async function scanOpenExitsFast() {
           );
         }
         sellShares = adjustedShares;
+        // Item 84 part 4: claimed before the await, because this path now runs
+        // on its own timer and can interleave with `scan()`'s exit handling.
+        if (!claimPositionExit(pos)) continue;
         try {
           const sellRes = await placeMarketSell({
             tokenId: pos.tokenId,
@@ -2448,9 +2595,11 @@ async function scanOpenExitsFast() {
           });
           pos.sellOrderId = sellRes.id;
         } catch (err) {
+          releasePositionExit(pos);
           log(`⚠️ LIVE FAST-SL sell REJECTED ${pos.symbol}: ${err.message.slice(0, 120)} — position stays open`, 'error');
           continue;
         }
+        releasePositionExit(pos);
       }
       markPosition(pos, fillPrice);
       pos.exitPrice = fillPrice;
@@ -2490,7 +2639,10 @@ export async function scan() {
   if (!cfg.enabled) return;
   if (botState._scanning) {
     // Heavy scan in flight — still try a fast bid-based exit pass so SL can't gap 50%+
-    await scanOpenExitsFast().catch(() => {});
+    // Item 84 part 4: exits run on their own interval now, so a slow market
+    // loop cannot delay them. Kept out of the scan cycle deliberately — calling
+    // it here too would reintroduce the coupling this change removes.
+    
     return;
   }
   botState._scanning = true;
@@ -2500,6 +2652,8 @@ export async function scan() {
     prunePendingTrades();
     // Arb capacity has to drain without anyone watching (items 9 and 10).
     await arbHousekeeping('scan');
+    // One computation per cycle for the hot arb path to read (item 74b).
+    botState._lossCap = currentLossCap();
     botState.stats.scansDone = (botState.stats.scansDone || 0) + 1;
     const readiness = await refreshTelemetry();
 
@@ -3004,7 +3158,12 @@ export async function scan() {
               // Arb legs are hedged to $1.00 at settlement — force-closing mid-window
               // forfeits the locked edge and books the spread. Keep them immune.
               if (holdsToSettlement(op)) continue;
+              // Item 84 part 4 — claimed immediately before the await, and only
+              // on the path that actually awaits. Claiming above the live check
+              // would leak the claim for every paper position, which never
+              // reaches the release below.
               if (op.mode === 'live' && op.tokenId && op.shares > 0) {
+                if (!claimPositionExit(op)) continue;
                 try {
                   const sellRes = await placeMarketSell({
                     tokenId: op.tokenId,
@@ -3014,7 +3173,9 @@ export async function scan() {
                     tickSize: op.tickSize || '0.01',
                   });
                   op.sellOrderId = sellRes?.id || op.sellOrderId;
+                  releasePositionExit(op);
                 } catch (err) {
+                  releasePositionExit(op);
                   log(`⚠️ DRAWDOWN close failed ${op.slug}: ${err.message.slice(0, 120)} — leaving open`, 'error');
                   continue;
                 }
@@ -3092,6 +3253,7 @@ export async function scan() {
                 'system',
                 sellDebug,
               );
+              if (!claimPositionExit(pos)) continue;
               try {
                 const sellRes = await placeMarketSell({
                   tokenId: pos.tokenId,
@@ -3101,12 +3263,14 @@ export async function scan() {
                   tickSize: pos.tickSize,
                 });
                 pos.sellOrderId = sellRes.id;
+                releasePositionExit(pos);
                 log(
                   `✅ LIVE PARTIAL SELL ACCEPTED ${pos.symbol} ${pos.outcome.toUpperCase()} · ${sellDebug.requestedShares}sh`,
                   'system',
                   { ...sellDebug, sellOrderId: sellRes.id },
                 );
               } catch (err) {
+                releasePositionExit(pos);
                 log(
                   `⚠️ LIVE PARTIAL sell REJECTED ${pos.symbol}: ${err.message.slice(0, 140)} — keeping full size`,
                   'error',
@@ -3172,6 +3336,7 @@ export async function scan() {
               'system',
               sellDebug,
             );
+            if (!claimPositionExit(pos)) continue;
             try {
               const sellRes = await placeMarketSell({
                 tokenId: pos.tokenId,
@@ -3181,12 +3346,14 @@ export async function scan() {
                 tickSize: pos.tickSize,
               });
               pos.sellOrderId = sellRes.id;
+              releasePositionExit(pos);
               log(
                 `✅ LIVE ${exitReason.toUpperCase()} SELL ACCEPTED ${pos.symbol} ${pos.outcome.toUpperCase()} · ${sellDebug.requestedShares}sh`,
                 'system',
                 { ...sellDebug, sellOrderId: sellRes.id },
               );
             } catch (err) {
+              releasePositionExit(pos);
               if (exitReason === 'settle') {
                 pos.pendingRedeem = true;
                 pos.pendingRedeemAt = Date.now();
@@ -4063,6 +4230,28 @@ export function startBot() {
   );
   scan();
   botState.interval = setInterval(scan, POLY_SCAN_INTERVAL_MS);
+  /**
+   * Item 84 part 4 — stop-losses on their own clock.
+   *
+   * Exits used to ride at the top of `scan()`, which made their frequency the
+   * reciprocal of however long a scan took. That was fine while a scan was a
+   * quarter of a second. It stopped being fine when a failed arb leg could add
+   * 4.5s of reconciliation *per market* inside the same cycle: with eight
+   * markets configured, exit checks could fall from four a second to one every
+   * ~36 seconds, and `_scanning` means the timer cannot make up the difference.
+   *
+   * Risk management should not be downstream of order dispatch latency. Its own
+   * interval, its own re-entrancy guard, and `claimPositionExit` to make "one
+   * position, one exit in flight" an invariant rather than a side effect of
+   * everything having previously run inside one loop.
+   */
+  botState.exitInterval = setInterval(() => {
+    if (!botState.running || _exitScanRunning) return;
+    _exitScanRunning = true;
+    scanOpenExitsFast()
+      .catch(() => {})
+      .finally(() => { _exitScanRunning = false; });
+  }, POLY_SCAN_INTERVAL_MS);
   // Kick an optimizer pass shortly after start (fast tune)
   setTimeout(() => {
     if (botState.running && botState.config.llmOptimize !== false) {
@@ -4165,6 +4354,9 @@ export function stopBot(options = {}) {
   botState.running = false;
   saveConfig({ enabled: false }, { tier: 'operator', source: 'bot-stop' });
   if (botState.interval) { clearInterval(botState.interval); botState.interval = null; }
+  // Item 84 part 4 — the exit timer stops with the bot, or it keeps selling
+  // after the operator has stopped it.
+  if (botState.exitInterval) { clearInterval(botState.exitInterval); botState.exitInterval = null; }
   const session = completeSession(options?.reason || (immediate ? 'immediate' : 'stopped'));
   botState.stopRequest = null;
   emitEvent('system.alert', {
@@ -4406,6 +4598,11 @@ async function executeSell(pos, reason = 'manual') {
   markPosition(pos, price);
 
   if (pos.mode === 'live' && pos.tokenId && positionShares(pos) > 0) {
+    // Item 84 part 4. Same claim as the fast stop-loss: since that path now runs
+    // on its own timer, this one can be entered concurrently with it.
+    if (!claimPositionExit(pos)) {
+      return { ok: false, error: 'exit already in flight' };
+    }
     try {
       const result = await placeMarketSell({
         tokenId: pos.tokenId,
@@ -4416,8 +4613,10 @@ async function executeSell(pos, reason = 'manual') {
       });
       pos.orderId = result.id;
     } catch (err) {
+      releasePositionExit(pos);
       return { ok: false, error: err.message };
     }
+    releasePositionExit(pos);
   }
 
   pos.exitPrice = price;

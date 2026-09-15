@@ -46,6 +46,7 @@ export const STRATEGY_KEYS = [
   'evalBothSides', 'sideBalanceEnabled', 'sideBalanceWeight',
   'preferShortTf', 'shortTfWeight',
   'clobArbEnabled', 'minArbGap', 'arbMinMarginPct', 'arbExploreRate', 'maxArbPackages',
+  'arbExactShareRouting', 'maxDailyLossUsd',
   'arbOnlyUntilEdge', 'forceArbOnly', 'requireEdgeForLive',
   'edgeLookback', 'edgeMinTrades', 'edgeMinExpectancy',
   'holdToSettleUnderdogs', 'underdogMaxPrice', 'holdToSettleDisasterSlPct',
@@ -127,6 +128,38 @@ export function defaultPaperStrategy() {
     preferShortTf: true,
     shortTfWeight: 2.0,
     clobArbEnabled: true,
+    /**
+     * Item 74b — rolling 24h realised-loss brake, in dollars. 0 disables it.
+     *
+     * OFF in paper deliberately. A paper run exists to find out how bad a
+     * defect gets and to produce the skip-code distribution that sizes the live
+     * dials; a brake there would truncate the evidence it is being run to
+     * collect. Live sets a real number below.
+     */
+    maxDailyLossUsd: 0,
+    /**
+     * Item 78 — submit arb legs by exact share count (limit + FOK) instead of by
+     * dollar amount. OFF by design, not by caution-as-habit.
+     *
+     * The SDK routes it via `createOrder` + `postOrder(order, OrderType.FOK)`;
+     * its own typing restricts the one-call helper to GTC/GTD
+     * (`clob-client-v2/dist/client.d.ts:127`). Nothing in this repo or in
+     * `docs/research/polymarket-domain-facts.md` establishes that the *exchange*
+     * honours FOK on a limit order — and if it silently downgrades to GTC the
+     * leg RESTS, which is the -$12.83 orphan from 2026-08-28.
+     *
+     * VERIFIED AND ENABLED 2026-09-15. The live probe answered in the venue's
+     * own words: `"order couldn't be fully filled. FOK orders are fully filled
+     * or killed."` — status 400, order id returned, nothing rested, $0.00 moved.
+     * Recorded as fact 8 in `docs/research/polymarket-domain-facts.md`.
+     *
+     * Scope limit kept deliberately in view: the probe proved the KILL branch.
+     * That a limit FOK which *can* fill delivers exactly `roundDown(size, 2)`
+     * shares is still SDK-source inference, and the first live fill is the
+     * observation. `placeLimitFokBuy` therefore still treats a resting response
+     * as a failure — now a contradiction-detector rather than a live hazard.
+     */
+    arbExactShareRouting: true,
     // Absolute floor: "how big a dislocation is worth the trouble". Profitability
     // is no longer this field's job — the fee-aware break-even gate owns that
     // (item 7), and it cannot be turned off. Safe to lower to capture skewed
@@ -162,6 +195,18 @@ export function defaultLiveStrategy() {
     certaintyMaxUsd: 2.0,
     arbBankrollFrac: 0.03,
     arbMaxUsd: 1,
+    /**
+     * Item 74b. $10 against the ~$278 live balance — roughly 3.6%, and about
+     * eight times the largest single realised arb loss on record (the
+     * 2026-08-28 orphan was -$12.83, but that was one unhedged leg at the old
+     * sizing, not the current $1 cap). Sized to stop a *loop*, which is the
+     * failure this exists for: at live `arbMaxUsd: 1`, ten dollars is dozens of
+     * consecutive losing round trips, not one bad trade.
+     *
+     * This is a starting number, not a derived one. It should be re-set from
+     * the realised-loss distribution once a paper run has produced one.
+     */
+    maxDailyLossUsd: 10,
     // Wider than paper on purpose: a quoted ask is not a fill price, and this
     // margin is what absorbs the difference when real money is at stake.
     arbMinMarginPct: 0.010,

@@ -57,6 +57,13 @@ export async function detectAndExecuteArbPackage({
    * every book every 250ms would bury the decision log it exists to protect.
    */
   if (isArbHalted()) return null;
+  /**
+   * Item 74b. Read from the per-scan snapshot rather than recomputed: this line
+   * runs on every market on every 250ms tick, and the authoritative check
+   * happens again inside `executePendingTrade` before any money moves. Cheap
+   * here, correct there.
+   */
+  if (botState?._lossCap?.tripped) return null;
   // Never execute arb packages on markets where both legs could lose.
   if (!isComplementaryBinary(market)) return null;
 
@@ -433,7 +440,7 @@ export async function detectAndExecuteArbPackage({
   let downShares = 0;
 
   try {
-    upShares = await executeArbLeg({ outcome: 'up', price: upAsk, cost: costUp, shares, pkg, market, executeTrade, mode });
+    upShares = await executeArbLeg({ outcome: 'up', price: upAsk, cost: costUp, shares, pkg, market, executeTrade, mode, depth });
 
     if (upShares > 0) {
       // 40ms interval ensures distinct millisecond timestamps and strictly increasing nonces on CLOB
@@ -450,7 +457,7 @@ export async function detectAndExecuteArbPackage({
       // on 2026-08-28.
       const downCostActual = Math.round(upShares * downAsk * 100) / 100;
       downShares = await executeArbLeg({
-        outcome: 'down', price: downAsk, cost: downCostActual, shares: upShares, pkg, market, executeTrade, mode,
+        outcome: 'down', price: downAsk, cost: downCostActual, shares: upShares, pkg, market, executeTrade, mode, depth,
       });
     }
   } catch (err) {
@@ -562,7 +569,23 @@ export async function detectAndExecuteArbPackage({
      */
     const upState = upShares > 0 ? 'OK' : 'FAIL';
     const downState = upShares > 0 ? (downShares > 0 ? 'OK' : 'FAIL') : 'NOT_ATTEMPTED';
-    pkg.abortReason = `Leg execution mismatch: UP=${upState}, DOWN=${downState}`;
+    // Item 79. The state pair alone is what 21 aborted packages recorded, and it
+    // cannot distinguish a FOK kill from a $1.00-notional rejection from a
+    // transport drop — three failures with three different fixes. Append
+    // whatever the venue actually said.
+    const why = [
+      pkg.legs.up.error ? `UP: ${pkg.legs.up.error}` : null,
+      pkg.legs.down.error ? `DOWN: ${pkg.legs.down.error}` : null,
+    ].filter(Boolean).join(' · ');
+    const age = [
+      pkg.legs.up.bookAgeMs != null ? `up book ${pkg.legs.up.bookAgeMs}ms old` : null,
+      pkg.legs.down.bookAgeMs != null ? `down book ${pkg.legs.down.bookAgeMs}ms old` : null,
+    ].filter(Boolean).join(', ');
+    pkg.abortReason = [
+      `Leg execution mismatch: UP=${upState}, DOWN=${downState}`,
+      why || null,
+      age || null,
+    ].filter(Boolean).join(' — ');
 
     let unwound = false;
     if (upShares > 0 && downShares <= 0) {
@@ -594,7 +617,7 @@ export async function detectAndExecuteArbPackage({
   }
 }
 
-async function executeArbLeg({ outcome, price, cost, shares, pkg, market, executeTrade, mode = 'paper' }) {
+async function executeArbLeg({ outcome, price, cost, shares, pkg, market, executeTrade, mode = 'paper', depth = null }) {
   const plan = {
     symbol: market.symbol,
     slug: market.slug,
@@ -636,7 +659,32 @@ async function executeArbLeg({ outcome, price, cost, shares, pkg, market, execut
   // short of a thrown exception.
   //
   // Read `ok` explicitly. A refusal is not a result.
+  //
+  // Item 79: stamp the leg before dispatch and record the venue's answer after,
+  // whichever way it goes. The book age is computed here rather than at the
+  // sizing gate because the interval that matters is snapshot → dispatch, and
+  // dispatch is here.
+  const leg = pkg.legs?.[outcome];
+  const bookTs = Number(depth?.[outcome]?.bookTs) || null;
+  const submittedAt = Date.now();
+  if (leg) {
+    leg.submittedAt = submittedAt;
+    leg.requestedShares = Number(shares) || null;
+    leg.bookSource = depth?.[outcome]?.source || null;
+    leg.bookAgeMs = bookTs ? Math.max(0, submittedAt - bookTs) : null;
+  }
+
   const res = await executeTrade(pending);
+
+  if (leg) {
+    // `rawError` is the venue's own text where `executePendingTrade` could
+    // isolate it; `error` is the wrapped message. Recording the wrapped one as
+    // a fallback is deliberate — a generic string beats the `undefined` these
+    // records have carried through 21 aborted packages.
+    leg.error = res?.ok === true ? null : (res?.rawError || res?.error || 'unknown');
+    leg.reconcile = res?.reconcile || null;
+    leg.orderId = res?.position?.orderId ?? res?.orderId ?? leg.orderId ?? null;
+  }
   if (res?.ok !== true) return 0;
 
   // Returns *matched shares*, not a boolean, because the sibling leg has to be

@@ -10,6 +10,25 @@ export interface ArbLegInfo {
   shares: number;
   filled: boolean;
   orderId?: string | null;
+  /**
+   * Item 79 diagnostics. Twenty-one live packages aborted across three days and
+   * every one recorded the same generic `Leg execution mismatch` — the venue's
+   * actual answer was captured in the receipt log and never reached the record
+   * anyone reads. These fields exist so the next failure explains itself
+   * instead of generating a fourth theory.
+   */
+  /** The venue's own rejection text, as close to raw as it reaches us. */
+  error?: string | null;
+  /** Milliseconds between the book snapshot this leg was sized from and dispatch. */
+  bookAgeMs?: number | null;
+  /** Which book fed the sizing gate — `clob-ws` or a REST fallback. */
+  bookSource?: string | null;
+  /** When the order was dispatched, so age can be recomputed against anything later. */
+  submittedAt?: number | null;
+  /** What the sizing gate asked for, before the venue's own rounding. */
+  requestedShares?: number | null;
+  /** Item 80: how an unconfirmed leg was resolved, if it had to be. */
+  reconcile?: { outcome: string; door: string | null; probes: number } | null;
 }
 
 export interface ArbPackage {

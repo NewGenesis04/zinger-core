@@ -194,11 +194,20 @@ export async function getDepthForMarket(market) {
           mid: wsBook.mid || 0,
           spread: (wsBook.bestBid && wsBook.bestAsk) ? wsBook.bestAsk - wsBook.bestBid : 0,
           source: 'clob-ws',
+          // Item 79. When the WS snapshot was last written — NOT when it was
+          // read. The arb sizing gate computes a share count from this book and
+          // the order then crosses a metered proxy before it reaches the
+          // matching engine; without the original stamp, "the level was gone by
+          // the time we got there" is unfalsifiable, and it was the leading
+          // untested theory for 20 consecutive FOK kills.
+          bookTs: Number(wsBook.ts) || null,
         };
         continue;
       }
       const d = await getOrderBookDepth(tokenId);
-      if (d) depth[outcome] = d;
+      // The REST book was fetched just now, so its age starts here. Stamped so
+      // the two sources are comparable rather than one being silently undated.
+      if (d) depth[outcome] = { ...d, bookTs: Date.now() };
     } catch {}
   }
   return depth;

@@ -1,5 +1,5 @@
 // @ts-nocheck
-import { ClobClient, AssetType, Side, SignatureTypeV2 } from '@polymarket/clob-client-v2';
+import { ClobClient, AssetType, Side, SignatureTypeV2, OrderType } from '@polymarket/clob-client-v2';
 import { createWalletClient, http } from 'viem';
 import { polygon } from 'viem/chains';
 import { privateKeyToAccount } from 'viem/accounts';
@@ -180,13 +180,118 @@ function sharesForUsd(usd, price, minShares = 5) {
   return Number(shares.toFixed(2));
 }
 
+/**
+ * The venue's own way of saying "your fill-or-kill matched nothing" — item 84.
+ *
+ * Every pattern here is a string this project has OBSERVED from the live CLOB,
+ * not one it expects. The only entry as of 2026-09-15 comes from the item 78
+ * probe, recorded as fact 8 in `docs/research/polymarket-domain-facts.md`:
+ *
+ *   "order couldn't be fully filled. FOK orders are fully filled or killed."
+ *
+ * This is deliberately the ONE place in the codebase that reads meaning out of
+ * an error string, and it is worth naming why that is normally forbidden.
+ * `verifyFilledShares` refuses to gate on `status` (:311) because the vocabulary
+ * was never recorded, and the Aug 2026 `negRisk` regression was exactly this
+ * shape — a plausible assumption about venue behaviour, shipped green.
+ *
+ * What makes it acceptable here is the direction of failure. A match skips a
+ * 4.5-second reconciliation for a leg the venue has explicitly said did not
+ * fill. A NON-match changes nothing: the leg takes the full dual-door path as
+ * before. So if Polymarket rewords this tomorrow, the bot gets slower, not
+ * wrong. That asymmetry is the whole justification — it does not extend to any
+ * other use of these strings.
+ */
+const FOK_KILL_PATTERNS = [
+  /fok orders are fully filled or killed/i,
+  /could\s*n.?.?t be fully filled/i,
+];
+
+const _fokStats = { fastAborts: 0, unmatchedFailures: 0, vocabulary: new Map<string, number>() };
+
+/**
+ * Did the venue synchronously tell us this fill-or-kill matched nothing?
+ *
+ * Requires BOTH an HTTP 400 and a recognised phrase. The status alone is far too
+ * broad — a 400 also covers malformed orders, insufficient balance and the
+ * $1.00-notional rejection, none of which say anything about whether shares
+ * moved.
+ */
+export function isSyncFokKill(status, message) {
+  if (Number(status) !== 400) return false;
+  const msg = String(message || '');
+  return FOK_KILL_PATTERNS.some((re) => re.test(msg));
+}
+
+/**
+ * Counters, so the vocabulary is learned from evidence rather than assumed.
+ *
+ * `unmatchedFailures` and `vocabulary` are the important half: they are what
+ * reveal a reworded kill message, or a second phrasing nobody anticipated. A
+ * rising `unmatchedFailures` against a flat `fastAborts` is the signal that this
+ * pattern list has gone stale.
+ */
+export function fokKillStats() {
+  return {
+    fastAborts: _fokStats.fastAborts,
+    unmatchedFailures: _fokStats.unmatchedFailures,
+    vocabulary: [..._fokStats.vocabulary.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 12)
+      .map(([text, n]) => ({ text, n })),
+  };
+}
+
+export function __resetFokStats() {
+  _fokStats.fastAborts = 0;
+  _fokStats.unmatchedFailures = 0;
+  _fokStats.vocabulary.clear();
+}
+
+/**
+ * Classify a rejected order response, and record what we learned from it.
+ *
+ * Split out from `assertOrderAccepted` so the classification has a seam that is
+ * exercisable without a signer, a client or a network — the counters are the
+ * early-warning system for this whole optimisation going stale, and an
+ * early-warning system nobody can test is decoration.
+ */
+export function classifyOrderFailure(result) {
+  const msg = result?.errorMsg || result?.error || null;
+  const fokKill = isSyncFokKill(result?.status, msg);
+  if (fokKill) {
+    _fokStats.fastAborts++;
+  } else {
+    _fokStats.unmatchedFailures++;
+    const key = String(msg || 'unknown').slice(0, 120);
+    _fokStats.vocabulary.set(key, (_fokStats.vocabulary.get(key) || 0) + 1);
+  }
+  return {
+    fokKill,
+    venueError: msg == null ? null : String(msg).slice(0, 300),
+    venueStatus: result?.status ?? null,
+  };
+}
+
 /** CLOB returns {success:false, errorMsg} instead of throwing — surface it. */
 function assertOrderAccepted(result, context) {
   const id = result?.orderID || result?.orderId || result?.id;
   const failed = result?.success === false || result?.error || result?.errorMsg;
   if (failed || !id) {
     const msg = result?.errorMsg || result?.error || (id ? 'order rejected' : 'no orderID in response');
-    throw new Error(`${context}: ${String(msg).slice(0, 200)}`);
+    const err: any = new Error(`${context}: ${String(msg).slice(0, 200)}`);
+    // Item 79. The venue's own words, kept separable from our framing of them.
+    // Twenty-one live packages recorded `Leg execution mismatch` and nothing
+    // else; at least two of those were a $1.00-notional rejection rather than a
+    // FOK kill, and the record could not tell them apart.
+    // Item 84. Classified here, at the one place that sees the venue's raw
+    // response, rather than re-parsed downstream from a wrapped message.
+    const verdict = classifyOrderFailure(result);
+    err.venueError = verdict.venueError;
+    err.venueStatus = verdict.venueStatus;
+    err.fokKill = verdict.fokKill;
+    err.orderId = id || null;
+    throw err;
   }
   return id;
 }
@@ -642,4 +747,130 @@ export function resetTradingClient() {
   _credsFailUntil = 0;
   _credsFailStreak = 0;
   _credsLastError = null;
+}
+
+/**
+ * The venue's own share resolution. `ROUNDING_CONFIG[tick].size` is **2** for
+ * every tick size in the vendored SDK
+ * (`order-builder/helpers/roundingConfig.js`), and both amount builders
+ * `roundDown` to it. A share count carrying a third decimal is therefore not a
+ * finer order — it is the same order with a digit the venue discards.
+ *
+ * The arb sizing gate computes on a 3-decimal grid (`arbEngine.ts:265`). See
+ * backlog item 83.
+ */
+export const VENUE_SHARE_DECIMALS = 2;
+
+/** What the venue will actually receive if we ask for `shares`, and why. */
+export function venueShareCount(shares, price, { minNotionalUsd = 1 } = {}) {
+  const want = Number(shares);
+  const px = Number(price);
+  if (!(want > 0) || !(px > 0)) return null;
+
+  const down = Math.floor(want * 100) / 100;
+  // Truncation is the safe direction against depth — it asks for less than the
+  // gate cleared. It is the WRONG direction against the $1.00 marketable-BUY
+  // minimum, which is a hard venue rejection rather than a maybe-kill (see the
+  // 2026-09-09 `invalid amount for a marketable BUY order ($0.38), min size: 1`
+  // receipts). So round up only when truncating would breach the floor, and say
+  // which happened.
+  if (down > 0 && down * px >= minNotionalUsd) {
+    return { shares: down, direction: 'down', notionalUsd: Math.round(down * px * 10000) / 10000 };
+  }
+  const up = Math.ceil(want * 100) / 100;
+  return { shares: up, direction: 'up', notionalUsd: Math.round(up * px * 10000) / 10000 };
+}
+
+/**
+ * Buy an exact share count, fill-or-kill — backlog item 78.
+ *
+ * WHY THIS EXISTS. `placeMarketBuy` submits a dollar amount, and the SDK derives
+ * the share count from it: `rawMakerAmt = roundDown(amount, 2)` then
+ * `rawTakerAmt = rawMakerAmt / rawPrice`
+ * (`order-builder/helpers/getMarketOrderRawAmounts.js`). The arb sizing gate
+ * computes a SHARE count against a SHARE depth ceiling, so that round trip
+ * re-derives the very number the gate was careful about. Measured across the 21
+ * live canary packages, 14 demanded MORE shares than planned, worst case
+ * +0.0950. A depth-bound order that demands more than the level holds is a
+ * fill-or-kill that must die.
+ *
+ * The limit builder inverts it — `rawTakerAmt = roundDown(size, 2)` and the
+ * dollars fall out (`getOrderRawAmounts.js`) — so the share count is the input
+ * and reaches the book intact.
+ *
+ * ⚠️ UNVERIFIED AGAINST THE LIVE VENUE. `createAndPostOrder` is typed
+ * `OrderType.GTC | OrderType.GTD` in this SDK version (`client.d.ts:127`); FOK
+ * on a limit order is only reachable via `createOrder` + `postOrder(order,
+ * OrderType.FOK)`, which `postOrder` accepts (`client.d.ts:139`). Whether the
+ * *exchange* honours FOK on a limit order is not established by anything in
+ * this repo or in `docs/research/polymarket-domain-facts.md`, and a plausible
+ * reading of an SDK type is exactly the shape of the Aug 2026 `negRisk`
+ * regression. So this is gated OFF by default and must stay that way until a
+ * live probe settles it — see item 78 in `docs/refactor-plan.md` for the
+ * zero-cost probe.
+ *
+ * If the venue silently downgrades FOK to GTC, the order RESTS instead of
+ * dying, and a resting arb leg is the -$12.83 orphan from 2026-08-28. The
+ * caller must treat a resting response as a failure and cancel — which is why
+ * this returns `resting` rather than swallowing it.
+ */
+export async function placeLimitFokBuy({
+  tokenId,
+  shares,
+  maxPrice,
+  negRisk = false,
+  tickSize = '0.01',
+  minNotionalUsd = 1,
+}) {
+  if (!(Number(maxPrice) > 0)) {
+    throw new Error('placeLimitFokBuy requires maxPrice — an unpriced order signs at $1.00/share');
+  }
+  const px = roundPrice(Number(maxPrice), Number(tickSize));
+  const sized = venueShareCount(shares, px, { minNotionalUsd });
+  if (!sized) throw new Error(`placeLimitFokBuy: non-positive size ${shares} @ ${px}`);
+
+  const client = await getProxyTradingClient();
+  const signed = await captureClobCall(
+    'placeLimitFokBuy/createOrder',
+    { tokenId: String(tokenId), side: 'BUY', size: sized.shares, price: px, tickSize,
+      negRisk: !!negRisk, requestedShares: Number(shares), rounding: sized.direction },
+    () => client.createOrder(
+      { tokenID: String(tokenId), price: px, size: sized.shares, side: Side.BUY },
+      { tickSize: String(tickSize), negRisk: !!negRisk },
+    ),
+  );
+
+  const result = await captureClobCall(
+    'placeLimitFokBuy/postOrder',
+    { tokenId: String(tokenId), size: sized.shares, price: px, orderType: 'FOK' },
+    () => client.postOrder(signed, OrderType.FOK),
+  );
+
+  const id = assertOrderAccepted(result, `CLOB limit-FOK buy ${sized.shares}sh @<=${px}`);
+
+  // A FOK that is honoured never rests. If this is ever true the venue did not
+  // treat the order as fill-or-kill, and that is a finding, not a fill.
+  const fill = readGtcFill(result, 'buy', sized.shares);
+  if (fill.resting) {
+    return {
+      id, order: result, price: px, size: 0, resting: true,
+      requestedShares: Number(shares), submittedShares: sized.shares,
+      status: result?.status || null,
+    };
+  }
+
+  return {
+    id,
+    order: result,
+    price: px,
+    size: fill.filledShares ?? sized.shares,
+    filledShares: fill.filledShares ?? sized.shares,
+    requestedShares: Number(shares),
+    submittedShares: sized.shares,
+    rounding: sized.direction,
+    costUsd: sized.notionalUsd,
+    side: Side.BUY,
+    resting: false,
+    status: result?.status || null,
+  };
 }
