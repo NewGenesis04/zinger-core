@@ -4772,6 +4772,70 @@ whoever owns that endpoint should say what it was meant to compute.
 
 ---
 
+### 88. Every arb package raised a false stop-loss alert on routine settlement ✅ FIXED
+
+**Found 2026-09-15** in the operator's paper-run log:
+
+```
+13:10:06.985  SL  ⚡ RAPID SELL BTC DOWN · settle · PnL $-5.25
+13:10:07.155  SL  🏁 PAPER ORPHAN SETTLE BTC DOWN · $5.25 · btc-updown-5m-1789473900
+```
+
+A pair's legs settle separately. The leg bought above $0.50 books a per-leg loss
+its sibling exactly offsets — this package netted **+$1.12**. But the line was
+typed `'sl'`, and `PolyDashboard.tsx:2628` raises a **red error toast** for every
+`'sl'`. So every profitable package produced one false stop-loss alert, which
+trains an operator to ignore exactly the alerts a live run needs.
+
+Three separate defects on those two lines:
+
+1. `executeSell` (`bot.ts:4696`) typed **every** sale `'sl'` — settle, manual,
+   rapid, panic — for both engines, and labelled a settlement "RAPID SELL".
+2. The paper settle loop (`bot.ts:2718`) used `pnl >= 0 ? 'tp' : 'sl'` on a
+   per-leg number that is meaningless for one half of a pair.
+3. `${pnl >= 0 ? '+' : ''}$${Math.abs(pnl)}` signed only gains and then took the
+   absolute value, so **a $5.25 loss printed as "$5.25"** — for both engines.
+
+**Scoped so directional trading is unaffected, and pinned by test rather than
+asserted.** The rule lives in `positions/settleLog.ts:settleLogKind`:
+
+| position | tone | why |
+|---|---|---|
+| arb leg, pair intact | `'settle'` (neutral, no toast) | per-leg P/L is meaningless |
+| arb leg, pair **gone** | `'tp'` / `'sl'`, unchanged | a naked leg's loss is real — the alert the live watchlist needs |
+| directional, any outcome | `'tp'` / `'sl'`, unchanged | exactly as before |
+
+"Intact" reuses item 74a's `hedgeIsIntact` rather than a second definition, and
+settlement order is safe with it: the second leg sees its sibling closed, but a
+LOCKED/SETTLED package short-circuits to intact first.
+
+The minus-sign fix applies to both engines. It is the one change directional
+sees, and it is display text only.
+
+**Display only.** Nothing here touches exit decisions, `exitReason`,
+`bookWindowExit`, window stats, cash or the ledger. `pushTrace` now passes
+`'settle'` through so arb settles stay in the exits trace bucket (`bot.ts:1514`
+already listed it); the ChatPanel "sell" filter includes it so they do not
+disappear from that view.
+
+Tests: 10 in `tests/unit/settleLogTone.test.ts`. 4 mutations, 4 killed —
+including the one that matters most to the operator's question: letting
+directional positions also take the neutral tone fails three tests.
+
+**Not fixed, noted for whoever owns it:**
+- `scan/exits.ts` contains an identical copy of the paper settle block and is
+  imported nowhere — dead code carrying the old sign bug.
+- Directional settles through `executeSell` still show as `⚡ RAPID SELL … 'sl'`
+  even when profitable, so a winning directional settlement raises a red error
+  toast. Left alone deliberately: this fix was scoped to not change directional
+  behaviour, and that change should be the directional owner's call.
+- Window summary lines (`🏁 WINDOW … closes 0 · PnL $0.00`) are written at window
+  end, but arb settlement waits `windowEnd + 5000ms`, so arb results are never
+  counted in them.
+- Log timestamps are local time (BST) while window labels are UTC.
+
+---
+
 ## Handoff — state as of 2026-08-20
 
 Written so a fresh session can continue without re-deriving any of the above.

@@ -22,7 +22,7 @@ function matchesFilter(type, filter) {
   if (filter === 'all') return true
   const t = (type || 'info').toLowerCase()
   if (filter === 'buy') return t === 'buy' || t === 'tp' || t === 'announce'
-  if (filter === 'sell') return t === 'sell' || t === 'sl' || t === 'panic'
+  if (filter === 'sell') return t === 'sell' || t === 'sl' || t === 'panic' || t === 'settle'
   if (filter === 'signal') return t === 'signal' || t === 'ml'
   if (filter === 'system') return t === 'system' || t === 'info' || t === 'log'
   if (filter === 'error') return t === 'error' || t === 'warn'

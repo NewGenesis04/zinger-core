@@ -77,6 +77,7 @@ import {
   portfolioView as buildPortfolioView,
 } from './positions/manager.js';
 import { holdsToSettlement, capacityFor } from './positions/policy.js';
+import { settleLogKind, formatSignedUsd } from './positions/settleLog.js';
 import { resolveSettlementPrice, positionWindowEndMs } from './positions/settle.js';
 import { evaluateEdgeGate, passesEdgeFilter } from './edge.js';
 import { buildDecision, resolveOrderSize, sideBalanceBonus } from './engines/directional.js';
@@ -1577,7 +1578,7 @@ function log(msg, type = 'info', meta = null) {
       meta: meta || null,
       read: false,
     });
-    pushTrace(type === 'sl' || type === 'tp' ? type : (meta?.arb ? 'arb' : 'event'), {
+    pushTrace(type === 'sl' || type === 'tp' || type === 'settle' ? type : (meta?.arb ? 'arb' : 'event'), {
       msg,
       type,
       symbol: meta?.market || meta?.symbol,
@@ -2725,12 +2726,23 @@ export async function scan() {
         try {
           const result = await executeSell(pos, 'settle');
           if (result?.ok) {
-            const pnlTxt = `${(pos.pnl || 0) >= 0 ? '+' : ''}$${Math.abs(pos.pnl || 0).toFixed(2)}`;
-            log(
-              `🏁 PAPER ORPHAN SETTLE ${pos.symbol} ${String(pos.outcome || '').toUpperCase()} · ${pnlTxt} · ${pos.slug}`,
-              (pos.pnl || 0) >= 0 ? 'tp' : 'sl',
-              { market: pos.symbol, slug: pos.slug, outcome: pos.outcome, pnl: pos.pnl, exitPrice: pos.exitPrice },
-            );
+            if (isIntactArbLeg(pos)) {
+              // One leg of a complete pair. Its sibling offsets this number, so
+              // neither a green TP nor a red SL describes what happened.
+              log(
+                `🏁 PAPER ARB LEG SETTLE ${pos.symbol} ${String(pos.outcome || '').toUpperCase()} · leg ${formatSignedUsd(pos.pnl)} · ${pos.slug}`,
+                'settle',
+                { market: pos.symbol, slug: pos.slug, outcome: pos.outcome, pnl: pos.pnl, exitPrice: pos.exitPrice, arb: true, packageId: pos.packageId },
+              );
+            } else {
+              // Directional, or a naked arb leg: the P/L is real, so the TP/SL
+              // tone stays exactly as it was. Only the sign is corrected.
+              log(
+                `🏁 PAPER ORPHAN SETTLE ${pos.symbol} ${String(pos.outcome || '').toUpperCase()} · ${formatSignedUsd(pos.pnl)} · ${pos.slug}`,
+                (pos.pnl || 0) >= 0 ? 'tp' : 'sl',
+                { market: pos.symbol, slug: pos.slug, outcome: pos.outcome, pnl: pos.pnl, exitPrice: pos.exitPrice },
+              );
+            }
           }
         } catch (err) {
           log(`⚠️ Orphan settle failed ${pos.slug}: ${String(err.message || err).slice(0, 120)}`, 'error');
@@ -4623,6 +4635,12 @@ export function resetLiveData({ baselineUsd = null } = {}) {
   return { ok: true, removed, baseline };
 }
 
+
+/** Item 88 — display tone for a settle line; the rule lives in `positions/settleLog.ts`. */
+function isIntactArbLeg(pos) {
+  return settleLogKind(pos, { packages: loadPackages(), positions: botState.positions }) === 'settle';
+}
+
 async function executeSell(pos, reason = 'manual') {
   if (!pos || pos.closed) return { ok: false, error: 'Position not found or already closed' };
 
@@ -4693,10 +4711,19 @@ async function executeSell(pos, reason = 'manual') {
   // without invalidating would hand back the pre-trade snapshot.
   try { invalidateBalanceCache(); await syncClobBalance(); await refreshTelemetry(); } catch {}
 
-  log(`⚡ RAPID SELL ${pos.symbol} ${pos.outcome?.toUpperCase()} · ${reason} · PnL $${pos.pnl?.toFixed(2)}`, 'sl', {
-    market: pos.symbol, slug: pos.slug, outcome: pos.outcome, reason,
-    pnl: pos.pnl, shares: positionShares(pos), exitPrice: price,
-  });
+  if (reason === 'settle' && isIntactArbLeg(pos)) {
+    log(`🏁 ARB LEG SETTLE ${pos.symbol} ${pos.outcome?.toUpperCase()} · leg ${formatSignedUsd(pos.pnl)} (offset by its pair)`, 'settle', {
+      market: pos.symbol, slug: pos.slug, outcome: pos.outcome, reason,
+      pnl: pos.pnl, shares: positionShares(pos), exitPrice: price, arb: true, packageId: pos.packageId,
+    });
+  } else {
+    // Unchanged for every other case — directional of any reason, and arb
+    // manual / rapid / panic sells, which are operator actions.
+    log(`⚡ RAPID SELL ${pos.symbol} ${pos.outcome?.toUpperCase()} · ${reason} · PnL $${pos.pnl?.toFixed(2)}`, 'sl', {
+      market: pos.symbol, slug: pos.slug, outcome: pos.outcome, reason,
+      pnl: pos.pnl, shares: positionShares(pos), exitPrice: price,
+    });
+  }
 
   return { ok: true, position: pos, pnl: pos.pnl };
 }
