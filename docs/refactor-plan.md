@@ -4564,7 +4564,7 @@ filled…`, `order was fully filled`); it dies now.
 
 ---
 
-### 85. A partially-filled directional entry is booked at its full requested size
+### 85. A partially-filled directional entry is booked at its full requested size ✅ FIXED
 
 **Found 2026-09-15** while confirming whether item 78 had made item 81
 unreachable. Same family, different order type, opposite direction.
@@ -4608,9 +4608,58 @@ position size that never existed.
 | `placeLimitFokBuy` | limit FOK, shares in | none; result is `{0, size}` | symmetric is **correct** |
 | `placeOrder` | GTC limit | fill can be **smaller** (partial) | one-sided **down** — this item |
 
-Not fixed inline: the fallback at `bot.ts:1176` is the load-bearing half, and
-changing what an unverified directional fill books is an execution-path decision
-on the directional engine, which this week's work has deliberately not touched.
+
+**FIXED 2026-09-15.** `readGtcFill` (`trade.ts`) + booking at `bot.ts`, 13
+invariant tests in `tests/unit/gtcPartialFill.test.ts`, 6 mutations applied.
+
+**The band is one-sided down, but widening it alone would have been wrong.**
+Admitting anything smaller than the request also admits any small number that
+happens to land in range — the degenerate receipt at
+`tests/unit/invariants.fillAccounting.test.ts:127` (`makingAmount: 1,
+takingAmount: 2` against 26 shares) would have started resolving as "2 shares
+filled". That existing invariant caught the first version of this fix, which is
+exactly what it was written for.
+
+So the rule is split by what the reading claims:
+
+| claim | accepted on | why |
+|---|---|---|
+| **full** — within the old symmetric tolerance of the request | itself | nothing to corroborate; this is the case the symmetric band was always right about, kept unchanged |
+| **partial** — anything less | the implied price | `maker / taker` is collateral-per-share actually paid. Both amounts share a scale so the ratio is scale-free. A BUY can never pay above its own limit, a SELL never sell below its floor — a partial whose implied price is impossible is a reading we do not understand |
+| **neither resolves** | nothing | `matched-unverified`, as before |
+
+Floor is `0.01` shares — `ROUNDING_CONFIG[tick].size` is 2 for every tick
+(item 83), so a sub-0.01 candidate is the other scale, not a fill. Ceiling is
+`want × 1.02`: a GTC order cannot overfill.
+
+**Booking.** A resolved partial is now booked at what filled, flagged
+`pos.partialFill`, and logged with both numbers. When the size is still
+unresolvable the request is booked *and said out loud* — between over- and
+under-booking, over-booking is the safer error here, because the exit paths
+clamp to real inventory before selling (`pmSharesForPosition`) whereas
+under-booking would strand real shares nobody knows about, which is the
+ghost-fill family. `pos.sharesUnverified` and `pos.requestedShares` make the
+divergence auditable instead of silent.
+
+**Mutation results: 6 applied, 5 killed, 1 equivalent.**
+
+- One survivor was a **real gap**: relaxing `fits.length === 1` to "take the
+  first match" passed every test, because scale ambiguity is unreachable below
+  ~9,800 shares (the candidates differ by 1e6). At that size the two readings
+  are 15,000 shares and 0.015 shares, and guessing books a million-fold error.
+  Two tests added at that size — one that must refuse, one that must still
+  resolve, so the guard refuses ambiguity rather than refusing size.
+- One survivor is **equivalent, not a gap**: dropping the `Number(price) > 0`
+  guard changes nothing, because a null price makes `limit` zero and the
+  implied-price comparison fails anyway. The guard is defensive redundancy and
+  is kept for readability.
+
+**Also corrected during this work:** the first draft of the floor test asserted
+that `makingAmount: 3, takingAmount: 6` must not resolve. It should — that is a
+6-share partial at exactly the limit price, an ordinary outcome. The test was
+wrong, not the code; rewritten to exercise the floor with a reading where
+neither candidate is usable.
+
 
 ---
 

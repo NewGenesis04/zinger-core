@@ -313,7 +313,29 @@ function assertOrderAccepted(result, context) {
  * BUY:  makingAmount = collateral paid, takingAmount = tokens received.
  * SELL: makingAmount = tokens given up, takingAmount = collateral received.
  */
-export function readGtcFill(result, side, requestedSize) {
+/**
+ * Resolve a wire amount to a real quantity — item 85.
+ *
+ * The only ambiguity is scale: the SDK signs with `parseUnits(…, 6)`, so a
+ * reading is either the quantity itself or that quantity × 1e6. Both candidates
+ * are tested against a band, and **exactly one** must fit; two fits is as
+ * unresolved as none, because picking the first would be a guess.
+ *
+ * The floor is not arbitrary. `ROUNDING_CONFIG[tick].size` is 2 for every tick
+ * size in this SDK, so the venue cannot represent a quantity below 0.01 — a
+ * candidate under that is not a fill, it is the other scale.
+ */
+function resolveScale(raw, { min, max }) {
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  const fits = [n, n / SHARE_SCALE].filter((c) => c >= min && c <= max);
+  return fits.length === 1 ? fits[0] : null;
+}
+
+/** The smallest share count the venue can express (see `roundingConfig.js`). */
+const MIN_REPRESENTABLE_SHARES = 0.01;
+
+export function readGtcFill(result, side, requestedSize, price = null) {
   const maker = Number(result?.makingAmount);
   const taker = Number(result?.takingAmount);
   const tradeCount = Array.isArray(result?.tradeIDs) ? result.tradeIDs.length : null;
@@ -324,18 +346,82 @@ export function readGtcFill(result, side, requestedSize) {
     return { filledShares: 0, resting: true, fillSource: tradeCount === 0 || moved === false ? 'no-fill' : 'unknown' };
   }
 
-  const rawShares = String(side).toLowerCase() === 'buy' ? taker : maker;
+  const isBuy = String(side).toLowerCase() === 'buy';
   const want = Number(requestedSize);
-  const tolerance = Math.max(0.05, Math.abs(want) * 0.02);
-  const shares = [rawShares, rawShares / 1e6]
-    .find((c) => Number.isFinite(want) && want > 0 && Math.abs(c - want) <= tolerance) ?? null;
+  if (!(want > 0)) {
+    return { filledShares: null, resting: false, fillSource: 'matched-unverified' };
+  }
+
+  /**
+   * ITEM 85 — the band is one-sided DOWN, because a GTC limit order can
+   * legitimately fill for less than it asked for and can never fill for more.
+   *
+   * The previous band was symmetric: `|c − want| ≤ max(0.05, want × 2%)`. That
+   * is the right shape for a fill-or-kill order, where the answer is 0 or
+   * exactly `want` — and it is the WRONG shape here, where a partial fill is an
+   * ordinary outcome. Anything more than 2% short failed to resolve, came back
+   * null, and `bot.ts` then booked the full requested size: a 50%-filled entry
+   * recorded as 100% filled, with equity, realised P/L and Kelly sizing all
+   * reading the inflated number.
+   *
+   * Note this is the mirror image of item 81, which had the same symmetric band
+   * failing in the *opposite* direction on the market-order path. Same
+   * arithmetic, three different correct answers — see the table in item 85.
+   */
+  const ceiling = want * 1.02;
+  const candidate = resolveScale(isBuy ? taker : maker, {
+    min: MIN_REPRESENTABLE_SHARES,
+    max: ceiling,
+  });
+
+  /**
+   * A FULL fill is self-evident: the count matches what was asked for, and no
+   * corroboration adds anything. This is the original symmetric test, kept
+   * exactly, for exactly the case it was right about.
+   */
+  const fullFillTolerance = Math.max(0.05, Math.abs(want) * 0.02);
+  const looksFull = candidate != null && Math.abs(candidate - want) <= fullFillTolerance;
+
+  /**
+   * A PARTIAL claim is not self-evident and is NOT accepted on its own.
+   *
+   * Widening the band downward to admit partials also admits any small number
+   * that happens to land in range — and a receipt of `makingAmount: 1,
+   * takingAmount: 2` against a 26-share request would read as "2 shares filled"
+   * rather than as the unresolvable garbage it is. That is the invariant at
+   * `tests/unit/invariants.fillAccounting.test.ts:127`, and it is correct.
+   *
+   * So a partial must corroborate itself with the implied price. `maker / taker`
+   * is the collateral-per-share actually paid; both amounts share a scale, so
+   * the ratio is scale-free and needs no unit guessing. For a BUY it can never
+   * legitimately exceed the limit price — you cannot pay more than your own
+   * ceiling — and for a SELL it can never fall below the floor. A partial whose
+   * implied price is impossible is a reading we do not understand, and an
+   * unresolved fill is the honest answer.
+   */
+  let shares = looksFull ? candidate : null;
+  let source = shares == null ? null : 'receipt';
+
+  if (shares == null && candidate != null && Number(price) > 0 && taker > 0 && maker > 0) {
+    const impliedPrice = isBuy ? maker / taker : taker / maker;
+    const limit = Number(price);
+    const withinLimit = isBuy
+      ? impliedPrice <= limit * 1.001
+      : impliedPrice >= limit * 0.999;
+    if (withinLimit && impliedPrice > 0) {
+      shares = candidate;
+      source = 'receipt-partial';
+    }
+  }
 
   return {
     // A matched order whose size cannot be resolved is reported as unverified
     // rather than assumed complete — null, never the requested size.
     filledShares: shares,
     resting: false,
-    fillSource: shares == null ? 'matched-unverified' : 'receipt',
+    partial: shares != null && shares < want - MIN_REPRESENTABLE_SHARES,
+    requestedShares: want,
+    fillSource: shares == null ? 'matched-unverified' : source,
   };
 }
 
@@ -355,7 +441,7 @@ export async function placeOrder({ tokenId, side, amountUsd, price, negRisk = fa
   );
 
   const id = assertOrderAccepted(result, `CLOB ${side} ${size}sh @ ${px}`);
-  const fill = readGtcFill(result, side, size);
+  const fill = readGtcFill(result, side, size, px);
   captureReceipt({
     fn: 'placeOrder/verified',
     phase: 'response',
@@ -850,7 +936,7 @@ export async function placeLimitFokBuy({
 
   // A FOK that is honoured never rests. If this is ever true the venue did not
   // treat the order as fill-or-kill, and that is a finding, not a fill.
-  const fill = readGtcFill(result, 'buy', sized.shares);
+  const fill = readGtcFill(result, 'buy', sized.shares, px);
   if (fill.resting) {
     return {
       id, order: result, price: px, size: 0, resting: true,

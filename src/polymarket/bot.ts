@@ -1175,7 +1175,39 @@ async function executePendingTrade(pending) {
       // `size` is what was asked for; `filledShares` is what the book gave.
       pos.shares = orderResult.filledShares ?? orderResult.size;
       pos.entryPrice = orderResult.price;
-      if (orderResult.fillSource === 'matched-unverified') pos.unverifiedFill = true;
+      /**
+       * Item 85. A GTC limit order can partially fill, and until the band in
+       * `readGtcFill` was made one-sided those partials came back unresolved and
+       * were booked at the full requested size — a 50% fill recorded as 100%.
+       *
+       * Genuine partials now resolve, and the two cases that remain are both
+       * recorded rather than smoothed over:
+       *
+       *  - a resolved partial: booked at what actually filled, and flagged so
+       *    the divergence from the plan is visible in the position record.
+       *  - still unresolvable: the request is booked, because between
+       *    over-booking and under-booking, over-booking is the safer error here
+       *    — the exit paths clamp to real inventory before selling
+       *    (`pmSharesForPosition`), whereas under-booking would strand real
+       *    shares nobody knows about, which is the ghost-fill family. The cost
+       *    is an overstated ledger, so it is logged rather than left silent.
+       */
+      pos.requestedShares = orderResult.size;
+      if (orderResult.partial) {
+        pos.partialFill = true;
+        log(`📉 PARTIAL FILL ${pending.symbol} ${pending.outcome.toUpperCase()} · ${pos.shares}sh of ${orderResult.size}sh requested`, 'system', {
+          market: pending.symbol, slug: pending.slug, outcome: pending.outcome,
+          filledShares: pos.shares, requestedShares: orderResult.size, orderId: pos.orderId,
+        });
+      }
+      if (orderResult.fillSource === 'matched-unverified') {
+        pos.unverifiedFill = true;
+        pos.sharesUnverified = true;
+        log(`⚠️ FILL SIZE UNVERIFIED ${pending.symbol} ${pending.outcome.toUpperCase()} — booking the requested ${orderResult.size}sh; ledger may overstate until inventory is reconciled`, 'error', {
+          market: pending.symbol, slug: pending.slug, outcome: pending.outcome,
+          requestedShares: orderResult.size, orderId: pos.orderId,
+        });
+      }
       markPosition(pos, orderResult.price);
       // Synchronous first: the next sizing read must not see money already
       // spent. `costBasis` is shares × entryPrice as of markPosition (:1360).
