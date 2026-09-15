@@ -3292,7 +3292,9 @@ export async function scan() {
                 'system',
                 sellDebug,
               );
-              if (!claimPositionExit(pos)) continue;
+              // Another exit already owns this position; report "did not sell"
+              // the way every other refusal in this function does.
+              if (!claimPositionExit(pos)) return false;
               try {
                 const sellRes = await placeMarketSell({
                   tokenId: pos.tokenId,
@@ -3375,7 +3377,9 @@ export async function scan() {
               'system',
               sellDebug,
             );
-            if (!claimPositionExit(pos)) continue;
+            // Another exit already owns this position — same convention as the
+            // rejection paths below: report that nothing was closed.
+            if (!claimPositionExit(pos)) return false;
             try {
               const sellRes = await placeMarketSell({
                 tokenId: pos.tokenId,

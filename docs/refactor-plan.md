@@ -4705,6 +4705,73 @@ neither candidate is usable.
 
 ---
 
+### 86. `tsc` and the test suite both pass on code the runtime cannot parse ✅ FIXED
+
+**Found 2026-09-15** by a live boot failure on the VPS, not by any check in this
+repo:
+
+```
+Error: Transform failed with 2 errors:
+  src/polymarket/bot.ts:3295:43: ERROR: Cannot use "continue" here
+  src/polymarket/bot.ts:3378:41: ERROR: Cannot use "continue" here
+```
+
+Two `continue` statements were added inside `closePosition` and the partial-sell
+helper — **functions, not loops** — during the item 84 exit-claim work. Both
+`npx tsc --noEmit -p .` and the full 569-test suite passed on that code.
+
+**Why both checks were blind, which is the actual finding:**
+
+1. `bot.ts` opens with `// @ts-nocheck` (line 1), so **tsc skips the file
+   entirely**.
+2. **No test imports `bot.ts` as a module.** The tests that mention it read it
+   as *text* via `repoFile(...)` to assert on source patterns
+   (`invariants.fillAccounting.test.ts:146`, `invariants.orderRouting.test.ts:72`),
+   so esbuild never transforms it and a parse error never surfaces.
+
+So the largest and most safety-critical file in the repo had **no syntax gate of
+any kind**, and a green suite said nothing about whether the bot could start.
+This is not specific to `continue`: any parse error in any `@ts-nocheck` file
+that no test imports would have shipped the same way.
+
+**Fix:** `tests/unit/sourceTransforms.test.ts` runs esbuild's `transformSync` —
+the same transform `tsx` uses at boot — over every `.ts`/`.tsx` under `src/` plus
+`index.ts`. Parse errors now fail in the suite instead of on the VPS. Verified by
+reintroducing the exact bug: the new test fails with the venue's own message
+while `tsc` still reports nothing.
+
+Deliberately checks **parsing only**. Type errors are tsc's job, and
+`@ts-nocheck` files have opted out of that on purpose — but nothing opts out of
+having to parse. The sweep also asserts it found >30 files, so it cannot
+silently cover nothing.
+
+**Note on the fix to the original bug:** both sites now `return false`, matching
+the convention every other refusal in those functions already used — not
+`break`, which would have changed control flow.
+
+---
+
+### 87. `server.ts:359` assigns to a constant and will throw when reached
+
+**Found 2026-09-15** by esbuild's own warning during the item 86 sweep:
+
+```
+▲ [WARNING] This assignment will throw because "totalReturn" is a constant
+    src/server.ts:359:8:
+      359 │         totalReturn += totalReturn;
+```
+
+Pre-existing and unrelated to this week's work. It parses, so item 86's sweep
+does not fail on it — esbuild reports it as a warning, and the throw happens at
+runtime when that line executes.
+
+Two things wrong independently: the assignment targets a `const`, and
+`totalReturn += totalReturn` is a doubling that reads like a typo for something
+else. Not fixed here because the correct value is not inferable from the line —
+whoever owns that endpoint should say what it was meant to compute.
+
+---
+
 ## Handoff — state as of 2026-08-20
 
 Written so a fresh session can continue without re-deriving any of the above.
