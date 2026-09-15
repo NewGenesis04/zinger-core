@@ -3514,7 +3514,7 @@ gate removed (1), budget gate removed (1), depth dropped from the sizing `min`
 (1). The 24 pre-existing arb fixtures gained `bestAskSize: 5000` — deep enough
 that depth is not the constraint under test in files testing parity and fees.
 
-### 74. Nothing stops a losing arb loop — the breakers exempt it, and there is no session cap · (a) OPEN · (b) ✅ FIXED
+### 74. Nothing stops a losing arb loop — the breakers exempt it, and there is no session cap ✅ FIXED (a + b)
 
 **Found 2026-09-10** while answering "can I leave this running overnight?". The
 answer is no, and the reason is not the sizing gate — it is that if the gate is
@@ -3556,6 +3556,48 @@ The information to tell them apart already exists and is not consulted:
 on the parity-breach path. The fix is for the exemption to require a *live
 complement*, not a marker. Belongs with the D4 position manager, which is what
 would own "is this leg still hedged".
+
+> **(a) FIXED 2026-09-15.** `hedgeIsIntact` + a `context` parameter on
+> `holdsToSettlement` (`positions/policy.ts`), supplied at the three risk-exit
+> call sites in `bot.ts`. 10 invariant tests in
+> `tests/unit/nakedLegExits.test.ts`, 7 mutations killed.
+>
+> **The exemption now belongs to the hedge, not to the label.** A leg is immune
+> from mid-window exits only while its pair actually exists. Positive evidence
+> that it does not — the package is `ABORTED` **and** no live sibling on the
+> opposite outcome remains — withdraws the immunity and the position becomes
+> exit-managed like any other directional holding.
+>
+> `ABORTED` alone is deliberately not enough: a package can abort with both legs
+> held (the parity-breach path does exactly that), and force-closing a real pair
+> is the expensive error.
+>
+> **Every "cannot tell" still returns exempt, and that is not timidity.** The
+> two errors are asymmetric, and the asymmetry runs opposite to intuition:
+>
+> | error | consequence |
+> |---|---|
+> | wrongly **expose** an intact pair | a stop loss closes one side, forfeits the locked edge, and **manufactures** the naked leg this item exists to prevent |
+> | wrongly **exempt** a naked leg | one unmanaged directional position — which is what we had before this fix |
+>
+> The first error *creates* the problem; the second merely fails to fix it. So an
+> absent package record, a missing context, a `PENDING_FILL` mid-dispatch and a
+> marker with no package key all stay exempt.
+>
+> **Call sites updated** (the ones that decide "may this position be closed
+> now"): the fast stop-loss (`scanOpenExitsFast`), the portfolio drawdown close,
+> and in-scan exit management. Deliberately **not** updated: `manager.ts:69` and
+> the paper-cash unwind, which ask "is this engine exit-managed" rather than
+> "may this position be closed", and where the marker-only reading remains
+> correct. The context parameter is optional precisely so that distinction stays
+> visible in the code rather than being flattened.
+>
+> **Operational consequence:** a naked leg now gets a stop loss. Combined with
+> item 80 (fewer naked legs created) and item 74b (a cap on what a loop can
+> cost), the 2026-08-28 failure — 26.33 DOWN shares, sibling killed, exempt from
+> every exit, expired at zero for −$12.83 — now has three independent things
+> that would each have caught it.
+
 
 **(b) No cumulative loss cap of any kind.**
 

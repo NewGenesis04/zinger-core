@@ -137,8 +137,79 @@ function hasHedgeMarkers(posOrPlan) {
  * is a single unmanaged position. So the structural markers win: any hedge
  * evidence at all means hold to settlement. Fail toward the intact pair.
  */
-export function holdsToSettlement(posOrPlan) {
-  if (hasHedgeMarkers(posOrPlan)) return true;
+/**
+ * Is the hedge this leg belongs to still actually a hedge? — backlog item 74a.
+ *
+ * The exemption above rests on a real property: a complementary pair redeems to
+ * exactly $1.00 at settlement, so closing it early forfeits the edge for
+ * nothing. That property belongs to the PAIR. A leg whose sibling never filled,
+ * or was unwound, does not have it — it is an ordinary directional bet, and the
+ * marker on it is a statement of intent, not of fact.
+ *
+ * Before this, the markers alone won, so the one position that most needed a
+ * stop loss — a naked leg the operator never chose to hold — was the single
+ * position guaranteed to ride to settlement untouched. That is the shape of the
+ * 2026-08-28 −$12.83 loss: 26.33 DOWN shares, sibling killed, exempt from every
+ * exit, expired at zero.
+ *
+ * ## Still failing toward the intact pair, and why that is not timidity
+ *
+ * Every "cannot tell" answer here returns `true` (stay exempt). The two errors
+ * are not symmetric, and the asymmetry runs the opposite way to intuition:
+ *
+ *   wrongly EXPOSE an intact pair  ->  a stop loss closes one side, forfeits the
+ *                                      locked edge, and MANUFACTURES the naked
+ *                                      leg this item exists to protect against
+ *   wrongly EXEMPT a naked leg     ->  one unmanaged directional position, which
+ *                                      is what we had before this fix
+ *
+ * The first error creates the problem; the second merely fails to fix it. So the
+ * exemption is withdrawn only on positive evidence that the hedge is gone —
+ * never on an absent package record, never on a missing context.
+ */
+export function hedgeIsIntact(pos, { packages = null, positions = null } = {}) {
+  const packageId = pos?.packageId;
+  // A marker with no package key: nothing to check it against.
+  if (!packageId) return true;
+  if (!Array.isArray(packages)) return true;
+
+  const pkg = packages.find((p) => p?.packageId === packageId);
+  // Unknown package — cannot disprove the hedge, so do not act on a guess.
+  if (!pkg) return true;
+
+  // LOCKED / SETTLED / MERGED are intact by definition; PENDING_FILL is still
+  // in flight and must not be touched mid-dispatch.
+  if (pkg.status !== 'ABORTED') return true;
+
+  /**
+   * ABORTED does not by itself mean naked. A package can abort with both legs
+   * held — the parity-breach path does exactly that — and force-closing a real
+   * pair is the expensive error. So the question is narrower: is a live sibling
+   * on the opposite outcome still open?
+   */
+  if (!Array.isArray(positions)) return true;
+  const sibling = positions.find((p) => (
+    p
+    && !p.closed
+    && p.packageId === packageId
+    && String(p.outcome) !== String(pos?.outcome)
+    && Number(p.shares || 0) > 0
+  ));
+  return !!sibling;
+}
+
+/**
+ * @param context  Optional `{ packages, positions }`. Supplied by the risk-exit
+ *   call sites so a naked leg can be told apart from a hedged one (item 74a).
+ *   Omitted elsewhere, where the answer is "is this engine exit-managed" rather
+ *   than "may this specific position be closed now" — and where the old
+ *   marker-only reading is still the right one.
+ */
+export function holdsToSettlement(posOrPlan, context = null) {
+  if (hasHedgeMarkers(posOrPlan)) {
+    if (context) return hedgeIsIntact(posOrPlan, context);
+    return true;
+  }
   return policyFor(posOrPlan).holdsToSettlement === true;
 }
 

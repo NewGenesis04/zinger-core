@@ -2565,6 +2565,10 @@ async function scanOpenExitsFast() {
   const opens = botState.positions.filter((p) => !p.closed);
   if (!opens.length) return;
   const readinessPositions = botState.readiness?.positions || [];
+  // Item 74a. A leg is exempt from this stop loss only while its hedge actually
+  // exists; the package list is what distinguishes an intact pair from a naked
+  // leg carrying a leftover marker. Read once per pass, not per position.
+  const hedgeContext = { packages: loadPackages(), positions: botState.positions };
   const bySlug = new Map();
   for (const pos of opens) {
     if (!bySlug.has(pos.slug)) bySlug.set(pos.slug, []);
@@ -2583,7 +2587,7 @@ async function scanOpenExitsFast() {
     const prices = await getPricesForMarket(market).catch(() => ({}));
     const depth = await getDepthForMarket(market).catch(() => null);
     for (const pos of positions) {
-      if (pos.closed || holdsToSettlement(pos)) continue;
+      if (pos.closed || holdsToSettlement(pos, hedgeContext)) continue;
       const mark = exitMarkPrice(pos.outcome, prices, depth);
       if (!mark) continue;
       markPosition(pos, mark);
@@ -3186,10 +3190,13 @@ export async function scan() {
             const ddPct = ((totalUnrealized / totalCost) * 100).toFixed(1);
             log(`🔴 MAX DRAWDOWN ${cfg.mode.toUpperCase()} · ${ddPct}% off cost (limit ${(maxDd * 100)}%) — closing all positions`, 'system', { totalCost, totalUnrealized, ddPct, limit: maxDd });
             botState._ddTriggered = true;
+            const ddHedgeContext = { packages: loadPackages(), positions: botState.positions };
             for (const op of modePositions) {
               // Arb legs are hedged to $1.00 at settlement — force-closing mid-window
               // forfeits the locked edge and books the spread. Keep them immune.
-              if (holdsToSettlement(op)) continue;
+              // Item 74a: only while the hedge is real. A leg whose sibling is
+              // gone is a directional position and belongs in this sweep.
+              if (holdsToSettlement(op, ddHedgeContext)) continue;
               // Item 84 part 4 — claimed immediately before the await, and only
               // on the path that actually awaits. Claiming above the live check
               // would leak the claim for every paper position, which never
@@ -3502,8 +3509,10 @@ export async function scan() {
           continue;
         }
 
-        // Package legs are immune from mid-window exits — hold strictly to settlement
-        if (holdsToSettlement(pos)) {
+        // Package legs are immune from mid-window exits — hold strictly to
+        // settlement. Item 74a: immune only while the pair actually exists; a
+        // naked leg is exit-managed like any other directional position.
+        if (holdsToSettlement(pos, { packages: loadPackages(), positions: botState.positions })) {
           continue;
         }
 
