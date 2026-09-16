@@ -3872,7 +3872,15 @@ fill → then this.
 
 ---
 
-### 78. The arb order is sized in shares and submitted in dollars, and the round trip does not close ✅ FIXED & ENABLED
+### 78. The arb order is sized in shares and submitted in dollars, and the round trip does not close ❌ CLOSED 2026-09-16 — WON'T FIX
+
+**CLOSED.** The share-denominated route is abandoned; `arbExactShareRouting`
+stays `false` permanently. The unit round-trip described below is real, but it
+was measured at **~0.014 shares per package** (worst case $0.09, total worst-case
+stranded value **$0.25** across all 21 canary packages) — and every route that
+removes it costs more than that. See item 89 for the measurement and the
+decision. Everything from here down is retained as the record of why, not as
+work to be picked up.
 
 **Found 2026-09-11** in `docs/live_canary_packages.json` (21 live packages,
 2026-09-09 → 2026-09-11, all ABORTED, no leg ever filled).
@@ -4340,7 +4348,41 @@ for the HTTP contract itself.
 
 ---
 
-### 81. `verifyFilledShares` uses a symmetric tolerance for a one-sided quantity ⏸️ DORMANT (unreachable while item 78 is on)
+### 81. `verifyFilledShares` uses a symmetric tolerance for a one-sided quantity 🔶 LIVE AGAIN, PERMANENTLY — contained, not fixed
+
+**STATUS 2026-09-16, supersedes the 2026-09-15 note below.** Items 78 and 89 are
+CLOSED WON'T FIX, so `arbExactShareRouting` is `false` for good. The 2026-09-15
+status said this defect was "one config flag away from being live again" — that
+flag has now been thrown, deliberately and permanently. **The defective path at
+`bot.ts:1139` is the only arb fill path there is.** It is no longer dormant and
+never will be again.
+
+Why that is nevertheless acceptable, traced rather than asserted
+(`bot.ts:1293–1307`): on the dollar route `quote` is non-null via
+`expectedSharesFor`, so an `UNVERIFIED_FILL` throw is caught by
+`reconcileArbLeg`, which uses `arbReconcile.ts:shareBand` — the correct
+one-sided ceiling. A confirmed fill is booked at `recon.shares` and
+`arbEngine.ts:635` sizes leg 2 against the venue's count, not the plan. So the
+symmetric band still misjudges every price-improved fill, but the misjudgement is
+now absorbed rather than acted on. That containment is exactly what was missing
+on 2026-09-11.
+
+**The residual cost, which is real and permanent.** `err.fokKill`'s fast abort
+does not apply here — an unverified fill is not a kill — so every price-improved
+arb fill now takes the full dual-door reconciliation (~4.5s) before leg 2 is
+sized. That is a one-sided exposure window on a leg that is already filled.
+Frequency is unmeasured: one confirmed instance (2026-09-11, 0.0004 shares
+outside the band). **Fixing the band at `trade.ts:293` to use `shareBand`'s
+one-sided ceiling would remove that window**, and is now worth doing on its own
+merits rather than being dissolved by item 78. Not scheduled; not attempted here.
+
+Note the trap flagged at the end of this item still stands: `readGtcFill`'s
+identical-looking symmetric band at `trade.ts:329` is **correct** and must not be
+"fixed" by analogy.
+
+---
+
+*Original filing follows.*
 
 **Found 2026-09-14** while building item 80. This is the root cause behind the
 ghost fill. It was live on the fill path when filed; see the status note below
@@ -4833,6 +4875,114 @@ directional positions also take the neutral tone fails three tests.
   end, but arb settlement waits `windowEnd + 5000ms`, so arb results are never
   counted in them.
 - Log timestamps are local time (BST) while window labels are UTC.
+
+---
+
+### 89. Exact-share routing breaks venue precision on 96% of orders, and on 65% of second legs ❌ CLOSED 2026-09-16 — WON'T FIX
+
+**CLOSED together with item 78.** `arbExactShareRouting` stays `false`
+permanently. The share-lattice fix sketched below is buildable and was costed:
+it is **~2.4× more expensive than the defect it removes**. Retained as the
+reason nobody should re-enable this route. See "Why this was closed" at the end.
+
+**Found 2026-09-15** from live receipts, within hours of item 78 being enabled.
+**`arbExactShareRouting` set back to `false`** in `modeConfig.ts`; the running
+VPS config must be changed by the operator, since a code default does not
+override a stored value.
+
+Two live leg-1 orders, 27 minutes apart:
+
+| time (UTC) | shares × price | signed maker | venue answer |
+|---|---|---|---|
+| 13:56:32 | 5.20 × $0.25 | 1300000 ($1.30, 2 dp) | FOK kill — valid order, nothing to match |
+| 14:23:53 | 5.26 × $0.35 | 1841000 ($1.841, **3 dp**) | **"invalid amounts … maker amount supports a max accuracy of 2 decimals"** |
+
+The first passed only because 5.2 × 0.25 happens to land on whole cents.
+
+**Mechanism** (full write-up: domain facts §8 amendment). A crossing limit order
+is validated under marketable-order precision — maker ≤ 2 dp, taker ≤ 4 dp. The
+SDK's market builder rounds to that; its limit builder allows maker to 4 dp.
+Measured with the SDK's own builders: **95.7%** of limit-route orders are
+invalid, **0.0%** of market-route orders.
+
+**Why it is worse than "most orders fail".** Share parity means leg 2 buys leg 1's
+count at a *different* price. Of packages whose first leg passes validation,
+**64.5%** would have the second leg rejected on precision. Leg 1 filled, leg 2
+refused, and `arbEngine.ts:592` unwinds leg 1 — a realised loss of the spread plus
+two taker fees, on every such package. Bounded: the unwind, item 74a's stop loss
+and item 74b's $10 cap each limit it. But it is a systematic bleed on a route that
+also almost never trades.
+
+**What the new telemetry did right.** The precision rejection does not match
+`isSyncFokKill` (verified), so it took the full reconciliation path rather than a
+fast abort, and incremented `unmatchedFailures` with its text — item 84's
+vocabulary counter surfacing a rejection nobody had seen, which is what it was
+built for.
+
+**Why turning it off is safe now, when it would not have been on 2026-09-11.**
+With routing back on the dollar path, item 81's symmetric band is reachable
+again. But item 80's reconciler resolves that exact case with `shareBand` — one-
+sided, correct — and hedges leg 2 against the confirmed count. The ghost fill was
+dangerous because nothing reconciled; now something does.
+
+**The fix that was considered, costed, and rejected.** Choose the package share
+count at sizing time (`arbEngine.ts`, item 73's gate) so it is valid for **both**
+legs:
+
+- per-leg step = `100 / gcd(c, 100)` hundredths of a share, for a price of `c` cents
+- package step = `lcm(step_up, step_down)`
+- round DOWN to the package step (depth-safe), then confirm both legs still clear
+  the $1.00 notional floor
+
+**Correction to the first draft of this item.** It claimed "at prices coprime to
+100 that step is one whole share, so small packages will often be unbuildable."
+The first half is right, the conclusion is wrong. Both per-leg steps divide 100,
+so their `lcm` also divides 100 — **the package step can never exceed 1.00
+share.** Swept over every tick-0.01 price pair summing under $1.00, the maximum
+joint step is exactly 1.00 share. All 21 canary packages (2.808–5.495 shares) are
+constructible. Buildability was never the obstacle.
+
+**Why this was closed.** The obstacle is the *size* the lattice forces you to
+give up. Snapping down to the joint step, priced at each package's own
+`1 − (p_up + p_down)` margin:
+
+| | gross locked profit, 21 canary packages |
+|---|---|
+| share counts as sized today | $6.73 |
+| snapped down to the joint lattice | **$6.11** (−9.2%) |
+| snapped to nearest within budget | $6.11 — snapping up never fits the budget |
+
+Against a defect (item 78's unit round-trip) whose total worst-case cost over the
+same 21 packages is **$0.25**, valuing every mismatched residual share at zero.
+Mean residual 0.0121 shares/package; worst `pkg-btc-mtutdjae` at 0.0995 shares
+($0.09). So the fix costs a **certain** $0.62 to remove an **upper-bound** $0.25
+— and the residual is a naked fraction of a share that sometimes settles a
+winner, so the true figure is lower still.
+
+The staircase is worth naming, because each tread was individually reasonable:
+the dollar route had a ~1¢/package flaw → item 78 moved to the share route to fix
+it → the share route broke 96% of orders → item 89 proposed lattice machinery to
+fix that → the machinery costs 9% of profit. Every step followed from the last
+and the sequence ends below where it started. The correct move is to step back to
+the dollar route and stop.
+
+**Caveats on the numbers above, stated so they are not over-read.** All 21
+packages ABORTED with no leg ever filled, so both columns are modelled on real
+prices and hypothetical fills. Fees are excluded from both sides. Crucially, a
+snapped-down package is *smaller*, so some would no longer clear the fee-aware
+break-even gate (item 7) — not modelled, and it can only make the lattice route
+look worse, never better. The comparison is thin evidence in absolute terms; it
+is decisive only because the two figures differ by 2.4× in the direction of doing
+nothing.
+
+**If anyone reopens this**, the bar is: live fill data showing the dollar route's
+leg-share mismatch costs materially more than $0.25 per 21 packages. Until then
+the lattice is a correct piece of arithmetic in search of a problem.
+
+**Process note.** The asymmetry was visible in vendored SDK source the whole time
+— `getMarketOrderRawAmounts` rounds maker to `size`, `getOrderRawAmounts` to
+`amount` — and was not cross-checked before the flag was turned on. The probe was
+treated as sufficient evidence for a route whose validation it could not exercise.
 
 ---
 

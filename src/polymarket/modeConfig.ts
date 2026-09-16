@@ -159,7 +159,41 @@ export function defaultPaperStrategy() {
      * observation. `placeLimitFokBuy` therefore still treats a resting response
      * as a failure — now a contradiction-detector rather than a live hazard.
      */
-    arbExactShareRouting: true,
+    /**
+     * DISABLED PERMANENTLY 2026-09-16 — items 78 and 89 both CLOSED, WON'T FIX.
+     * Leave this `false`. The route below is not "off pending a fix"; the fix
+     * was costed and rejected.
+     *
+     * DISABLED 2026-09-15 — item 89. The live probe proved the venue
+     * honours FOK on a limit order; it could not reveal that a CROSSING limit
+     * order is validated under MARKETABLE-order precision:
+     *
+     *   "invalid amounts, the market buy orders maker amount supports a max
+     *    accuracy of 2 decimals, taker amount a max of 4 decimals"
+     *
+     * The limit builder signs maker = shares × price to up to 4 decimals
+     * (`ROUNDING_CONFIG['0.01'].amount`). Swept against the SDK's own builders:
+     * 95.7% of limit-route orders break that rule; 0% of market-route orders
+     * do. And of the packages whose FIRST leg happens to pass, 64.5% would have
+     * the second leg rejected — leg 1 filled, leg 2 refused, leg 1 unwound at
+     * the cost of the spread plus two taker fees.
+     *
+     * The probe's own order (100 × $0.01 = $1.00) is exactly the kind that
+     * avoids the rule, which is why it passed.
+     *
+     * With this off, item 81's symmetric-tolerance path is live again — but item
+     * 80's reconciler now resolves that exact case with an asymmetric band and
+     * hedges the second leg, which is what was missing on 2026-09-11.
+     *
+     * WHY NOT JUST FIX THE SIZING. You can: pick a share count valid at both
+     * legs' prices. Per-leg step is `100/gcd(cents, 100)` hundredths of a share,
+     * package step is their `lcm`, and since both divide 100 the package step
+     * never exceeds 1.00 share — always constructible. It was measured on the 21
+     * canary packages and it costs 9.2% of gross locked profit ($6.73 -> $6.11)
+     * to remove a defect whose total WORST-CASE cost over the same packages is
+     * $0.25. The fix is 2.4x the flaw. Item 89 has the full workings.
+     */
+    arbExactShareRouting: false,
     // Absolute floor: "how big a dislocation is worth the trouble". Profitability
     // is no longer this field's job — the fee-aware break-even gate owns that
     // (item 7), and it cannot be turned off. Safe to lower to capture skewed
