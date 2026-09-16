@@ -123,8 +123,10 @@ describe('INVARIANT: the 2026-09-11 fill is recognised as a fill', () => {
     // A fill can never come in below the expected count — FOK does not partly
     // fill — so the only slack below is our own rounding.
     expect(band.lo).toBeCloseTo(4.4982, 4);
-    // Above, the ceiling is every share filling a full tick better.
-    expect(band.hi).toBeCloseTo(4.59 * 27 + 0.0918, 4);
+    // Above, the ceiling is every share filling at one tick, with the rounding
+    // slack scaled by the same factor (item 81).
+    expect(band.hi).toBeCloseTo((4.59 + 0.0918) * 27, 4);
+    expect(band.hi).toBeGreaterThanOrEqual(1.24 / 0.01);
     expect(GHOST.actualShares).toBeGreaterThan(band.lo);
     expect(GHOST.actualShares).toBeLessThan(band.hi);
   });

@@ -1,5 +1,5 @@
 // @ts-nocheck
-import { ClobClient, AssetType, Side, SignatureTypeV2, OrderType } from '@polymarket/clob-client-v2';
+import { ClobClient, AssetType, Side, SignatureTypeV2 } from '@polymarket/clob-client-v2';
 import { createWalletClient, http } from 'viem';
 import { polygon } from 'viem/chains';
 import { privateKeyToAccount } from 'viem/accounts';
@@ -479,13 +479,53 @@ export async function placeOrder({ tokenId, side, amountUsd, price, negRisk = fa
  */
 const SHARE_SCALE = 1_000_000;
 
-function resolveAgainstExpected(rawValue, expectedShares, tolerance) {
-  const raw = Number(rawValue);
-  if (!Number.isFinite(raw) || raw <= 0) return null;
-  const fits = [raw, raw / SHARE_SCALE].filter((c) => Math.abs(c - expectedShares) <= tolerance);
-  // Exactly one reading may fit. Zero means the fill is not what we asked for;
-  // two means the two scales are indistinguishable here. Both are unresolved.
-  return fits.length === 1 ? fits[0] : null;
+/**
+ * The share count band a fixed-dollar FOK buy could legitimately land in —
+ * item 81.
+ *
+ *   lo = expected − tolerance                  (rounding on our side of the arithmetic)
+ *   hi = (expected + tolerance) × (price / tick)   (every share filled at one tick)
+ *
+ * The tolerance is scaled into `hi`, not added after. `expected` is rounded to
+ * 2dp, and `price / tick` multiplies that rounding by up to 98×: with it added
+ * unscaled, a $2.75 buy bounded at $0.51 got a ceiling of 274.9978 shares
+ * against a physical maximum of 275 (`amount / tick`). Found by the sweep in
+ * `tests/unit/fillPathBand.test.ts`.
+ *
+ * WHY ONE-SIDED. The order commits a fixed dollar amount at a limit price, so
+ * the shares received are `amount / fillPrice` with `fillPrice ≤ price`. Price
+ * improvement can only ever ADD shares, and FOK does not partially fill, so
+ * nothing below `expected` is a real outcome beyond our own rounding. The
+ * previous band here was symmetric (`|c − expected| ≤ tolerance`) and rejected
+ * the 2026-09-11 fill — 4.682223 against 4.59 — by 0.0004 shares. The fill was
+ * reported unverified, and that is where the ghost began.
+ *
+ * `hi` is generous (27× at $0.27 on a $0.01 tick) and that is fine: the only
+ * thing the band discriminates is wire scale, and the two candidate readings
+ * differ by 1e6. `hi / lo` is at most `price / tick`, under 1000 for any tick in
+ * this SDK, so both readings can never fit at once.
+ *
+ * ONE OWNER. The fill path (`verifyFilledShares`) and the reconciler
+ * (`arbReconcile.ts`, re-exported there) both read this function. Before item
+ * 81 they held two different bands for the same question, and the fill path's
+ * was the wrong one.
+ *
+ * Not for GTC limit orders: those can partially fill and can never overfill,
+ * which is the opposite shape — see `readGtcFill`.
+ */
+export function shareBand({ expectedShares, price, tickSize = 0.01, tolerance = 0.05 }) {
+  const exp = Number(expectedShares);
+  const px = Number(price);
+  const tick = Number(tickSize) || 0.01;
+  const tol = Math.max(Number(tolerance) || 0, 0.001);
+  const lo = exp - tol;
+  const hi = px > 0 && tick > 0 ? (exp + tol) * (px / tick) : exp + tol;
+  return { lo, hi, tolerance: tol };
+}
+
+/** Resolve a raw wire number to shares within `band`, or null when the scale is ambiguous. */
+export function resolveInBand(rawValue, band) {
+  return resolveScale(rawValue, { min: band.lo, max: band.hi });
 }
 
 /**
@@ -501,20 +541,18 @@ function resolveAgainstExpected(rawValue, expectedShares, tolerance) {
  *   2. getOrder(id).size_matched, authoritative, one extra round trip
  *
  * Returns null when neither rung resolves. Null means "unknown", never "zero".
+ *
+ * Both rungs resolve against `band` — `shareBand`, one-sided, the same band the
+ * reconciler uses (item 81). `getSizeMatched` is the second rung's round trip,
+ * injected so the resolution can be exercised without a signer or a network.
  */
-async function verifyFilledShares(result, expectedShares, tolerance) {
-  const fromReceipt = resolveAgainstExpected(result?.takingAmount, expectedShares, tolerance);
+export async function verifyFilledShares(result, band, getSizeMatched) {
+  const fromReceipt = resolveInBand(result?.takingAmount, band);
   if (fromReceipt != null) return fromReceipt;
 
   try {
-    const client = await getProxyTradingClient();
     const orderId = String(result?.orderID || result?.orderId || result?.id);
-    const open = await captureClobCall(
-      'verifyFilledShares/getOrder',
-      { orderId, expectedShares, tolerance },
-      () => client.getOrder(orderId),
-    );
-    return resolveAgainstExpected(open?.size_matched, expectedShares, tolerance);
+    return resolveInBand(await getSizeMatched(orderId), band);
   } catch {
     return null;
   }
@@ -577,11 +615,7 @@ export async function getOrderMatchedShares(orderId, band) {
     const raw = Number(open?.size_matched);
     if (!Number.isFinite(raw) || raw < 0) return null;
     if (raw === 0) return 0;
-    // Scale resolution inline rather than imported from `arbReconcile`, which
-    // imports this module — the band is already a plain pair of numbers, so the
-    // circular dependency would buy nothing.
-    const fits = [raw, raw / SHARE_SCALE].filter((c) => c >= band.lo && c <= band.hi);
-    return fits.length === 1 ? fits[0] : null;
+    return resolveInBand(raw, band);
   } catch {
     return null;
   }
@@ -618,12 +652,12 @@ export async function placeMarketBuy({
   if (!(Number(maxPrice) > 0)) {
     throw new Error('placeMarketBuy requires maxPrice — an unpriced market buy signs at $1.00/share');
   }
-  const px = roundPrice(Number(maxPrice), Number(tickSize));
-  const amount = Math.round(Math.max(Number(amountUsd) || 0, minShares * px) * 100) / 100;
-  if (!(amount > 0)) throw new Error(`placeMarketBuy: non-positive amount $${amount}`);
-
-  const expectedShares = Number((amount / px).toFixed(2));
-  const tolerance = Math.max(Number(shareTolerance) || 0, expectedShares * 0.02);
+  // Same derivation the reconciler reads (`expectedSharesFor`), so the fill path
+  // and reconciliation build their band from one set of numbers — item 81.
+  const quote = expectedSharesFor({ amountUsd, maxPrice, tickSize, minShares, shareTolerance });
+  if (!quote) throw new Error(`placeMarketBuy: non-positive amount (amountUsd=${amountUsd}, minShares=${minShares})`);
+  const { price: px, amountUsd: amount, expectedShares, tolerance } = quote;
+  const band = shareBand({ expectedShares, price: px, tickSize: Number(tickSize), tolerance });
 
   const client = await getProxyTradingClient();
   const result = await captureClobCall(
@@ -637,7 +671,14 @@ export async function placeMarketBuy({
   );
 
   const id = assertOrderAccepted(result, `CLOB FOK buy $${amount} @<=${px}`);
-  const shares = await verifyFilledShares(result, expectedShares, tolerance);
+  const shares = await verifyFilledShares(result, band, async (orderId) => {
+    const open = await captureClobCall(
+      'verifyFilledShares/getOrder',
+      { orderId, expectedShares, band },
+      () => client.getOrder(orderId),
+    );
+    return open?.size_matched;
+  });
 
   // Backlog 33 answered in one line: `expectedShares` was derived from our own
   // arithmetic, so whichever of takingAmount / takingAmount/1e6 sits beside it
@@ -646,7 +687,7 @@ export async function placeMarketBuy({
   captureReceipt({
     fn: 'placeMarketBuy/verified',
     phase: 'response',
-    request: { tokenId: String(tokenId), amountUsd: amount, maxPrice: px, expectedShares, tolerance },
+    request: { tokenId: String(tokenId), amountUsd: amount, maxPrice: px, expectedShares, tolerance, band },
     raw: result,
     derived: {
       orderId: id,
@@ -833,130 +874,4 @@ export function resetTradingClient() {
   _credsFailUntil = 0;
   _credsFailStreak = 0;
   _credsLastError = null;
-}
-
-/**
- * The venue's own share resolution. `ROUNDING_CONFIG[tick].size` is **2** for
- * every tick size in the vendored SDK
- * (`order-builder/helpers/roundingConfig.js`), and both amount builders
- * `roundDown` to it. A share count carrying a third decimal is therefore not a
- * finer order — it is the same order with a digit the venue discards.
- *
- * The arb sizing gate computes on a 3-decimal grid (`arbEngine.ts:265`). See
- * backlog item 83.
- */
-export const VENUE_SHARE_DECIMALS = 2;
-
-/** What the venue will actually receive if we ask for `shares`, and why. */
-export function venueShareCount(shares, price, { minNotionalUsd = 1 } = {}) {
-  const want = Number(shares);
-  const px = Number(price);
-  if (!(want > 0) || !(px > 0)) return null;
-
-  const down = Math.floor(want * 100) / 100;
-  // Truncation is the safe direction against depth — it asks for less than the
-  // gate cleared. It is the WRONG direction against the $1.00 marketable-BUY
-  // minimum, which is a hard venue rejection rather than a maybe-kill (see the
-  // 2026-09-09 `invalid amount for a marketable BUY order ($0.38), min size: 1`
-  // receipts). So round up only when truncating would breach the floor, and say
-  // which happened.
-  if (down > 0 && down * px >= minNotionalUsd) {
-    return { shares: down, direction: 'down', notionalUsd: Math.round(down * px * 10000) / 10000 };
-  }
-  const up = Math.ceil(want * 100) / 100;
-  return { shares: up, direction: 'up', notionalUsd: Math.round(up * px * 10000) / 10000 };
-}
-
-/**
- * Buy an exact share count, fill-or-kill — backlog item 78.
- *
- * WHY THIS EXISTS. `placeMarketBuy` submits a dollar amount, and the SDK derives
- * the share count from it: `rawMakerAmt = roundDown(amount, 2)` then
- * `rawTakerAmt = rawMakerAmt / rawPrice`
- * (`order-builder/helpers/getMarketOrderRawAmounts.js`). The arb sizing gate
- * computes a SHARE count against a SHARE depth ceiling, so that round trip
- * re-derives the very number the gate was careful about. Measured across the 21
- * live canary packages, 14 demanded MORE shares than planned, worst case
- * +0.0950. A depth-bound order that demands more than the level holds is a
- * fill-or-kill that must die.
- *
- * The limit builder inverts it — `rawTakerAmt = roundDown(size, 2)` and the
- * dollars fall out (`getOrderRawAmounts.js`) — so the share count is the input
- * and reaches the book intact.
- *
- * ⚠️ UNVERIFIED AGAINST THE LIVE VENUE. `createAndPostOrder` is typed
- * `OrderType.GTC | OrderType.GTD` in this SDK version (`client.d.ts:127`); FOK
- * on a limit order is only reachable via `createOrder` + `postOrder(order,
- * OrderType.FOK)`, which `postOrder` accepts (`client.d.ts:139`). Whether the
- * *exchange* honours FOK on a limit order is not established by anything in
- * this repo or in `docs/research/polymarket-domain-facts.md`, and a plausible
- * reading of an SDK type is exactly the shape of the Aug 2026 `negRisk`
- * regression. So this is gated OFF by default and must stay that way until a
- * live probe settles it — see item 78 in `docs/refactor-plan.md` for the
- * zero-cost probe.
- *
- * If the venue silently downgrades FOK to GTC, the order RESTS instead of
- * dying, and a resting arb leg is the -$12.83 orphan from 2026-08-28. The
- * caller must treat a resting response as a failure and cancel — which is why
- * this returns `resting` rather than swallowing it.
- */
-export async function placeLimitFokBuy({
-  tokenId,
-  shares,
-  maxPrice,
-  negRisk = false,
-  tickSize = '0.01',
-  minNotionalUsd = 1,
-}) {
-  if (!(Number(maxPrice) > 0)) {
-    throw new Error('placeLimitFokBuy requires maxPrice — an unpriced order signs at $1.00/share');
-  }
-  const px = roundPrice(Number(maxPrice), Number(tickSize));
-  const sized = venueShareCount(shares, px, { minNotionalUsd });
-  if (!sized) throw new Error(`placeLimitFokBuy: non-positive size ${shares} @ ${px}`);
-
-  const client = await getProxyTradingClient();
-  const signed = await captureClobCall(
-    'placeLimitFokBuy/createOrder',
-    { tokenId: String(tokenId), side: 'BUY', size: sized.shares, price: px, tickSize,
-      negRisk: !!negRisk, requestedShares: Number(shares), rounding: sized.direction },
-    () => client.createOrder(
-      { tokenID: String(tokenId), price: px, size: sized.shares, side: Side.BUY },
-      { tickSize: String(tickSize), negRisk: !!negRisk },
-    ),
-  );
-
-  const result = await captureClobCall(
-    'placeLimitFokBuy/postOrder',
-    { tokenId: String(tokenId), size: sized.shares, price: px, orderType: 'FOK' },
-    () => client.postOrder(signed, OrderType.FOK),
-  );
-
-  const id = assertOrderAccepted(result, `CLOB limit-FOK buy ${sized.shares}sh @<=${px}`);
-
-  // A FOK that is honoured never rests. If this is ever true the venue did not
-  // treat the order as fill-or-kill, and that is a finding, not a fill.
-  const fill = readGtcFill(result, 'buy', sized.shares, px);
-  if (fill.resting) {
-    return {
-      id, order: result, price: px, size: 0, resting: true,
-      requestedShares: Number(shares), submittedShares: sized.shares,
-      status: result?.status || null,
-    };
-  }
-
-  return {
-    id,
-    order: result,
-    price: px,
-    size: fill.filledShares ?? sized.shares,
-    filledShares: fill.filledShares ?? sized.shares,
-    requestedShares: Number(shares),
-    submittedShares: sized.shares,
-    rounding: sized.direction,
-    costUsd: sized.notionalUsd,
-    side: Side.BUY,
-    resting: false,
-    status: result?.status || null,
-  };
 }

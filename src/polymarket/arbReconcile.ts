@@ -35,16 +35,16 @@
  * shares at the *limit* price, and the book may fill it better — the ghost paid
  * 0.26483 against a 0.27 bound and received 4.682 shares against 4.59 expected.
  * Fills can only ever come in ABOVE the expected count, never below (FOK does
- * not partially fill). The symmetric ±2% band in `verifyFilledShares` rejected
- * the real fill by 0.0004 shares. Here the upper bound is derived from what the
- * venue could actually have done: at best one tick per share.
+ * not partially fill). The symmetric ±2% band `verifyFilledShares` used at the
+ * time rejected the real fill by 0.0004 shares. Here the upper bound is derived
+ * from what the venue could actually have done: at best one tick per share.
+ * Since item 81 the fill path uses this same band (`trade.ts:shareBand`).
  */
-import { getOrderMatchedShares } from './trade.js';
+import { getOrderMatchedShares, shareBand, resolveInBand } from './trade.js';
 
 /** Probe offsets from the throw, in ms. Last probe clears the observed 2.9s settle. */
 export const PROBE_SCHEDULE_MS = [0, 2250, 4500];
 
-const SHARE_SCALE = 1_000_000;
 
 /* ------------------------------------------------------------------ *
  * Halt state
@@ -66,32 +66,11 @@ export function arbHaltState() { return _halt ? { ..._halt } : null; }
 export function clearArbHalt() { const prev = _halt; _halt = null; return prev; }
 
 /**
- * The share count band a fill could legitimately land in.
- *
- *   lo = expected − tolerance         (rounding on our side of the arithmetic)
- *   hi = expected × (price / tick)    (every share filled a full tick better)
- *
- * `hi` is generous — 27× at $0.27 against a $0.01 tick — and that is fine,
- * because the only thing the band has to discriminate is wire scale, and the
- * two candidate readings differ by 1e6.
+ * The band and its scale resolution are owned by `trade.ts` (item 81): the fill
+ * path and this reconciler must answer "how many shares?" with one band, not
+ * two. Re-exported so callers of this module need not know that.
  */
-export function shareBand({ expectedShares, price, tickSize = 0.01, tolerance = 0.05 }) {
-  const exp = Number(expectedShares);
-  const px = Number(price);
-  const tick = Number(tickSize) || 0.01;
-  const tol = Math.max(Number(tolerance) || 0, 0.001);
-  const lo = exp - tol;
-  const hi = px > 0 && tick > 0 ? exp * (px / tick) + tol : exp + tol;
-  return { lo, hi, tolerance: tol };
-}
-
-/** Resolve a raw wire number to shares, or null when the scale is ambiguous. */
-export function resolveInBand(rawValue, band) {
-  const raw = Number(rawValue);
-  if (!Number.isFinite(raw) || raw <= 0) return null;
-  const fits = [raw, raw / SHARE_SCALE].filter((c) => c >= band.lo && c <= band.hi);
-  return fits.length === 1 ? fits[0] : null;
-}
+export { shareBand, resolveInBand };
 
 /**
  * Door A: what the wallet actually holds of this token, right now.

@@ -3874,6 +3874,13 @@ fill → then this.
 
 ### 78. The arb order is sized in shares and submitted in dollars, and the round trip does not close ❌ CLOSED 2026-09-16 — WON'T FIX
 
+**CODE REMOVED 2026-09-16.** `placeLimitFokBuy`, `venueShareCount`,
+`VENUE_SHARE_DECIMALS`, the `arbExactShareRouting` flag and its branches in
+`bot.ts`, `scripts/probe-limit-fok.ts` and `tests/unit/arbExactShareRouting.test.ts`
+are deleted — recoverable from `7ae2450`. A stored VPS config may still carry
+`arbExactShareRouting: true`; `normalizeConfigStore` → `pickStrategy` drops
+unlisted keys on every load path (`bot.ts:214, 220, 4442`), so it is inert.
+
 **CLOSED.** The share-denominated route is abandoned; `arbExactShareRouting`
 stays `false` permanently. The unit round-trip described below is real, but it
 was measured at **~0.014 shares per package** (worst case $0.09, total worst-case
@@ -4348,7 +4355,48 @@ for the HTTP contract itself.
 
 ---
 
-### 81. `verifyFilledShares` uses a symmetric tolerance for a one-sided quantity 🔶 LIVE AGAIN, PERMANENTLY — contained, not fixed
+### 81. `verifyFilledShares` uses a symmetric tolerance for a one-sided quantity ✅ FIXED 2026-09-16
+
+**FIXED 2026-09-16.** The fill path now resolves against the same one-sided band
+as the reconciler — one function, one owner:
+
+| piece | where | owner |
+|---|---|---|
+| quote (amount, expectedShares, tolerance) | `trade.ts:expectedSharesFor` | trade.ts — `placeMarketBuy` now calls it instead of re-deriving the same arithmetic inline |
+| band | `trade.ts:shareBand` (moved from `arbReconcile.ts`) | trade.ts |
+| scale resolution | `trade.ts:resolveInBand` → the existing `resolveScale` | trade.ts |
+| readers | `verifyFilledShares` (fill path), `getOrderMatchedShares` and `reconcileArbLeg` (reconciler) | — `arbReconcile.ts` re-exports, does not copy |
+
+The symmetric `resolveAgainstExpected` is deleted. `verifyFilledShares` is
+exported and takes its `getOrder` round trip as an injected function, so it is
+tested without a signer.
+
+**A second defect in the band itself, found by the new sweep.** `hi` was
+`expected × (price/tick) + tolerance`. `expected` is rounded to 2dp and
+`price/tick` amplifies that rounding up to 98×, while the tolerance was added
+unscaled — so the ceiling could sit up to **0.39 shares below** the physical
+maximum `amount / tick` (e.g. $2.75 @≤$0.51: 274.9978 vs 275). Now
+`(expected + tolerance) × (price/tick)`, zero shortfalls across the sweep. Only
+reachable by a fill near the lowest tick on a high-bounded buy, so no observed
+live effect; it was the band's own stated contract that was wrong.
+
+**Tests** — `tests/unit/fillPathBand.test.ts`, as invariants: the 2026-09-11 fill
+verifies on the fill path at both wire scales and via `size_matched`; every
+achievable fill (97 limit prices × 4 amounts × every tick fill price × both
+scales, >30k cases) resolves to exactly one reading; under-fills, over-ceiling
+readings, zeros and an unreachable venue all return null (unknown), never a
+number; and `arbReconcile.shareBand === trade.shareBand`. Mutation-checked:
+restoring the symmetric band fails 3, the unscaled ceiling fails 1, reporting
+unknown as zero fails 4.
+
+**Residual cost from the 2026-09-16 status note below is gone:** a price-improved
+fill now verifies synchronously, so it no longer takes the ~4.5s dual-door
+reconciliation before leg 2 is sized.
+
+---
+
+*Superseded status notes follow.*
+
 
 **STATUS 2026-09-16, supersedes the 2026-09-15 note below.** Items 78 and 89 are
 CLOSED WON'T FIX, so `arbExactShareRouting` is `false` for good. The 2026-09-15
@@ -4499,7 +4547,7 @@ So there is no live defect here. What remains is real but narrower:
 2. **The depth clamp is slightly more conservative than it says.** 3-decimal
    floor, then the venue truncates to 2 decimals. Both reductions, so the error
    is in the safe direction, but the effective utilisation is not exactly 90%.
-3. **Under exact-share routing the floor case rounds UP** — measured, the
+3. **[MOOT 2026-09-16 — exact-share routing and `venueShareCount` removed, items 78/89.]** **Under exact-share routing the floor case rounds UP** — measured, the
    up-branch fires at **81 of 97** price points. At the minimum-notional floor,
    exact-share routing therefore asks for up to 0.0099 shares *more* than the
    gate computed. That is within behaviour the gate already accepts on purpose
@@ -4516,6 +4564,16 @@ item 78 is switched on, not after.
 ---
 
 ### 84. Reconciliation runs inside the scan loop, so every FOK kill stalls it for 4.5s ✅ FIXED
+
+**NOTE 2026-09-16 — the fast abort may now never fire.** The only kill message
+in `FOK_KILL_PATTERNS` (`trade.ts`) was observed on the **limit** route —
+`placeLimitFokBuy/postOrder`, `data/clob_receipts.jsonl:2` — which is now
+removed. What the **market** route (`createAndPostMarketOrder`, FOK) returns on a
+kill has never been recorded. If it words it differently, every arb kill takes
+the full ~4.5s reconciliation again. That is the safe direction (slower, not
+wrong), and stop-losses no longer share the loop, so no code change. Settle it
+from the live receipts: `unmatchedFailures` / the vocabulary map in
+`fokKillStats()` will show the market route's actual string on the first kill.
 
 **Found 2026-09-15**, immediately after the item 78 probe made FOK kills a
 first-class, correctly-reported outcome rather than a mystery.
@@ -4879,6 +4937,13 @@ directional positions also take the neutral tone fails three tests.
 ---
 
 ### 89. Exact-share routing breaks venue precision on 96% of orders, and on 65% of second legs ❌ CLOSED 2026-09-16 — WON'T FIX
+
+**CODE REMOVED 2026-09-16.** `placeLimitFokBuy`, `venueShareCount`,
+`VENUE_SHARE_DECIMALS`, the `arbExactShareRouting` flag and its branches in
+`bot.ts`, `scripts/probe-limit-fok.ts` and `tests/unit/arbExactShareRouting.test.ts`
+are deleted — recoverable from `7ae2450`. A stored VPS config may still carry
+`arbExactShareRouting: true`; `normalizeConfigStore` → `pickStrategy` drops
+unlisted keys on every load path (`bot.ts:214, 220, 4442`), so it is inert.
 
 **CLOSED together with item 78.** `arbExactShareRouting` stays `false`
 permanently. The share-lattice fix sketched below is buildable and was costed:

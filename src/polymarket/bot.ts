@@ -48,7 +48,7 @@ import {
   resetPackages,
 } from './arbEngine.js';
 import { persist, persistSync, load, FILES, dataPath } from './persistence.js';
-import { placeOrder, placeMarketBuy, placeMarketSell, placeLimitFokBuy, venueShareCount, sellFloor, cancelOrder, syncClobBalance, expectedSharesFor, fokKillStats } from './trade.js';
+import { placeOrder, placeMarketBuy, placeMarketSell, sellFloor, cancelOrder, syncClobBalance, expectedSharesFor, fokKillStats } from './trade.js';
 import { lossCapStatus, resetLossCap } from './lossCap.js';
 import {
   reconcileArbLeg, haltArb, isArbHalted, arbHaltState, clearArbHalt,
@@ -1124,19 +1124,7 @@ async function executePendingTrade(pending) {
       // `botState.positions` for an unaccounted holding. Marked before the
       // order leaves, cleared once the position exists or the leg is resolved.
       markOrderInFlight(pending.tokenId);
-      const exactShares = plan.isArbLeg && cfg.arbExactShareRouting === true && Number(plan.shares) > 0;
-      const orderResult = exactShares
-        // Item 78. The sizing gate computed a share count against a share depth
-        // ceiling; this is the only route that delivers that number to the book
-        // intact. Gated off by default — see `modeConfig.ts`.
-        ? await placeLimitFokBuy({
-          tokenId: pending.tokenId,
-          shares: plan.shares,
-          maxPrice: entryPx,
-          negRisk: pending.negRisk,
-          tickSize: pending.tickSize || '0.01',
-        })
-        : plan.isArbLeg
+      const orderResult = plan.isArbLeg
         ? await placeMarketBuy({
           tokenId: pending.tokenId,
           amountUsd: plan.sizeUsd,
@@ -1255,15 +1243,7 @@ async function executePendingTrade(pending) {
        * have made up its mind.
        */
       const reconcilable = plan.isArbLeg && cfg.mode === 'live' && pending.tokenId;
-      // Under exact-share routing the expected count is simply what we asked
-      // for — there is no dollars→shares round trip left to re-derive, which is
-      // also why item 78 dissolves item 81 rather than fixing it.
-      const routed = reconcilable && cfg.arbExactShareRouting === true
-        ? venueShareCount(plan.shares, entryPx)
-        : null;
-      const quote = routed
-        ? { price: entryPx, amountUsd: routed.notionalUsd, expectedShares: routed.shares, tolerance: 0.005 }
-        : reconcilable
+      const quote = reconcilable
         ? expectedSharesFor({
           amountUsd: plan.sizeUsd,
           maxPrice: entryPx,
