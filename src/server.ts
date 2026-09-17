@@ -351,12 +351,12 @@ export async function createApp() {
         const spent = s.initialBuyAmount || 0;
         const feesCollected = s.feesCollected || 0;
         const currentValue = s.currentValue || 0;
-        const totalReturn = feesCollected + currentValue;
-        const netPnl = totalReturn - spent;
-        const roi = spent > 0 ? ((totalReturn - spent) / spent) * 100 : 0;
+        const tokenReturn = feesCollected + currentValue;
+        const netPnl = tokenReturn - spent;
+        const roi = spent > 0 ? ((tokenReturn - spent) / spent) * 100 : 0;
         totalPnl += netPnl;
         totalSpent += spent;
-        totalReturn += totalReturn;
+        totalReturn += tokenReturn;
         return { symbol: s.symbol, spent, feesCollected, currentValue, netPnl, roi };
       });
       const roi = totalSpent > 0 ? ((totalReturn - totalSpent) / totalSpent) * 100 : 0;

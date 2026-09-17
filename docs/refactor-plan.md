@@ -3034,7 +3034,27 @@ number, so waiting for the network would leave the same window open.
 
 ---
 
-### 63. A failed CLOB balance read never sets `clobError`
+### 63. A failed CLOB balance read never sets `clobError` ❌ CLOSED 2026-09-17 — covered by items 57, 59, 63b
+
+**CLOSED, no code change** (operator decision). Re-traced against current code:
+
+- **A dead proxy mid-run does not take this branch.** The SDK returns transport
+  errors as values (`clob-client-v2/dist/http-helpers/index.js:74`), so
+  `getClobBalance` resolves with `clobError` set rather than throwing.
+- **The throw branch needs `getTradingClient` to fail**, which means
+  `ensureApiKey` failed, which already fails `api` and forces `liveReady` false.
+- **Item 59** probes the proxy after any proxied failure and forces `liveReady`
+  false when it is down; **item 63b** makes arb obey `liveReady`.
+- **The one remaining window** — API key recovers while the balance leg still
+  serves a cached failure (backoff up to 15 min) — is a window in which the CLOB
+  *is* reachable again, so `liveReady: true` there is correct. Item 59's cached
+  down verdict holds it false until the proxy is re-probed anyway.
+
+**Residual, unverified, not acted on:** `ensureApiKey` requires `creds.key` but
+not `creds.secret` (`trade.ts:104`). Credentials with a key and an empty secret
+would make every L2-signed call throw. Whether the CLOB can return that shape is
+unknown.
+
 
 **OPEN — behavioural, needs a decision.** In `checkReadiness`, the failure branch
 for `getClobBalance` pushes a `clob_balance` check but leaves `clobError` null.
@@ -5047,7 +5067,32 @@ the convention every other refusal in those functions already used — not
 
 ---
 
-### 87. `server.ts:359` assigns to a constant and will throw when reached
+### 87. `server.ts:359` assigns to a constant and will throw when reached ✅ FIXED 2026-09-17
+
+**FIXED 2026-09-17.** Variable shadowing. `/api/pnl` declares the running total
+`let totalReturn = 0` (`:349`), then inside the per-token `map` declares
+`const totalReturn = feesCollected + currentValue` (`:354`). The accumulator line
+`totalReturn += totalReturn` (`:359`) resolves to the inner constant, so it
+throws `TypeError: Assignment to constant variable` on the first active token.
+
+**Correction to the original filing below.** It said the intended value "is not
+inferable from the line". It is: the stream path in the same file (`:74-84`)
+computes the identical portfolio with a per-token `ret` and `totalReturn += ret`.
+The fix follows that: the per-token value is renamed `tokenReturn` at its
+declaration and its three uses (`netPnl`, `roi`, and the accumulator). Per-token
+`netPnl`/`roi` values are unchanged; `totalReturn` now sums the per-token
+returns instead of throwing.
+
+**Blast radius, measured.** Contained: the handler's `try/catch` turned the throw
+into an HTTP 500, not a process crash, and only when at least one token session
+was active. Not Polymarket code — the ETH token-launch feature (`pons.ts`,
+`/api/launch`). No caller in `src/` or `src/public/`; the dashboard's portfolio
+comes from the correct stream path. External callers cannot be ruled out from
+the repo.
+
+**Verified:** esbuild's `assign-to-constant` warning is present on `HEAD`'s
+`server.ts` and absent after the change.
+
 
 **Found 2026-09-15** by esbuild's own warning during the item 86 sweep:
 
