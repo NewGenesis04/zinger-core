@@ -262,7 +262,7 @@ describe('Arb entry invariants — fill-or-kill share parity', () => {
     prices: { up: 0.33, down: 0.487 },
     cfg,
     mode,
-    readiness: { spendableBalance: 500 },
+    readiness: { spendableBalance: 500, liveReady: true },
     log: () => {},
     executeTrade,
     adjustPaperCash: () => {},

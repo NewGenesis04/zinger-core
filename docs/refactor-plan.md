@@ -2866,7 +2866,74 @@ also a *direct RPC* call, so caching it saves no proxy bandwidth at all. Given a
 
 ---
 
-### 59. Readiness cannot say "the proxy is down"
+### 59. Readiness cannot say "the proxy is down" ✅ FIXED 2026-09-17
+
+**FIXED 2026-09-17** (`readiness.ts`), design agreed with the operator the same
+day. Departs from the original proposal below on two points, deliberately: no
+probe-first ordering and no short-circuit.
+
+**What the code did before, traced from source** (`readiness.ts`,
+`proxyEnv.ts:checkGeoblock`, `trade.ts:ensureApiKey`, SDK
+`http-helpers/index.js:74`, which returns transport errors as `{ error }` values
+rather than throwing):
+
+| | restart with the proxy dead | proxy dies while running |
+|---|---|---|
+| geoblock | proxied call throws → silent DIRECT fallback → *"restricted in FR"* | green from a **4 h** cache (`TTL.geoblockAllowed`) |
+| api | *"Wallet must sign CLOB API auth"* | green — key memoised for process life |
+| clob_balance | *"CLOB registry: timeout of 10000ms exceeded (website balance may still work)"* | same |
+| `liveReady` | false | **true** — cached region + memoised key + on-chain pUSD fallback |
+
+`geoblock.proxyError`, which names the cause, was computed and discarded. In the
+mid-run case directional live entries (`directional.ts:353`) stayed enabled with
+no route to the CLOB.
+
+**Why not the original proposal.** A probe on every pass is a proxied request
+every 30 s (`syncBalances`, `bot.ts`) — about 28 MB/day at the ~10 KB/request
+measured in item 61, a large share of the 1 GB/month quota. Probe-first
+sequencing would also undo item 55's overlap. The "25 s hang" premise is stale:
+items 55/57 bound every read at 10 s and overlap the legs.
+
+**What it does now.**
+- **Conditional probe.** `checkProxyHealth` (GET `clob/time` through the proxy,
+  6 s) runs only when a proxied leg failed: `geoblock.proxyError`, a failed
+  proxied geoblock answer, `api` rejected, or the CLOB balance leg threw or
+  returned `clobError`. A healthy pass spends zero proxy requests on diagnosis.
+- **Cached like every other leg.** Healthy verdict `TTL.proxyHealthOk` (10 min);
+  failed verdict rejects inside `leased`, so it gets the 1→2→4→8→15 min backoff.
+  Dropped on the first pass with no proxied failure, so a restored proxy is not
+  reported down from cache.
+- **`proxy` row, first in `checks`.** Red: *"CLOB proxy unreachable (…) — CLOB
+  auth, balance and region checks cannot pass until it is restored"*. Green:
+  *"… the CLOB failures below are not the proxy"*.
+- **`liveReady = false` when the probe confirms the proxy down** (operator
+  decision). A probe blip blocks directional live entries for one backoff step,
+  1 min at first — accepted as the safe side.
+- **`needs`:** proxy line first; the registry, API-auth and region lines are
+  suppressed while the proxy is confirmed down, since they are its consequences.
+- **geoblock row** no longer reports this host's direct egress as the trading
+  region when `proxyError` is set (independent of the probe). Its `ok` value and
+  `regionAllowed` are unchanged.
+- `readiness.proxyHealth` exposes the verdict (null when not probed).
+
+**Tests** — `tests/unit/readinessProxyHealth.test.ts` (14): zero probes on a
+healthy pass and with no proxy configured; each of five triggers probes exactly
+once; mid-run shape flips `liveReady` only on a down verdict (control run with a
+reachable proxy stays true); proxy row first, other checks intact; misleading
+needs removed; geoblock wording; a reachable proxy is not blamed; bounded probes
+during an outage; fresh probe after a clean pass. `readinessChecks.test.ts`
+gains `proxy` at the head of `CANONICAL_ORDER`. Mutation-checked, 7 mutants, all
+killed: liveReady ignoring the verdict (2 fail), probing every pass (2), never
+forgetting a down verdict (1), uncached probe (1), old geoblock wording (1),
+misleading needs kept (1), `clobError` not a trigger (5).
+
+**Not covered here:** the arb engine does not read `liveReady` at all — filed as
+item 63b.
+
+---
+
+*Original filing follows.*
+
 
 **OPEN.** `checkProxyHealth()` already exists (`proxyEnv.ts:191`), is bounded, and
 is cheap — but `checkReadiness` never consults it. So a dead egress proxy
@@ -2979,6 +3046,75 @@ It may well be deliberate — the check falls back to `depositPusd`, and there i
 also fails `ensureApiKey`, which does force `liveReady: false`, so the state is
 hard to reach. Left alone because changing it is a design call on the live gate,
 not a cleanup.
+
+---
+
+### 63b. The arb engine never consults `liveReady` ✅ FIXED 2026-09-17
+
+**FIXED 2026-09-17 — Option 1, operator's choice: gate arb on `liveReady`
+directly.** One answer to "can this bot execute live orders" for both engines.
+Accepted cost: a blip in any readiness condition (the region heuristic included)
+pauses live arb until it recovers.
+
+**Where** — `arbEngine.ts:detectAndExecuteArbPackage`, after the two gap gates
+and before capacity, sizing and execution: `mode === 'live' &&
+!readiness?.liveReady` → skip `live_not_ready`, operands `{ readinessKnown,
+proxyDown }`.
+- *After the gap gates* so the code is counted only for books that were
+  genuinely tradable — the case where "why didn't arb trade?" gets asked.
+- *Fails closed* on a missing snapshot. Directional's gate is written fail-open
+  (`readiness && !readiness.liveReady`, `engines/directional.ts:353`), but not
+  reachably: `botState.readiness` starts `null` (`bot.ts:143`) and directional's
+  bankroll gate (`:328`) reads that as $0 and refuses first. Noted, not changed.
+- `live_not_ready` is added to the decision sink's `COUNTED_CODES`: standing
+  state, hourly counts, no per-scan rows.
+- Paper mode is untouched.
+
+**Tests** — `tests/unit/arbLiveReady.test.ts` (6): not-ready live sends no leg
+while the same book trades when ready; missing snapshot fails closed;
+`proxyDown` operand recorded; paper unaffected; a no-gap book keeps its gap code;
+sink classification. Mutation-checked, 5 mutants, all killed: no gate (4 fail),
+fail-open on a missing snapshot (2), gating paper too (2), dropped `proxyDown`
+operand (1), code persisted per row (1).
+
+**Existing tests touched.** Six live-mode arb fixtures (`arbDecisionSink`,
+`arbDepthUtilisation`, `arbEngine`, `arbReconcile`, `arbSizingGate`, `ctfMerge`)
+gained `liveReady: true` — each tests something else and models a live-ready
+bot. `arbAffordability` sets `liveReady: true` explicitly to isolate the
+affordability gate; its "readiness missing entirely" case now expects the
+earlier `live_not_ready` refusal, and a new case (`{ liveReady: true }`, no
+balance) keeps the "absent balance reads as zero" invariant on the
+affordability gate itself.
+
+---
+
+*Original filing follows.*
+
+
+**Filed 2026-09-17** while fixing item 59, at the operator's direction, as a
+separate item under 63 (both concern what gates live execution).
+
+`liveReady` gates directional live entries (`engines/directional.ts:353`) and a
+session-start warning (`bot.ts`, `refreshTelemetry().then`). Nothing on the arb
+path reads it. `grep liveReady` over `arbEngine.ts`, `arbReconcile.ts` and
+`scan/` returns nothing. The arb call site runs on `cfg.clobArbEnabled` and
+`isArbOnlyMode || arb` alone (`bot.ts:2949`) and passes `readiness` through only
+for `spendableBalance`.
+
+**Consequence.** Every condition `liveReady` encodes is invisible to arb:
+deposit-wallet owner mismatch, missing API key, unverified region, and — since
+item 59 — a confirmed-dead CLOB proxy. With the proxy down, `spendableBalance`
+still includes on-chain pUSD read directly, so the affordability gate passes and
+arb legs are sent into a dead route. Each fails and is contained (FOK, item 80
+reconciliation, item 84 abort), so this costs failed attempts and proxy-backoff
+noise rather than exposure — but it is the same "firing doomed orders" item 59
+removed for directional.
+
+**Not fixed.** Adding `liveReady` to the arb gate changes when live arb trades,
+so it is a decision on the live gate alongside item 63. Two shapes to choose
+between: gate arb on `liveReady` as a whole, or on the specific conditions that
+make an arb order undeliverable (proxy down, no API key, owner mismatch) while
+leaving e.g. the region heuristic out.
 
 ---
 

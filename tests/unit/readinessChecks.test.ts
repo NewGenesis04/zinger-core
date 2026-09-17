@@ -26,6 +26,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 
 /** Every check `checkReadiness` can emit, in the order it must emit them. */
 const CANONICAL_ORDER = [
+  'proxy',      // only present after a proxied leg failed (item 59)
   'geoblock',
   'api',
   'deposit_owner',
@@ -138,7 +139,9 @@ describe('INVARIANT: readiness checks keep their order and their independence', 
     const readiness = await checkReadiness({});
     const ids = idsOf(readiness);
 
-    expect(ids).toEqual(CANONICAL_ORDER);
+    // `proxy` is emitted only after a proxied leg fails, so a healthy pass has
+    // every other check (its placement is pinned in readinessProxyHealth.test.ts).
+    expect(ids).toEqual(CANONICAL_ORDER.filter((id) => id !== 'proxy'));
     expect(new Set(ids).size).toBe(ids.length);
   });
 

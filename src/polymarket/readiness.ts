@@ -5,7 +5,7 @@ import { getWallet } from '../lib/wallet.js';
 import { POLY, POLY_MIN_ORDER_USD } from './config.js';
 import { ensureApiKey, getClobBalance, getWalletAddress, getFunderAddress } from './trade.js';
 import { resolveDynamicLimits } from './kelly.js';
-import { checkGeoblock, getClobProxyUrl, redactProxy } from './proxyEnv.js';
+import { checkGeoblock, checkProxyHealth, getClobProxyUrl, redactProxy } from './proxyEnv.js';
 
 const ERC20_ABI = [{
   inputs: [{ name: 'owner', type: 'address' }],
@@ -91,6 +91,9 @@ export const TTL = {
   depositOwner: 60 * MINUTE,
   gas: 10 * MINUTE,
   balances: MINUTE,
+  // Only probed after a proxied leg has failed (item 59), so a healthy answer
+  // can be held a while: it is re-asked only while that failure persists.
+  proxyHealthOk: 10 * MINUTE,
   failBase: MINUTE,
   failCap: 15 * MINUTE,
 };
@@ -243,12 +246,18 @@ export async function checkReadiness(config = {}) {
   const polP = capture(leased('polBalance', () => getClient().getBalance({ address }), () => TTL.gas));
 
   const geoblock = await geoblockP;
+  // `checkGeoblock` falls back to a DIRECT request when the proxied one throws,
+  // and reports that as `proxyError`. The direct answer describes this host's
+  // own egress — the route CLOB traffic is deliberately kept off — so it must
+  // not be presented as the trading region.
   checks.push({
     id: 'geoblock',
     ok: geoblock.ok && !geoblock.blocked,
-    detail: geoblock.blocked
-      ? `Trading restricted from ${geoblock.country || 'current region'}${geoblock.region ? `/${geoblock.region}` : ''}`
-      : (geoblock.ok ? `Trading region allowed (${geoblock.country || 'unknown'})` : `Region check failed: ${geoblock.error || 'unknown error'}`),
+    detail: geoblock.proxyError
+      ? `Region check through the CLOB proxy failed (${geoblock.proxyError}); this host's direct egress is ${geoblock.country || 'unknown'}, which is why CLOB traffic uses the proxy`
+      : geoblock.blocked
+        ? `Trading restricted from ${geoblock.country || 'current region'}${geoblock.region ? `/${geoblock.region}` : ''}`
+        : (geoblock.ok ? `Trading region allowed (${geoblock.country || 'unknown'})` : `Region check failed: ${geoblock.error || 'unknown error'}`),
   });
 
   const api = await apiP;
@@ -327,6 +336,51 @@ export async function checkReadiness(config = {}) {
     checks.push({ id: 'clob_balance', ok: depositPusd >= POLY_MIN_ORDER_USD, detail: `CLOB balance check failed: ${clob.error.message}` });
   }
 
+  /*
+   * Proxy health — item 59.
+   *
+   * Every CLOB call egresses through a metered proxy. When that proxy is dead,
+   * the legs that use it fail with messages about auth, balances and region,
+   * none of which names the actual cause.
+   *
+   * Probed only when a proxied leg has failed, never on a healthy pass: the
+   * probe itself is a proxied request, and a per-pass probe would spend a large
+   * share of the monthly quota to confirm what the other legs already show.
+   * Cached like the other legs — a healthy answer for `TTL.proxyHealthOk`, a
+   * failed one with backoff — and dropped on the first pass with no proxied
+   * failure, so a restored proxy is not reported down from cache.
+   */
+  const proxyConfigured = !!getClobProxyUrl();
+  const proxiedLegFailed = !!geoblock.proxyError
+    || (geoblock.viaProxy && !geoblock.ok)
+    || !api.ok
+    || !clob.ok
+    || !!clob.value?.clobError;
+  let proxyHealth = null;
+  if (proxyConfigured && proxiedLegFailed) {
+    const probe = await capture(leased('proxyHealth', async () => {
+      const health = await checkProxyHealth();   // never rejects
+      // Rejecting a failed probe is what puts it on the backoff schedule.
+      if (!health?.ok) throw Object.assign(new Error(health?.detail || 'proxy unreachable'), { health });
+      return health;
+    }, () => TTL.proxyHealthOk));
+    proxyHealth = probe.ok
+      ? probe.value
+      : (probe.error?.health || { ok: false, detail: probe.error?.message || 'proxy unreachable' });
+    checks.unshift({
+      id: 'proxy',
+      ok: !!proxyHealth.ok,
+      detail: proxyHealth.ok
+        ? `CLOB proxy reachable${proxyHealth.latencyMs != null ? ` (${proxyHealth.latencyMs}ms)` : ''} — the CLOB failures below are not the proxy`
+        : `CLOB proxy unreachable (${proxyHealth.detail || 'unknown'}) — CLOB auth, balance and region checks cannot pass until it is restored`,
+    });
+  } else {
+    _memo.delete('proxyHealth');
+  }
+  // A dead proxy means no order can reach the CLOB, whatever cached region,
+  // remembered API key or on-chain balance says.
+  const proxyDown = proxyConfigured && proxyHealth != null && !proxyHealth.ok;
+
   const usdc = await usdcP;
   if (usdc.ok) {
     onchainUsdc = Number(formatUnits(usdc.value, 6));
@@ -368,7 +422,7 @@ export async function checkReadiness(config = {}) {
   const minRequired = minBet;
   const regionAllowed = geoblock.ok && !geoblock.blocked;
   const clobWorks = apiReady && !clobError;
-  const liveReady = (regionAllowed || clobWorks) && apiReady && ownerMatches && spendable >= minRequired && sizeOk && (!clobError || spendable >= minRequired);
+  const liveReady = !proxyDown && (regionAllowed || clobWorks) && apiReady && ownerMatches && spendable >= minRequired && sizeOk && (!clobError || spendable >= minRequired);
   const walletFunded = onchainUsdc >= minRequired || depositPusd >= minRequired;
   const paperReady = true;
 
@@ -382,6 +436,7 @@ export async function checkReadiness(config = {}) {
     clobError,
     geoblock,
     proxy: redactProxy(getClobProxyUrl()),
+    proxyHealth,
     openPositions: positions.length,
     positions: positions.slice(0, 10),
     apiReady,
@@ -399,13 +454,20 @@ export async function checkReadiness(config = {}) {
     maxOrderUsd: maxBet,
     useKellySizing: !!config.useKellySizing,
     needs: [
+      // With the proxy confirmed down, the auth, registry and region lines are
+      // all consequences of it; listing them would point away from the cause.
+      proxyDown && `CLOB proxy unreachable (${proxyHealth.detail || 'unknown'}) — live trading blocked; check the proxy quota and CLOB_PROXY_URL`,
       depositWallet && !ownerMatches && `Deposit wallet owner ${depositOwner} is not bot signer ${address} — export that wallet’s private key into Zinger`,
-      clobError && `CLOB registry: ${clobError} (website balance may still work)`,
-      !apiReady && 'Wallet must sign CLOB API auth (automatic on first live trade)',
-      !regionAllowed && clobWorks && `Polymarket region check says blocked (${geoblock.country || 'FR'}) but CLOB API works — live trading allowed`,
-      !regionAllowed && !clobWorks && (geoblock.blocked
-        ? `Polymarket trading is restricted in ${geoblock.country || 'this region'}`
-        : `Unable to verify trading region: ${geoblock.error || 'unknown error'}`),
+      !proxyDown && clobError && `CLOB registry: ${clobError} (website balance may still work)`,
+      !proxyDown && !apiReady && 'Wallet must sign CLOB API auth (automatic on first live trade)',
+      !proxyDown && !regionAllowed && clobWorks && (geoblock.proxyError
+        ? `Region could not be verified through the proxy (${geoblock.proxyError}) but CLOB API works — live trading allowed`
+        : `Polymarket region check says blocked (${geoblock.country || 'FR'}) but CLOB API works — live trading allowed`),
+      !proxyDown && !regionAllowed && !clobWorks && (geoblock.proxyError
+        ? `Unable to verify trading region through the proxy: ${geoblock.proxyError}`
+        : geoblock.blocked
+          ? `Polymarket trading is restricted in ${geoblock.country || 'this region'}`
+          : `Unable to verify trading region: ${geoblock.error || 'unknown error'}`),
       spendable < minRequired && `Need $${minRequired}+ trading balance (have $${spendable.toFixed(2)} pUSD)`,
       !sizeOk && `Bet range invalid — min $${minBet} max $${maxBet}`,
     ].filter(Boolean),

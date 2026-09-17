@@ -220,7 +220,7 @@ describe('INVARIANT: the sink reads the payload the engine actually emits', () =
         arbBankrollFrac: 1.0, arbMaxUsd: 50, minPositionSize: 0.5, instantCtfMerge: false,
       },
       mode: 'live',
-      readiness: { spendableBalance: 10_000 },
+      readiness: { spendableBalance: 10_000, liveReady: true },
       log: () => {},
       executeTrade: async (p) => ({ ok: true, position: { shares: p.plan.shares } }),
       adjustPaperCash: () => {},

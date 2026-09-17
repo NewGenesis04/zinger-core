@@ -93,7 +93,7 @@ describe('Feature: Instant On-Chain CTF Merge (mergePositions)', () => {
         // A funded live account. Required since the affordability gate covers
         // live as well as paper: without it `arbBank` is 0 and the package is
         // correctly refused before it can reach the merge path under test.
-        readiness: { spendableBalance: 500 },
+        readiness: { spendableBalance: 500, liveReady: true },
         log: () => {},
         executeTrade,
         adjustPaperCash,

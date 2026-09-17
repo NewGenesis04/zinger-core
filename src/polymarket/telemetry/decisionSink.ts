@@ -70,6 +70,7 @@ export const COUNTED_CODES = new Set([
   'gap_below_operator_floor',
   'package_capacity_full',
   'package_already_on_slug',
+  'live_not_ready',
 ]);
 
 /**

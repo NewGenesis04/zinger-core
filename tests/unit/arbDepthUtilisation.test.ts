@@ -53,7 +53,7 @@ function run({ upAsk = 0.04, downAsk = 0.94, size = 5000, arbMaxUsd = 50, bank =
     prices: { upAsk, downAsk },
     cfg: { ...baseCfg, arbMaxUsd },
     mode: 'live',
-    readiness: { spendableBalance: bank },
+    readiness: { spendableBalance: bank, liveReady: true },
     log: () => {},
     executeTrade: async (p) => ({ ok: true, position: { shares: p.plan.shares } }),
     adjustPaperCash: () => {},

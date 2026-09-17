@@ -49,14 +49,21 @@ const baseCfg = {
   instantCtfMerge: false,
 };
 
-function run({ mode, spendableBalance, paperBankroll, executeTrade }) {
+/**
+ * `liveReady: true` isolates the affordability gate from the live-readiness gate
+ * (item 63b) that sits before it. Affordability must hold on its own even if
+ * readiness were wrong, so it is tested with readiness saying yes.
+ */
+function run({ mode, spendableBalance, paperBankroll, executeTrade, readiness = undefined }) {
   return detectAndExecuteArbPackage({
     market,
     depth,
     prices: { up: 0.33, down: 0.487 },
     cfg: { ...baseCfg, paperBankroll },
     mode,
-    readiness: spendableBalance == null ? undefined : { spendableBalance },
+    readiness: readiness !== undefined
+      ? readiness
+      : (spendableBalance == null ? undefined : { spendableBalance, liveReady: true }),
     log: () => {},
     executeTrade: executeTrade ?? (async (p) => ({ ok: true, position: { shares: p.plan.shares } })),
     adjustPaperCash: () => {},
@@ -86,10 +93,21 @@ describe('INVARIANT: arb never sizes past the bankroll that funds it', () => {
 
   it('refuses a live package when readiness is missing entirely', async () => {
     // The cold-start case that decoupling the scan loop creates: nothing has
-    // populated botState.readiness yet. Absent balance must read as zero, not
-    // as permission to send a floor-sized order.
+    // populated botState.readiness yet. The live-readiness gate refuses first
+    // (item 63b) — no snapshot is not readiness.
     const executeTrade = vi.fn();
     const pkg = await run({ mode: 'live', spendableBalance: undefined, executeTrade });
+
+    expect(pkg).toBeNull();
+    expect(executeTrade).not.toHaveBeenCalled();
+    expect(skipCodes()).toContain('live_not_ready');
+  });
+
+  it('reads an absent balance as zero, even when readiness says live', async () => {
+    // Defence in depth: a readiness snapshot that carries no balance must not be
+    // taken as permission to send a floor-sized order.
+    const executeTrade = vi.fn();
+    const pkg = await run({ mode: 'live', readiness: { liveReady: true }, executeTrade });
 
     expect(pkg).toBeNull();
     expect(executeTrade).not.toHaveBeenCalled();

@@ -165,6 +165,27 @@ export async function detectAndExecuteArbPackage({
     return null;
   }
 
+  /*
+   * Live readiness (item 63b). `liveReady` is the single answer to "can this
+   * bot execute live orders right now" — proxy route, API key, deposit-wallet
+   * owner, region, balance — and it gates arb exactly as it gates directional
+   * (`engines/directional.ts`). No engine sends live orders the readiness check
+   * has refused.
+   *
+   * Placed after the gap gates so the code is counted only for books that were
+   * genuinely tradable, which is when "why didn't arb trade?" gets asked.
+   * Fails closed: no readiness snapshot yet is not readiness.
+   */
+  if (mode === 'live' && !readiness?.liveReady) {
+    arbDecision('skip', 'live_not_ready',
+      {
+        readinessKnown: readiness != null,
+        proxyDown: readiness?.proxyHealth ? readiness.proxyHealth.ok === false : null,
+      },
+      { breakEvenGap, requiredGap });
+    return null;
+  }
+
   // Capacity check against dedicated maxArbPackages setting
   const activePkgs = getActivePackages(mode);
   const maxPkgs = Number(cfg.maxArbPackages ?? 4);
