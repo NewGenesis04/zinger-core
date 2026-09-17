@@ -39,7 +39,8 @@ describe('INVARIANT: a CLOB receipt is captured whole', () => {
       },
     });
 
-    const [rec] = findByFn(fn);
+    // A 'request' receipt is written before the wire (item 94); the settled one follows.
+    const rec = findByFn(fn).find((r) => r.phase !== 'request');
     expect(rec).toBeDefined();
     const raw = rec.raw as Record<string, any>;
     expect(raw.takingAmount).toBe('26330000');
@@ -65,7 +66,8 @@ describe('INVARIANT: a CLOB receipt is captured whole', () => {
       },
     });
 
-    const [rec] = findByFn(fn);
+    // A 'request' receipt is written before the wire (item 94); the settled one follows.
+    const rec = findByFn(fn).find((r) => r.phase !== 'request');
     expect(rec.derived?.expectedShares).toBe(26.33);
     expect(rec.derived?.takingAsShares).toBe(26.33);
   });
@@ -88,7 +90,8 @@ describe('INVARIANT: a CLOB receipt is captured whole', () => {
   it('serialises a BigInt rather than dropping the record', () => {
     const fn = tag('bigint');
     captureReceipt({ fn, phase: 'response', request: {}, raw: { amount: 26330000n } });
-    const [rec] = findByFn(fn);
+    // A 'request' receipt is written before the wire (item 94); the settled one follows.
+    const rec = findByFn(fn).find((r) => r.phase !== 'request');
     expect(rec).toBeDefined();
     expect((rec.raw as any).amount).toBe('26330000n');
   });
@@ -121,7 +124,8 @@ describe('INVARIANT: capturing never changes what the caller sees', () => {
     await captureClobCall(fn, { side: 'SELL', minPrice: 0.25 }, async () => { throw httpErr; })
       .catch(() => {});
 
-    const [rec] = findByFn(fn);
+    // A 'request' receipt is written before the wire (item 94); the settled one follows.
+    const rec = findByFn(fn).find((r) => r.phase !== 'request');
     expect(rec.phase).toBe('throw');
     expect(rec.error?.status).toBe(400);
     expect(rec.error?.body).toEqual({ error: 'not enough balance / allowance' });
@@ -135,7 +139,8 @@ describe('INVARIANT: capturing never changes what the caller sees', () => {
     const body = { success: false, errorMsg: 'order could not be fully filled' };
     await captureClobCall(fn, { side: 'SELL' }, async () => body);
 
-    const [rec] = findByFn(fn);
+    // A 'request' receipt is written before the wire (item 94); the settled one follows.
+    const rec = findByFn(fn).find((r) => r.phase !== 'request');
     expect(rec.phase).toBe('response');
     expect((rec.raw as any).success).toBe(false);
     expect((rec.raw as any).errorMsg).toBe('order could not be fully filled');
@@ -194,5 +199,44 @@ describe('INVARIANT: a receipt reaches the log and the bus alike', () => {
     } finally {
       unsubscribe();
     }
+  });
+});
+
+/**
+ * INVARIANT: a call in flight is visible before it returns (item 94).
+ *
+ * A 13-hour freeze (item 91) could not be attributed to any call, because
+ * receipts were written only once a call settled — so the one call that mattered
+ * recorded nothing at all. A request with no matching response or throw is now
+ * itself the diagnosis.
+ */
+describe('INVARIANT: a hung CLOB call still leaves a trace', () => {
+  it('writes a request receipt before the wire, and only that one while the call hangs', async () => {
+    const fn = tag('hung');
+    let release;
+    const hung = captureClobCall(fn, { tokenId: 'tok-hang', side: 'BUY' }, () =>
+      new Promise((resolve) => { release = () => resolve({ orderID: '0xlate' }); }));
+
+    // Nothing has come back yet — this is the state that was previously invisible.
+    await Promise.resolve();
+    const inFlight = findByFn(fn);
+    expect(inFlight).toHaveLength(1);
+    expect(inFlight[0].phase).toBe('request');
+    expect(inFlight[0].request.tokenId).toBe('tok-hang');
+    expect(inFlight[0].raw).toBeUndefined();
+
+    release();
+    await hung;
+
+    const settled = findByFn(fn);
+    expect(settled.map((r) => r.phase)).toEqual(['request', 'response']);
+  });
+
+  it('pairs a request with a throw when the call fails', async () => {
+    const fn = tag('hungthrow');
+    await captureClobCall(fn, { tokenId: 'tok-err' }, async () => { throw new Error('ECONNRESET'); })
+      .catch(() => {});
+
+    expect(findByFn(fn).map((r) => r.phase)).toEqual(['request', 'throw']);
   });
 });

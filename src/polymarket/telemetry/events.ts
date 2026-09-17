@@ -149,7 +149,7 @@ export interface TradeExecutionPayload extends LegacyMeta {
 export interface TradeExecutionReceiptPayload {
   at: string;
   fn: string;
-  phase: 'response' | 'throw';
+  phase: 'request' | 'response' | 'throw';
   request: Record<string, unknown>;
   raw?: unknown;
   rawKeys?: string[];

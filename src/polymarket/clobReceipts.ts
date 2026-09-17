@@ -45,7 +45,7 @@ const ECHO = process.env.ZINGER_RECEIPT_ECHO !== '0';
 export interface ClobReceipt {
   at: string;
   fn: string;
-  phase: 'response' | 'throw';
+  phase: 'request' | 'response' | 'throw';
   /** What we asked for — needed to interpret what came back. */
   request: Record<string, unknown>;
   /** The response object exactly as received. The whole point of this file. */
@@ -130,6 +130,12 @@ export async function captureClobCall<T>(
   request: Record<string, unknown>,
   call: () => Promise<T>,
 ): Promise<T> {
+  // Written BEFORE the wire, so a call that never returns still leaves a trace
+  // (backlog 94). Without this a hung call is invisible: the only records were
+  // written after a call settled, so the one that mattered most recorded
+  // nothing, and a 13-hour freeze (item 91) could not be attributed. A request
+  // with no matching response or throw IS the diagnosis.
+  captureReceipt({ fn, phase: 'request', request });
   try {
     const raw = await call();
     captureReceipt({ fn, phase: 'response', request, raw });

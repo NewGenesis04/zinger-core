@@ -5335,6 +5335,243 @@ UNWIND FAILED (attempt 1/3)` with `balance: 0`.
 
 ---
 
+### 91. The scan loop froze for 13 hours and nothing noticed ✅ FIXED 2026-09-17 (cause unidentified)
+
+**Found 2026-09-17** during an attended live canary. The loop stopped evaluating
+markets at **05:43:39 UTC** and was still frozen 13 hours later.
+
+**Evidence.** `arb_decision_counts` stops dead at the 05:00 bucket (counts are
+written per event, so this is real, not a flush artefact). Two `/api/poly/state`
+snapshots 10s apart: `scanning: true`, `scansDone: 16448` unchanged,
+`lastScan: 1789623819480` (= 05:43:39Z), `halt: null`. Capital untouched: no
+package opened, equity == cash.
+
+**Mechanism.** `scan()` raises `botState._scanning` and lowers it in a `finally`.
+A `finally` runs only when the pass settles, so an await that never settles holds
+the flag for the life of the process; every later tick returns at the guard.
+
+**The cause was never identified, and this item does not claim one.** Audited and
+ruled out: every scan-path `fetch` (all bounded), viem RPC (8-15s), CLOB reads
+(10s via the axios interceptor), the Python ML spawns (all SIGKILL on a timer),
+the heuristics trainer (30s spawn timeout), and the announce path (synchronous,
+no approval await). **CLOB writes are unbounded by design** and were the leading
+theory — killed by `proxyUsage.writes: 0` for the whole run: the counter
+increments when a request is *dispatched*, so a hung order would still have been
+counted. Receipts cannot help either: `captureClobCall` writes only after a call
+settles (see item 94).
+
+**Fixed by containment, not by cure** (operator chose option B of three):
+
+- **Watchdog** (`bot.ts:scan`): a tick finding the holding pass with no PROGRESS
+  for `SCAN_STALL_MS` (30s, `ZINGER_SCAN_STALL_MS`) logs `🚨 SCAN WATCHDOG`,
+  counts the stall, releases the flag and starts a fresh pass.
+- **Progress, not duration** (added 2026-09-18, before deploy). The first cut
+  measured total pass time, which is wrong for the situation it fires in: a pass
+  covers every tradable market and each call is separately bounded (reads 10s),
+  so on a degraded network a *healthy* pass can exceed any fixed total budget.
+  It would have abandoned working passes exactly during a network wobble, and the
+  replacement would meet the same network and be abandoned in turn. `scan()` now
+  stamps a heartbeat after each phase and each market
+  (`scanGuard.notePassProgress`), and the watchdog measures silence since the
+  last one. Slow survives; stopped is caught within 30s of stopping. A pass the
+  watchdog already abandoned cannot stamp a heartbeat — otherwise a waking zombie
+  would hold the watchdog off the live pass that replaced it.
+- **`/api/poly/state` exposes `passStartedAt`, `passIdleMs` and `scanStalls`**, so
+  a stall is visible in one snapshot rather than two taken 10s apart.
+- **Stale-pass guard** (`scanGuard.ts`): releasing the flag alone would be worse
+  than the freeze — nothing can cancel the stalled pass, and it may wake holding
+  pre-stall prices while a new pass sizes against the same account. Each pass
+  runs inside an `AsyncLocalStorage` context carrying a generation;
+  `executePendingTrade` — the funnel for every buy, arb legs included
+  (`bot.ts:2958`) — refuses when its pass is no longer current. Work with no
+  pass context (operator approval at `bot.ts:1440`, timers) is never stale.
+- **Release is conditional**: only `ownsLoop(gen)` may clear the flag, or an
+  abandoned pass finishing later would unlock the pass that replaced it.
+- Sells inside `scan()` needed no new guard: `claimPositionExit` (item 84)
+  already allows one sale per position.
+
+**Rejected:** exiting on stall for a supervisor to restart — the VPS runs under
+tmux with no process manager, so exiting would leave the bot dead until a human
+noticed.
+
+**Tests** — `tests/unit/scanGuard.test.ts` (9) on the policy and the zombie case;
+`tests/unit/invariants.scanWiring.test.ts` (8) reads `bot.ts` to pin the wiring,
+with checkers exercised against deliberately broken sources so they cannot fail
+open. Mutation-checked, 9 mutants: unconditional unlock, watchdog removed, zombie
+allowed to trade, no-context treated as stale, watchdog firing on an unstamped
+pass, judging total duration again, zombie allowed to stamp progress, and the
+market-loop heartbeat dropped — all killed. One survivor, equivalent rather than
+untested: not clearing `_lastProgressAt` in `beginPass` changes nothing, because
+a new pass's `startedAt` is always later than the previous pass's last
+heartbeat, and the watchdog takes the max of the two.
+
+**Still open:** the underlying hang (item 94 makes the next one diagnosable), and
+the WebSocket reporting connected while silent for ~53 min (item 96).
+
+---
+
+### 92. A render path drained the metered proxy at ~3 requests/second ✅ FIXED 2026-09-17
+
+**Found 2026-09-17** while diagnosing item 91. `proxyUsage.total` rose 171 in 60s
+(~10,000/h) against a run average of ~350/h.
+
+`updatePublicPaper` (`api/publicPredictions.ts`) called `syncClobBalance()`
+whenever the running session was live, throttled only to 2/s. It is reached from
+`buildPredictionResponse`, which serves `/api/v1/predictions`, `/paper`,
+`/bot-paper`, `/pilot`, **`/data-health`** and every SSE tick — so page views and
+health checks, including the ones used to diagnose item 91, spent proxy quota.
+
+**Nothing was cached, because there is nothing to cache.** `syncClobBalance`
+returns void (`trade.ts:844`): it asks the venue to re-read its own allowance.
+The call site discarded the result. Removed from the render path; the bot still
+makes it at startup, after every fill, and on the operator's manual sync.
+
+At ~250k requests/day this alone would exhaust the 1 GB/month plan in well under
+a week — item 61 fixed a 480/h drain, this was ~20× that.
+
+---
+
+### 93. A hung call is cached forever by the readiness lease ✅ FIXED 2026-09-18
+
+**FIXED.** The in-flight entry now expires after `IN_FLIGHT_MAX_MS` (20s) instead
+of `Infinity`, so a call that never settles stops being handed to every later
+pass. 20s is above every leg's own timeout (reads 10s, geoblock 8s, chain 8–15s),
+so a merely slow call is still shared rather than duplicated. Safe as designed:
+both settle handlers write only while their entry is still current, so a
+superseded call cannot clobber a newer answer. Tests in
+`readinessCache.test.ts`: a never-settling leg is shared within the window, a
+fresh call starts after it, and the leg recovers on the first good answer.
+
+
+**Found 2026-09-17.** `leased()` (`readiness.ts:115-121`) caches the in-flight
+promise with `expires: Infinity` and sets a real expiry only in the settle
+handlers. Deliberate, so concurrent callers share one call — but a call that
+never settles is cached forever and every later pass awaits the same dead
+promise. Agreed fix: cap the in-flight lease (~20s) so a fresh call can start.
+Safe as designed: a superseded entry only writes its outcome when
+`_memo.get(key) === entry`, so a late zombie cannot clobber a newer answer.
+
+---
+
+### 94. A call in flight leaves no trace, and writes are unbounded ✅ FIXED 2026-09-18
+
+**FIXED, both halves.**
+
+- **`phase: 'request'` receipt before dispatch** (`clobReceipts.ts`). A request
+  with no matching response or throw is now itself the diagnosis — the record
+  item 91 needed and did not have.
+- **Writes bounded** at `WRITE_TIMEOUT_MS` (15s, `CLOB_WRITE_TIMEOUT_MS`), vs 10s
+  for reads. The old exemption traded "unknown fill" against "hangs forever";
+  item 80's reconciler answers the first, and item 91 showed the second is not
+  the safe end — there is no supervisor to notice.
+
+**The exit-path check item 94 asked for, done:** every live sell clamps to actual
+wallet inventory first (`pmSharesForPosition`), and a failed sell leaves the
+position open. So a sell that times out but did fill leaves a position whose
+inventory is now zero, and the next pass reconciles it
+(`reconcileLiveGhostPosition`) instead of selling twice. `unwindLeg` already
+retried on failure, and a duplicate sell is refused by the venue for shares no
+longer held.
+
+**Cost:** receipt volume roughly doubles on order paths (request + settle). These
+are per-order, not per-scan, so the rate stays low — but it brings item 50's
+rotation (two 4 MB generations, third discarded) closer.
+
+Tests: `clobReceipts.test.ts` — a hung call leaves exactly one `request` receipt
+and nothing else until it settles; request/throw pairing.
+`proxyRequestCounter.test.ts` now pins that a write is bounded *more loosely*
+than a read rather than left unbounded.
+
+
+**Found 2026-09-17.** `captureClobCall` (`clobReceipts.ts:128`) writes a receipt
+only on response or throw, so a hung call records nothing — which is why item
+91's cause could not be found. Agreed fix: a `phase: 'request'` receipt before
+dispatch, plus a ~15s timeout on CLOB writes (`MONEY_PATHS`, `proxyEnv.ts:63`).
+Bounding writes was correctly refused before item 80: a timed-out order used to
+mean "unknown fill". `reconcileArbLeg` now answers exactly that. **To verify when
+implementing:** each exit path's behaviour when a sell times out but did in fact
+fill — on the arb unwind the retry is refused for shares no longer held, but the
+other sell sites need walking.
+
+---
+
+### 95. Two scan implementations, and the live one contradicts item 60 ✅ CLOSED 2026-09-18 — both decided, quarantine only
+
+**CLOSED by operator decision, no behavioural change.**
+
+**Decision 1 — do NOT wire `scan/index.ts`.** It stays quarantined behind the
+header banner added 2026-09-18, which states it has no caller and that editing it
+changes nothing at runtime. Deleting it remains available and is not urgent.
+
+**Decision 2 — keep `refreshTelemetry()` in the scan loop** (`bot.ts:2655`),
+despite item 60. Rationale: do not alter the money path immediately before a
+canary run. The contradiction is recorded rather than resolved.
+
+That call site is no longer able to hang the loop indefinitely, which is what
+made keeping it acceptable: item 93 caps a shared in-flight leg at 20s, reads are
+bounded at 10s, and item 91's watchdog takes the loop back at 30s.
+
+**Revisit after the canary:** whether the loop should read readiness rather than
+refresh it, as item 60 intends.
+
+
+**Half done 2026-09-18.** `scan/index.ts` now carries a header saying it is not
+wired and that editing it changes nothing at runtime — the trap was silent, and
+it now announces itself. Deleting it is a decision about the refactor, not a
+cleanup, so it stays.
+
+**Decision 1: delete `scan/index.ts`, or wire it?** It is the finished slice-2
+extraction. Leaving it costs nothing but confusion; wiring it would move the
+watchdog and stale-pass guard (item 91) into it too.
+
+**Decision 2: should `bot.ts:scan()` keep refreshing readiness every pass?**
+`await refreshTelemetry()` at `bot.ts:2655` contradicts item 60 ("the scan loop
+is a reader; the 30s timer owns readiness"). The lease absorbs the network cost,
+so the quota is safe — but it puts a network call site *inside* the pass, which
+is the class of thing that froze the loop, and since item 59 it can also await
+the proxy probe. Removing it makes readiness up to 30s stale for sizing, which
+item 60 says is intended and the affordability gates already handle. Not changed
+here: it alters freshness on the money path.
+
+
+**Found 2026-09-17.** `src/polymarket/scan/index.ts` (`executeScanCycle`) is
+referenced nowhere; the live loop is `bot.ts:scan()`. Edits to the tidied module
+change nothing. Separately, the live loop calls `await refreshTelemetry()` every
+pass (`bot.ts:2655`), which item 60 states it must not: the lease cache absorbs
+the network cost, so the quota is safe, but the design and the code disagree, and
+since item 59 that call can also await the proxy probe.
+
+---
+
+### 96. The CLOB WebSocket reports connected while silent ✅ FIXED 2026-09-18
+
+**FIXED.** `readyState` describes the socket, not the feed, and a half-open
+connection stays OPEN indefinitely — so the stream reported `connected: true`
+with its last message 53 minutes old while every book aged out. The existing
+ping proved nothing, because nothing checked for a reply.
+
+- `isStreamStale()` (pure, exported): connected **and** subscribed **and** silent
+  longer than `STALE_MS` (120s, `CLOB_WS_STALE_MS`). A stream that just connected,
+  one with nothing subscribed, and a disconnected one are each excluded — those
+  are different faults.
+- The existing ping timer now closes a stale socket, taking the existing
+  reconnect path rather than adding a second one, and counts `staleReconnects`.
+- `lastMsgAt` is stamped on open, so a fresh socket is not judged on the previous
+  connection's traffic.
+- `/api/v1/data-health` reports `stale` and `staleReconnects` beside `connected`.
+
+Tests in `clobWsBook.test.ts`, including the observed 53-minute case.
+
+
+**Found 2026-09-17.** `/api/v1/data-health` showed `connected: true`,
+`subscribed: 24`, `books: 80`, `lastMsgAgeMs: 3192169` (~53 min). A silent socket
+that still reports connected makes every book stale without anything saying so —
+and stale books are what item 70 was about. The feed is direct, not proxied, so
+this is independent of items 91/92. Needs a staleness threshold that marks the
+feed unhealthy, and a reconnect.
+
+---
+
 ## Handoff — state as of 2026-08-20
 
 Written so a fresh session can continue without re-deriving any of the above.

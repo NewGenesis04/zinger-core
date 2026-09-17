@@ -98,6 +98,15 @@ export const TTL = {
   failCap: 15 * MINUTE,
 };
 
+/**
+ * How long an unsettled call may be shared before a fresh one is allowed.
+ *
+ * Longer than any leg's own timeout (reads 10s, geoblock 8s, chain 8-15s), so a
+ * merely slow call is still shared rather than duplicated; short enough that a
+ * call which will never settle cannot wedge the leg for the life of the process.
+ */
+const IN_FLIGHT_MAX_MS = 20_000;
+
 const _memo = new Map();
 
 /** Backoff for a leg that keeps failing: 1m → 2m → 4m → 8m → 15m (capped). */
@@ -118,7 +127,17 @@ function leased(key, fn, ttlFor) {
   if (hit && now < hit.expires) return hit.promise;
 
   const streak = hit?.streak ?? 0;
-  const entry = { promise: null, expires: Infinity, streak };
+  /*
+   * An in-flight call is cached so concurrent callers share it — but only for
+   * `IN_FLIGHT_MAX_MS` (item 93). It used to be cached with no expiry at all,
+   * which is correct right up until a call never settles: the entry then never
+   * reaches the handlers below that set a real expiry, so every later pass is
+   * handed the same dead promise and the leg can never be retried.
+   *
+   * Capping it is safe because a superseded call cannot clobber a newer answer:
+   * both handlers below write only while this entry is still the current one.
+   */
+  const entry = { promise: null, expires: Date.now() + IN_FLIGHT_MAX_MS, streak };
   entry.promise = Promise.resolve()
     .then(fn)
     .then(

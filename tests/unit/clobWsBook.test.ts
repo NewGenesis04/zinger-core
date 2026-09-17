@@ -19,7 +19,7 @@
  * was not on it.
  */
 import { describe, it, expect } from 'vitest';
-import { upsertFromBook, applyPriceChange, getClobWsBook } from '../../src/polymarket/clobWs.js';
+import { upsertFromBook, applyPriceChange, getClobWsBook, isStreamStale} from '../../src/polymarket/clobWs.js';
 
 const TOK = 'test-token-1';
 
@@ -89,5 +89,43 @@ describe('clobWs book maintainer', () => {
     applyPriceChange({ asset_id: 't-worse', price: '0.80', size: '10', side: 'SELL' }, Date.now());
     // 0.30 still rests, so it is still the best ask.
     expect(getClobWsBook('t-worse').bestAsk).toBe(0.3);
+  });
+});
+
+/**
+ * INVARIANT: a silent feed is reported as dead, not as connected (item 96).
+ *
+ * `readyState` describes the socket, not the feed. A half-open connection stays
+ * OPEN indefinitely, so the stream reported `connected: true` with its last
+ * message 53 minutes old while every book quietly aged out. Pings did not catch
+ * it, because nothing checked that anything came back.
+ */
+describe('INVARIANT: feed silence is detected while the socket still says OPEN', () => {
+  const now = Date.UTC(2026, 8, 18, 12, 0, 0);
+  const staleMs = 120_000;
+
+  it('is not stale while messages keep arriving', () => {
+    expect(isStreamStale({ connected: true, subscribed: 24, lastMsgAt: now - 5_000, now, staleMs })).toBe(false);
+    expect(isStreamStale({ connected: true, subscribed: 24, lastMsgAt: now - staleMs, now, staleMs })).toBe(false);
+  });
+
+  it('is stale once the whole subscribed set has gone quiet', () => {
+    expect(isStreamStale({ connected: true, subscribed: 24, lastMsgAt: now - (staleMs + 1), now, staleMs })).toBe(true);
+    // The observed case: connected, subscribed, silent for 53 minutes.
+    expect(isStreamStale({ connected: true, subscribed: 24, lastMsgAt: now - 3_192_169, now, staleMs })).toBe(true);
+  });
+
+  it('never calls a disconnected or unsubscribed stream stale', () => {
+    // Those are different faults with different handling; conflating them would
+    // fire a reconnect at a stream that was never meant to be delivering.
+    expect(isStreamStale({ connected: false, subscribed: 24, lastMsgAt: now - 3_600_000, now, staleMs })).toBe(false);
+    expect(isStreamStale({ connected: true, subscribed: 0, lastMsgAt: now - 3_600_000, now, staleMs })).toBe(false);
+  });
+
+  it('does not judge a connection that has never received a message', () => {
+    // A socket that just opened has delivered nothing yet; that is not silence.
+    for (const lastMsgAt of [0, null, undefined, NaN]) {
+      expect(isStreamStale({ connected: true, subscribed: 24, lastMsgAt, now, staleMs }), String(lastMsgAt)).toBe(false);
+    }
   });
 });

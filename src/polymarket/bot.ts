@@ -48,6 +48,7 @@ import {
   resetPackages,
 } from './arbEngine.js';
 import { persist, persistSync, load, FILES, dataPath } from './persistence.js';
+import { shouldAbandonCurrentPass, notePassProgress, passTimings, beginPass, runAsPass, ownsLoop, recordStall, isStalePass, callingGeneration, currentGeneration, scanStallCount } from './scanGuard.js';
 import { placeOrder, placeMarketBuy, placeMarketSell, sellFloor, cancelOrder, syncClobBalance, expectedSharesFor, fokKillStats } from './trade.js';
 import { lossCapStatus, resetLossCap } from './lossCap.js';
 import {
@@ -1001,6 +1002,23 @@ function currentLossCap() {
 async function executePendingTrade(pending) {
   const cfg = botState.config;
   const plan = pending.plan;
+  /*
+   * A pass the watchdog abandoned may wake up here, inside the await it stalled
+   * on, holding prices and a balance from before the stall. It must not place an
+   * order: a newer pass is live and sizing against the same account.
+   *
+   * Callers outside a scan pass — an operator approving by hand, a timer — carry
+   * no pass context and are never stale, so this refuses only the zombie.
+   */
+  if (isStalePass()) {
+    log(`⛔ STALE PASS — refusing ${pending.symbol} ${String(pending.outcome || '').toUpperCase()}: pass #${callingGeneration()} was abandoned (current #${currentGeneration()})`, 'error', {
+      market: pending.symbol, slug: pending.slug, outcome: pending.outcome,
+      pass: callingGeneration(), current: currentGeneration(),
+    });
+    pending.status = 'failed';
+    botState._buyLocks.delete(pending.slug);
+    return { ok: false, error: 'stale scan pass' };
+  }
   const costNeeded = Number(plan.costEst || plan.sizeUsd || 0);
   // D5: each engine is gated by its own dial, counting its own positions. Arb
   // legs used to be charged against maxOpenPositions, which is the directional
@@ -1978,6 +1996,13 @@ export function getState(opts = {}) {
     phase: botState.running ? (botState._scanning ? 'scanning' : 'idle') : 'stopped',
     scanning: !!botState._scanning,
     lastScanAt: botState.lastScan,
+    // A stall is visible in one snapshot: `scanning` true with `passIdleMs`
+    // climbing is a stuck pass, without needing two reads ten seconds apart.
+    passStartedAt: passTimings().startedAt || null,
+    passIdleMs: botState._scanning
+      ? Date.now() - Math.max(passTimings().startedAt || 0, passTimings().lastProgressAt || 0)
+      : null,
+    scanStalls: scanStallCount(),
     scansDone: botState.stats.scansDone || 0,
     signalsToday: botState.stats.signalsToday || 0,
     pendingCount: botState.pendingTrades.filter((p) => p.status === 'pending').length,
@@ -2639,20 +2664,52 @@ export async function scan() {
     // Item 84 part 4: exits run on their own interval now, so a slow market
     // loop cannot delay them. Kept out of the scan cycle deliberately — calling
     // it here too would reintroduce the coupling this change removes.
-    
-    return;
+
+    /*
+     * Watchdog. The flag is lowered in a `finally`, which only runs when the
+     * pass settles — so an await that never settles holds the loop for the life
+     * of the process and every tick after it returns here. Past `stallMs` the
+     * pass is declared abandoned and the loop is taken back.
+     *
+     * Taking the loop back does not cancel that pass; nothing can. It stays
+     * inside its await and may wake later holding stale prices. `scanGuard`
+     * carries a generation through the async context and
+     * `executePendingTrade` refuses a woken zombie — that guard is what makes
+     * releasing the flag here safe rather than reckless.
+     */
+    if (shouldAbandonCurrentPass(true)) {
+      const { startedAt, lastProgressAt } = passTimings();
+      const heldSec = Math.round((Date.now() - Number(startedAt || 0)) / 1000);
+      const idleSec = Math.round((Date.now() - Math.max(Number(startedAt || 0), Number(lastProgressAt || 0))) / 1000);
+      const stalls = recordStall();
+      log(
+        `🚨 SCAN WATCHDOG — pass #${botState._scanGeneration} made no progress for ${idleSec}s (running ${heldSec}s) and was abandoned · starting a fresh pass (stall ${stalls})`,
+        'error',
+        { generation: botState._scanGeneration, heldSec, idleSec, stalls, startedAt, lastProgressAt },
+      );
+      botState._scanning = false;
+      botState._scanStalledAt = Date.now();
+    } else {
+      return;
+    }
   }
   botState._scanning = true;
+  botState._scanStartedAt = Date.now();
+  const passGen = beginPass();
+  botState._scanGeneration = passGen;
 
   try {
+    return await runAsPass(passGen, async () => {
     maybeFinalizeCycle();
     prunePendingTrades();
     // Arb capacity has to drain without anyone watching (items 9 and 10).
     await arbHousekeeping('scan');
+    notePassProgress();
     // One computation per cycle for the hot arb path to read (item 74b).
     botState._lossCap = currentLossCap();
     botState.stats.scansDone = (botState.stats.scansDone || 0) + 1;
     const readiness = await refreshTelemetry();
+    notePassProgress();
 
     await collectSignals({
       cfg,
@@ -2749,6 +2806,10 @@ export async function scan() {
     }
 
     for (const market of tradableMarkets) {
+      // One heartbeat per market: a pass crawling through a slow network is
+      // still working and must not be abandoned; one that stops between markets
+      // has stopped. See `scanGuard.shouldAbandonPass`.
+      notePassProgress();
       if (!cfg.assets.includes(market.symbol)) continue;
       const prices = await getPricesForMarket(market);
       recordChartTick(market.slug, prices);
@@ -3742,10 +3803,14 @@ export async function scan() {
       }
     );
 
+    });
   } catch (err) {
     log(`⚠️ Scan error: ${err.message}`, 'error');
   } finally {
-    botState._scanning = false;
+    // Only the pass that still owns the loop may lower the flag. An abandoned
+    // pass finishing later must not, or a third pass would start alongside the
+    // one that replaced it.
+    if (ownsLoop(passGen)) botState._scanning = false;
   }
 }
 

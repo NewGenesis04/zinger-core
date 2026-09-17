@@ -1,4 +1,17 @@
 // @ts-nocheck
+/**
+ * ⚠️ NOT WIRED — backlog 95.
+ *
+ * `executeScanCycle` has no caller: the loop the bot actually runs is
+ * `bot.ts:scan()`, driven by the interval in `startBackgroundFeeds`. This module
+ * is the slice-2 extraction, finished but never switched on, so **editing it
+ * changes nothing at runtime** — including the watchdog and stale-pass guard
+ * (item 91), which live in `bot.ts` because that is what runs.
+ *
+ * Kept rather than deleted because deleting it is a decision about the refactor,
+ * not a cleanup. Verify with `grep -rn executeScanCycle src` before assuming a
+ * change here has any effect.
+ */
 import {
   evaluateCycleBoundary,
   prunePendingTrades,

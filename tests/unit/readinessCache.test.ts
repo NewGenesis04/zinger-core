@@ -296,3 +296,53 @@ describe('INVARIANT: checkReadiness does not filter the wallet scan (item 68)', 
     expect(open?.detail).toMatch(/^1 open position/);
   });
 });
+
+/**
+ * INVARIANT: a call that never settles cannot wedge a leg forever (item 93).
+ *
+ * The lease caches the in-flight promise so concurrent callers share one call.
+ * With no expiry on that entry, a call that never settles is handed to every
+ * later pass forever — the leg can never be retried, and the bot cannot heal
+ * even once the underlying fault clears.
+ */
+describe('INVARIANT: an unsettled leg is retried, not cached forever', () => {
+  it('starts a fresh call once the in-flight window lapses', async () => {
+    vi.useFakeTimers();
+    try {
+      // A call that never settles, exactly like a socket that dropped silently.
+      clobBalanceSpy.mockImplementation(() => new Promise(() => {}));
+
+      await Promise.race([checkReadiness({}), Promise.resolve()]);
+      expect(clobBalanceSpy).toHaveBeenCalledTimes(1);
+
+      // Within the window the same dead call is shared — no duplicate traffic.
+      await Promise.race([checkReadiness({}), Promise.resolve()]);
+      expect(clobBalanceSpy).toHaveBeenCalledTimes(1);
+
+      vi.setSystemTime(Date.now() + 25_000);
+
+      await Promise.race([checkReadiness({}), Promise.resolve()]);
+      expect(clobBalanceSpy).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('recovers on the first good answer after a hang', async () => {
+    vi.useFakeTimers();
+    try {
+      clobBalanceSpy.mockImplementation(() => new Promise(() => {}));
+      await Promise.race([checkReadiness({}), Promise.resolve()]);
+
+      // The clock must stay advanced for the call itself: dropping back to real
+      // time would make the dead entry look unexpired again.
+      vi.setSystemTime(Date.now() + 25_000);
+      allLegsHealthy();
+
+      const readiness = await checkReadiness({});
+      expect(readiness.clobBalance).toBe(25);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});

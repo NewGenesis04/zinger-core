@@ -66,15 +66,25 @@ describe('INVARIANT: proxied requests are counted', () => {
     expect(res.config.timeout).toBe(1234);
   });
 
-  it('counts an order write and leaves it unbounded', async () => {
+  it('counts an order write and bounds it generously, not tightly', async () => {
+    const read = await send(`${HOST}/balance-allowance`, 'get');
+    resetProxyRequestStats();
     const res = await send(`${HOST}/order`, 'post');
 
     const stats = getProxyRequestStats();
     expect(stats.total).toBe(1);
     expect(stats.writes).toBe(1);
     expect(stats.reads).toBe(0);
-    // The whole point of the timeout policy: an order POST must not be capped.
-    expect(res.config.timeout == null || res.config.timeout === 0).toBe(true);
+
+    /*
+     * Item 94. Writes were exempt from any timeout, because a cut-off order
+     * leaves an order in unknown state. Item 80's reconciler answers that
+     * question now, and an unbounded write is what can hang the scan loop
+     * forever (item 91) — so a write IS bounded, but far more loosely than a
+     * read, to fire only on a dead socket rather than a slow venue.
+     */
+    expect(Number(res.config.timeout)).toBeGreaterThan(Number(read.config.timeout));
+    expect(Number(res.config.timeout)).toBeGreaterThan(0);
   });
 
   it('accumulates across mixed traffic', async () => {

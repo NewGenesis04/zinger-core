@@ -12,6 +12,19 @@ const WS_URL = 'wss://ws-subscriptions-clob.polymarket.com/ws/market';
 const MAX_BOOK_AGE_MS = 15_000;
 const RECONNECT_MS = 2500;
 const PING_MS = 20_000;
+/**
+ * Total silence after which the stream is treated as dead — backlog 96.
+ *
+ * `readyState` only reports the socket, not the feed: a half-open connection
+ * stays OPEN indefinitely, so the stream can report connected while delivering
+ * nothing and every book quietly ages out. Pings alone do not detect it, because
+ * nothing checks that anything comes back.
+ *
+ * Well above the gaps a live book actually shows (updates arrive many times a
+ * minute across the subscribed set), so this fires on a dead feed, not a quiet
+ * one.
+ */
+const STALE_MS = Number(process.env.CLOB_WS_STALE_MS) || 120_000;
 
 /** @type {Map<string, { bestBid:number|null, bestAsk:number|null, mid:number|null, lastTrade:number|null, ts:number, source:string }>} */
 const books = new Map();
@@ -94,6 +107,7 @@ let pingTimer = null;
 let lastMsgAt = 0;
 let connectCount = 0;
 let msgCount = 0;
+let staleReconnects = 0;
 
 function emit(tokenId, snap) {
   for (const fn of listeners) {
@@ -248,11 +262,21 @@ function connect() {
   ws = new WebSocket(WS_URL);
   ws.on('open', () => {
     if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+    // A fresh socket has delivered nothing yet; without this the staleness check
+    // would judge it on the previous connection's last message.
+    lastMsgAt = Date.now();
     sendSubscribe([...desired]);
     if (pingTimer) clearInterval(pingTimer);
     pingTimer = setInterval(() => {
-      if (ws?.readyState === WebSocket.OPEN) {
-        try { ws.ping(); } catch {}
+      if (ws?.readyState !== WebSocket.OPEN) return;
+      try { ws.ping(); } catch {}
+      // A ping proves nothing on its own — nothing checks for a reply. Silence
+      // across the whole subscribed set is the signal (backlog 96). Closing
+      // takes the existing reconnect path rather than adding a second one.
+      if (isStreamStale({ connected: true, subscribed: desired.size, lastMsgAt })) {
+        staleReconnects += 1;
+        console.warn(`[clob-ws] feed silent ${Math.round((Date.now() - lastMsgAt) / 1000)}s while connected — reconnecting (${staleReconnects})`);
+        try { ws.close(); } catch {}
       }
     }, PING_MS);
   });
@@ -320,6 +344,19 @@ export function getClobWsBook(tokenId) {
   return { ...snap, stale: false };
 }
 
+/**
+ * Has the feed gone silent while claiming to be connected?
+ *
+ * Pure so the policy is testable without a socket. Silence only counts when
+ * something is subscribed and at least one message has ever arrived: a stream
+ * that has just connected, or one with nothing to deliver, is not stale.
+ */
+export function isStreamStale({ connected, subscribed, lastMsgAt: last, now = Date.now(), staleMs = STALE_MS }) {
+  if (!connected || !subscribed) return false;
+  if (!(Number(last) > 0)) return false;
+  return now - Number(last) > Number(staleMs);
+}
+
 export function getClobWsSnapshot() {
   const out = {};
   for (const [id, snap] of books.entries()) {
@@ -338,6 +375,13 @@ export function getClobWsSnapshot() {
     connectCount,
     lastMsgAt,
     lastMsgAgeMs: lastMsgAt ? Date.now() - lastMsgAt : null,
+    // Connected is about the socket; this is about the feed (backlog 96).
+    stale: isStreamStale({
+      connected: !!(ws && ws.readyState === WebSocket.OPEN),
+      subscribed: desired.size,
+      lastMsgAt,
+    }),
+    staleReconnects,
     tokens: out,
   };
 }

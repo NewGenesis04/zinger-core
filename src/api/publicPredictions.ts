@@ -13,7 +13,7 @@ import { getWallet } from '../lib/wallet.js';
 import { POLY, durationFromSlug } from '../polymarket/config.js';
 import { checkPusdBalance } from '../polymarket/swap.js';
 import { startDepositScanner, stopDepositScanner, getLastScannedBlock } from '../polymarket/deposits.js';
-import { placeOrder, placeMarketSell, sellFloor, syncClobBalance, getClobBalance } from '../polymarket/trade.js';
+import { placeOrder, placeMarketSell, sellFloor, getClobBalance } from '../polymarket/trade.js';
 import {
   ensureAccount,
   getAccount,
@@ -426,9 +426,11 @@ function updatePublicPaper(signals, markets, rawMarkets) {
   const running = getRunningSession();
   if (running?.wallet) syncAccountCash(running.wallet, publicPaper.cash);
 
-  if (running?.mode === 'live') {
-    syncClobBalance().catch(() => {});
-  }
+  // NOT a balance read and nothing here consumes it: `syncClobBalance` asks the
+  // venue to re-read its own allowance, and returns void. It ran on every page
+  // view, poll and SSE tick (this function is throttled only to 2/s), which made
+  // a render path the largest consumer of a metered proxy. The bot already makes
+  // this call at startup, after every fill, and on the operator's manual sync.
 
   publicPaper.events = publicPaper.events.slice(0, 60);
   return publicPaperSnapshot();
@@ -989,6 +991,9 @@ export function registerPublicAPI(app, getPolyState) {
             books: wsSnap.books,
             msgCount: wsSnap.msgCount,
             lastMsgAgeMs: wsSnap.lastMsgAgeMs,
+            // Connected describes the socket; stale describes the feed (item 96).
+            stale: wsSnap.stale,
+            staleReconnects: wsSnap.staleReconnects,
           },
           writeProxy: proxyHealth,
           note: wsFresh

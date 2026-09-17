@@ -62,6 +62,21 @@ export function getClobProxyAgent() {
  */
 const MONEY_PATHS = new Set(['/order', '/orders', '/cancel-market-orders']);
 const READ_TIMEOUT_MS = Number(process.env.CLOB_READ_TIMEOUT_MS) || 10000;
+/**
+ * Writes are bounded too, but far more loosely (backlog 94).
+ *
+ * They were exempt because a cut-off order leaves an order in unknown state, and
+ * unknown is worse than slow. That is no longer the trade-off: `reconcileArbLeg`
+ * (item 80) answers "did it fill?" from the venue's own record, and every exit
+ * path clamps to real wallet inventory before selling, so a timed-out sell that
+ * did fill is reconciled rather than repeated.
+ *
+ * Unbounded is not the safe end of that trade any more: a write that never
+ * returns holds whatever awaited it forever, and there is no supervisor to
+ * notice. The value is generous so it fires only on a dead socket, never on a
+ * slow venue.
+ */
+const WRITE_TIMEOUT_MS = Number(process.env.CLOB_WRITE_TIMEOUT_MS) || 15000;
 
 let _timeoutsInstalled = false;
 
@@ -153,8 +168,8 @@ export function installAxiosReadTimeouts() {
     // request interceptors run, and its default timeout is 0 ("no timeout") —
     // not undefined. A null check therefore never fires, which silently made
     // this interceptor a no-op for bounding while still looking correct.
-    if (!isWrite && !(Number(config.timeout) > 0)) {
-      config.timeout = READ_TIMEOUT_MS;
+    if (!(Number(config.timeout) > 0)) {
+      config.timeout = isWrite ? WRITE_TIMEOUT_MS : READ_TIMEOUT_MS;
     }
     return config;
   });
