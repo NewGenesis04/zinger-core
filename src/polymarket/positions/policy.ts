@@ -146,11 +146,9 @@ function hasHedgeMarkers(posOrPlan) {
  * or was unwound, does not have it — it is an ordinary directional bet, and the
  * marker on it is a statement of intent, not of fact.
  *
- * Before this, the markers alone won, so the one position that most needed a
- * stop loss — a naked leg the operator never chose to hold — was the single
- * position guaranteed to ride to settlement untouched. That is the shape of the
- * 2026-08-28 −$12.83 loss: 26.33 DOWN shares, sibling killed, exempt from every
- * exit, expired at zero.
+ * If the markers alone decided, the one position that most needs a stop loss —
+ * a naked leg the operator never chose to hold — would be the single position
+ * guaranteed to ride to settlement untouched.
  *
  * ## Still failing toward the intact pair, and why that is not timidity
  *

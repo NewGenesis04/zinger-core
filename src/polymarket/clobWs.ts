@@ -19,13 +19,11 @@ const books = new Map();
 /*
  * Per-level resting size, one map per side per token. Item 70.
  *
- * `bestBid`/`bestAsk` used to be maintained as two bare scalars, which cannot
- * answer "what is underneath the top level" — so a `price_change` removing the
- * best ask set it to `null` even with size still resting one tick down. That
- * null was coerced to 0 by `clob.ts:174` and then replaced with a MID by
- * `arbEngine.ts:54`, which is how a live FOK order came to be signed at a price
- * nothing rested at (2026-09-09 run: every leg rejected against a 1,386-share
- * book).
+ * Two bare `bestBid`/`bestAsk` scalars cannot answer "what is underneath the top
+ * level": a `price_change` removing the best ask would null it even with size
+ * still resting one tick down, and a missing ask lets downstream code price an
+ * order off something that is not an ask. Keeping every level means removing
+ * the top one reveals the next.
  *
  * Prices are tick-aligned (0.001 minimum), so they are keyed as integer
  * ten-thousandths — float keys would make `delete` unreliable.

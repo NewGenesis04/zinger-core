@@ -10,12 +10,9 @@
  * expectancy calculation measures nothing about whether a *signal* predicts
  * direction; it measures that the two halves of a hedge cancel.
  *
- * Measured on the local store 2026-08-20, before the filter: 6 of 7 paper
- * trades were arb legs, giving 3 artificial wins, 3 artificial losses and an
- * expectancy of −$0.010 — arithmetic noise around zero, from a sample that had
- * tested a directional signal exactly once. Since `requireEdgeForLive` gates
- * real money on this number, a run of lucky packages could have unlocked live
- * trading on evidence that never tested the strategy.
+ * Since `requireEdgeForLive` gates real money on this number, counting arb legs
+ * would let a run of ordinary packages unlock live directional trading on
+ * evidence that never tested a directional signal.
  */
 import { tradeEngine } from './audit.js';
 

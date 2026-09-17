@@ -184,16 +184,15 @@ function sharesForUsd(usd, price, minShares = 5) {
  * The venue's own way of saying "your fill-or-kill matched nothing" — item 84.
  *
  * Every pattern here is a string this project has OBSERVED from the live CLOB,
- * not one it expects. The only entry as of 2026-09-15 comes from the item 78
- * probe, recorded as fact 8 in `docs/research/polymarket-domain-facts.md`:
+ * not one it expects (domain facts §8):
  *
  *   "order couldn't be fully filled. FOK orders are fully filled or killed."
  *
  * This is deliberately the ONE place in the codebase that reads meaning out of
  * an error string, and it is worth naming why that is normally forbidden.
- * `verifyFilledShares` refuses to gate on `status` (:311) because the vocabulary
- * was never recorded, and the Aug 2026 `negRisk` regression was exactly this
- * shape — a plausible assumption about venue behaviour, shipped green.
+ * `verifyFilledShares` refuses to gate on `status` because a status vocabulary
+ * is an assumption about venue behaviour, and an unverified assumption about
+ * venue behaviour is the failure CLAUDE.md warns about.
  *
  * What makes it acceptable here is the direction of failure. A match skips a
  * 4.5-second reconciliation for a leg the venue has explicitly said did not
@@ -300,10 +299,10 @@ function assertOrderAccepted(result, context) {
  * Did a GTC limit order actually match, or is it resting on the book?
  *
  * `assertOrderAccepted` passes on orderID presence alone, and the CLOB returns
- * an orderID for a resting order just as it does for a matched one. That is how
- * the 2026-08-28 arb leg was recorded as filled while it sat unmatched as a bid
- * — and the same read still applies to directional entries, which use GTC
- * deliberately (a resting bid is a missed trade, not a naked position).
+ * an orderID for a resting order just as it does for a matched one, so an
+ * orderID alone would record an unmatched bid as a fill. Directional entries use
+ * GTC deliberately (a resting bid is a missed trade, not a naked position), so
+ * this read applies to them.
  *
  * Detection is quantitative, not status-string based: the exact status vocabulary
  * is still an open question in the research doc, but "no collateral moved" is
@@ -468,50 +467,35 @@ export async function placeOrder({ tokenId, side, amountUsd, price, negRisk = fa
  * Polymarket scales conditional-token amounts by COLLATERAL_TOKEN_DECIMALS (6),
  * the same as USDC — verified in the SDK at
  * `order-builder/helpers/buildMarketOrderCreationArgs.js`, which runs both
- * `makerAmount` and `takerAmount` through `parseUnits(..., 6)`. The live
- * settlement receipts agree: `26330000` is 26.33 shares.
+ * `makerAmount` and `takerAmount` through `parseUnits(..., 6)`. That is the
+ * SIGNED order.
  *
- * What the SDK does NOT pin down is the scale of `makingAmount`/`takingAmount`
- * on the OrderResponse coming back over the wire — both are typed bare `string`
- * with no documented units. Guessing wrong mis-sizes the sibling arb leg, which
- * is the failure this whole path exists to prevent, so resolve the scale
- * against a share count we derived ourselves instead of assuming one.
+ * The OrderResponse coming back is a different matter: the SDK types
+ * `makingAmount`/`takingAmount` as bare `string` with no documented units.
+ * Observed responses carry decimal human units (domain facts §9a), but that is
+ * an observation, not a contract — and guessing wrong mis-sizes the sibling arb
+ * leg. So readings are resolved against a band derived from our own order,
+ * accepting either scale, rather than assuming one.
  */
 const SHARE_SCALE = 1_000_000;
 
 /**
- * The share count band a fixed-dollar FOK buy could legitimately land in —
- * item 81.
+ * Share count band for fixed-dollar FOK buy fills.
  *
- *   lo = expected − tolerance                  (rounding on our side of the arithmetic)
- *   hi = (expected + tolerance) × (price / tick)   (every share filled at one tick)
+ *   lo = expected − tolerance
+ *   hi = (expected + tolerance) × (price / tick)
  *
- * The tolerance is scaled into `hi`, not added after. `expected` is rounded to
- * 2dp, and `price / tick` multiplies that rounding by up to 98×: with it added
- * unscaled, a $2.75 buy bounded at $0.51 got a ceiling of 274.9978 shares
- * against a physical maximum of 275 (`amount / tick`). Found by the sweep in
- * `tests/unit/fillPathBand.test.ts`.
+ * Why one-sided:
+ * The order commits a fixed dollar amount at a limit price (`amount / fillPrice`
+ * where `fillPrice <= maxPrice`). Price improvements increase the shares received,
+ * while FOK never partially fills. Thus, valid fills can legitimately exceed
+ * `expected`, but will not fall below `expected - tolerance`.
  *
- * WHY ONE-SIDED. The order commits a fixed dollar amount at a limit price, so
- * the shares received are `amount / fillPrice` with `fillPrice ≤ price`. Price
- * improvement can only ever ADD shares, and FOK does not partially fill, so
- * nothing below `expected` is a real outcome beyond our own rounding. The
- * previous band here was symmetric (`|c − expected| ≤ tolerance`) and rejected
- * the 2026-09-11 fill — 4.682223 against 4.59 — by 0.0004 shares. The fill was
- * reported unverified, and that is where the ghost began.
+ * The tolerance is scaled into `hi` rather than added after to prevent rounding
+ * distortions when multiplying by `(price / tick)`.
  *
- * `hi` is generous (27× at $0.27 on a $0.01 tick) and that is fine: the only
- * thing the band discriminates is wire scale, and the two candidate readings
- * differ by 1e6. `hi / lo` is at most `price / tick`, under 1000 for any tick in
- * this SDK, so both readings can never fit at once.
- *
- * ONE OWNER. The fill path (`verifyFilledShares`) and the reconciler
- * (`arbReconcile.ts`, re-exported there) both read this function. Before item
- * 81 they held two different bands for the same question, and the fill path's
- * was the wrong one.
- *
- * Not for GTC limit orders: those can partially fill and can never overfill,
- * which is the opposite shape — see `readGtcFill`.
+ * Owned here and shared by both the immediate fill path (`verifyFilledShares`)
+ * and the dual-door reconciler (`arbReconcile.ts`).
  */
 export function shareBand({ expectedShares, price, tickSize = 0.01, tolerance = 0.05 }) {
   const exp = Number(expectedShares);
@@ -531,11 +515,10 @@ export function resolveInBand(rawValue, band) {
 /**
  * How many shares did this order actually match?
  *
- * Deliberately never gated on `status`. Nothing in the SDK, the research doc, or
- * this codebase records what strings the CLOB returns there, and gating live
- * execution on an unverified vocabulary is exactly the shape of the Aug 2026
- * `negRisk` regression — fluent, plausible, and silently fatal for days. Every
- * rung below is numeric.
+ * Deliberately never gated on `status`. The SDK does not document its
+ * vocabulary, and a handful of observed values (domain facts §9e) is not a
+ * vocabulary. Gating live execution on unverified venue semantics is the
+ * failure CLAUDE.md warns about. Every rung below is numeric.
  *
  *   1. the receipt's own takingAmount (shares, for a BUY), free
  *   2. getOrder(id).size_matched, authoritative, one extra round trip
@@ -627,9 +610,8 @@ export async function getOrderMatchedShares(orderId, band) {
  * Why this exists: `placeOrder` posts a GTC limit order. If the ask ticks up
  * between the scan and the post, the order does not match — it *rests* on the
  * book as a bid, and the CLOB still returns an orderID. `assertOrderAccepted`
- * sees that ID and reports success, so the arb engine proceeds to buy the
- * second leg against a first leg that never filled. On 2026-08-28 that left
- * 26.33 unhedged DOWN shares which expired at zero (-$12.83).
+ * sees that ID and reports success, so the arb engine would buy the second leg
+ * against a first leg that never filled — leaving an unhedged position.
  *
  * `maxPrice` is required, and that is not a stylistic preference.
  * `buildMarketOrderCreationArgs` computes the signed amounts with

@@ -137,9 +137,8 @@ export function defaultPaperStrategy() {
      * collect. Live sets a real number below.
      */
     maxDailyLossUsd: 0,
-    // `arbExactShareRouting` (items 78/89) was REMOVED 2026-09-16 along with the
-    // limit-FOK route it gated. A stored config may still carry the key; nothing
-    // reads it, and `pickStrategy` drops it on load. See docs/refactor-plan.md.
+    // `arbExactShareRouting` is not a setting (items 78/89). A stored config may
+    // still carry the key; nothing reads it, and `pickStrategy` drops it on load.
 
     // Absolute floor: "how big a dislocation is worth the trouble". Profitability
     // is no longer this field's job — the fee-aware break-even gate owns that
@@ -177,12 +176,10 @@ export function defaultLiveStrategy() {
     arbBankrollFrac: 0.03,
     arbMaxUsd: 1,
     /**
-     * Item 74b. $10 against the ~$278 live balance — roughly 3.6%, and about
-     * eight times the largest single realised arb loss on record (the
-     * 2026-08-28 orphan was -$12.83, but that was one unhedged leg at the old
-     * sizing, not the current $1 cap). Sized to stop a *loop*, which is the
-     * failure this exists for: at live `arbMaxUsd: 1`, ten dollars is dozens of
-     * consecutive losing round trips, not one bad trade.
+     * Item 74b. Sized to stop a *loop*, which is the failure this exists for:
+     * at live `arbMaxUsd: 1`, ten dollars is dozens of consecutive losing round
+     * trips, not one bad trade. It is a small fraction of the live balance, so
+     * the brake trips well before a runaway matters.
      *
      * This is a starting number, not a derived one. It should be re-set from
      * the realised-loss distribution once a paper run has produced one.

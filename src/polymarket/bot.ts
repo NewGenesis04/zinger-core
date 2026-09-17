@@ -570,16 +570,10 @@ function repairPaperOverdraft(reason = 'overdraft repair') {
  */
 
 /**
- * Sell back any wallet holding the bot has no record of — item 80's backstop.
+ * Sweeps and liquidates any wallet holdings not tracked by active positions.
  *
- * Reconciliation runs once, in a 4.5-second window, and any window can be
- * raced. This cannot be: it re-reads ground truth on a schedule, so a fill that
- * appears after reconciliation gave up is found on the next pass rather than
- * never. That is the 2026-09-11 failure exactly — the leg landed 1.4s after the
- * engine had already walked away, and nothing in this process ever looked again.
- *
- * Live mode only, and throttled well below the 250ms scan cadence: this is a
- * safety net, not a hot path, and `/positions` is a network call.
+ * Serves as a backstop if an order fills after local reconciliation has timed out.
+ * Runs on a throttled background interval in live mode.
  */
 const SWEEP_INTERVAL_MS = Number(process.env.ARB_SWEEP_INTERVAL_MS) || 30_000;
 const SWEEP_GRACE_MS = Number(process.env.ARB_SWEEP_GRACE_MS) || 10_000;
@@ -1117,8 +1111,8 @@ async function executePendingTrade(pending) {
       });
       // Arb legs must match immediately or not at all. A GTC limit that rests on
       // the book returns an orderID, which reads as success here and lets the
-      // engine hedge against a leg that never filled (the 2026-08-28 -$12.83
-      // orphan). Directional entries keep the limit path deliberately: they are
+      // engine hedge against a leg that never filled, leaving the hedge leg
+      // naked. Directional entries keep the limit path deliberately: they are
       // single-sided, so a resting bid is a missed trade, not a naked position.
       // The sweep must never mistake a fill still being written into
       // `botState.positions` for an unaccounted holding. Marked before the
@@ -1145,10 +1139,9 @@ async function executePendingTrade(pending) {
       pos.orderId = orderResult.id;
 
       // A GTC limit can be accepted and rest on the book with nothing matched.
-      // The CLOB returns an orderID either way, so an orderID has never meant
-      // shares in hand — that read cost the -$12.83 arb leg on 2026-08-28, and
-      // the same response shape reaches directional entries, which keep the
-      // limit path on purpose. Cancel rather than book a position we do not
+      // The CLOB returns an orderID either way, so an orderID does not mean
+      // shares in hand. This response shape reaches directional entries, which
+      // keep the limit path on purpose. Cancel rather than book a position we do not
       // hold: an untracked resting bid can still fill later, unattended.
       if (orderResult.resting) {
         pending.status = 'failed';
@@ -1178,7 +1171,7 @@ async function executePendingTrade(pending) {
        *    over-booking and under-booking, over-booking is the safer error here
        *    — the exit paths clamp to real inventory before selling
        *    (`pmSharesForPosition`), whereas under-booking would strand real
-       *    shares nobody knows about, which is the ghost-fill family. The cost
+       *    shares the ledger does not know about (see item 80). The cost
        *    is an overstated ledger, so it is logged rather than left silent.
        */
       pos.requestedShares = orderResult.size;
@@ -1227,20 +1220,9 @@ async function executePendingTrade(pending) {
       botState._buyLocks.delete(pending.slug);
 
       /**
-       * Item 80 — never report a live arb leg as failed without asking the venue.
-       *
-       * What used to be here was a defensive flatten, and it was right about the
-       * asymmetry (selling shares we do not hold is rejected harmlessly; not
-       * selling shares we do hold expires them at zero). What it got wrong was
-       * timing. On 2026-09-11 it fired ~1.5s after the order was signed, the
-       * chain matched at +2.9s, and the sell was rejected for shares that did
-       * not exist yet — then logged "likely never filled" about a leg that was
-       * about to fill. The package aborted, and 4.682223 UP shares sat naked for
-       * 8.2 minutes with no record anywhere in this process.
-       *
-       * So the flatten stays, but it is now the LAST resort rather than the
-       * first move, and it runs after a window long enough for the venue to
-       * have made up its mind.
+       * In live mode, verify order execution status with the venue before declaring failure.
+       * Immediate defensive sells can fail with "balance: 0" if attempted before on-chain
+       * settlement completes (~2s). Reconcile first to confirm whether shares were filled.
        */
       const reconcilable = plan.isArbLeg && cfg.mode === 'live' && pending.tokenId;
       const quote = reconcilable
@@ -1262,7 +1244,7 @@ async function executePendingTrade(pending) {
        * rejection instead of from a follow-up `getOrder`.
        *
        * Skipping reconciliation here is worth 4.5 seconds per kill, and kills
-       * are the common case: 20 of the 21 live canary packages. Inside a
+       * are the common outcome of a live arb attempt (item 84). Inside a
        * sequential market loop that delay multiplies across every market in the
        * cycle.
        *
@@ -1842,9 +1824,9 @@ function buildPortfolio(readiness, mode) {
     : Math.round((liveStats.verifiedPnl + pmUnrealized) * 100) / 100;
   // `baselineUsd` is the CURRENT RUN's starting point and is rebased by
   // resetLiveData. `lifetimeBaseline` is the account's first observed cash and
-  // is never rebased, so a reset can hide a session but not the whole history —
-  // after the Aug-27 canary these read $275.16 and $285.29, and only the second
-  // one still knew about the -$10.13 (backlog 45).
+  // is never rebased, so a reset can hide a session but not the whole history:
+  // a loss rebased out of `baselineUsd` is still visible against
+  // `lifetimeBaseline` (backlog 46).
   const lifetimeRaw = mode === 'live' ? getLiveAccount(0)?.cash?.lifetimeBaseline : null;
   const lifetimeBaseline = lifetimeRaw != null ? Number(lifetimeRaw) : null;
   const lifetimePnl = lifetimeBaseline != null
@@ -2507,15 +2489,13 @@ export function setBaseline(balanceUsd) {
 /**
  * One position, one exit in flight — item 84, part 4.
  *
- * Until now every exit path ran inside `scan()`, serialised by `_scanning`, so
- * "two sellers for one position" was impossible by accident rather than by
- * design. Moving the fast stop-loss onto its own timer removes that accident.
+ * The fast stop-loss runs on its own timer, outside `scan()` and its
+ * `_scanning` serialisation, so "two sellers for one position" has to be
+ * prevented by design.
  *
- * The hazard is concrete: `scanOpenExitsFast` sets `pos.closed = true` only
- * AFTER awaiting `placeMarketSell`. Two overlapping runs would both read
- * `closed === false`, both dispatch a sell, and the second would sell shares the
- * first had already sold — the mirror image of the ghost fill, and worse,
- * because it is an unhedged short.
+ * `scanOpenExitsFast` sets `pos.closed = true` only AFTER awaiting
+ * `placeMarketSell`. Two overlapping runs would both read `closed === false`
+ * and both dispatch a sell for the same shares.
  *
  * Claimed synchronously before any await, released in a `finally`. A claim that
  * outlives its run cannot deadlock the position: `closed` is the durable state,

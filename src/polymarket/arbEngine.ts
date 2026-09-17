@@ -69,22 +69,19 @@ export async function detectAndExecuteArbPackage({
 
   /*
    * These two numbers become the `maxPrice` of a live fill-or-kill order
-   * (`bot.ts:1011`), so they must be ASKS. This read used to be
-   * `depth?.up?.bestAsk || prices?.up`, and `prices.up` is a MID
-   * (`clob.ts:118` assigns it `wsMid`) — so whenever the book maintainer had no
-   * ask, a midpoint was silently substituted into a variable named `upAsk`.
+   * (`bot.ts:1011`), so they must be ASKS. `prices.up` is a MID (`clob.ts:118`
+   * assigns it `wsMid`) and must never stand in for one.
    *
-   * That is not a rounding error. With the fallback on one leg,
+   * That is not a rounding concern. With a mid on one leg,
    *   computed_sum = mid_up + ask_down = true_sum − spread_up/2
-   * so the "gap" the detector sees is half the spread of the leg that fell
-   * back. The wider the spread, the bigger the phantom edge — the gate
-   * therefore *selected for* the most broken books it could find. On the
-   * 2026-09-09 live run every arb leg was rejected while REST showed 1,386
-   * shares resting: the bot was bidding a midpoint at which nothing rested.
+   * so the "gap" the detector sees is half the spread of that leg. The wider
+   * the spread, the bigger the phantom edge — a mid fallback would make the gate
+   * *select for* the most broken books, and sign orders at a price nothing
+   * rests at (item 70).
    *
-   * `clob.ts:120` already publishes the real ask as `prices.upAsk` and nothing
-   * read it. Use that, and when there is no ask from either source, refuse:
-   * no ask → no trade. An arb leg cannot be priced off anything but an ask.
+   * `clob.ts:120` publishes the real ask as `prices.upAsk`. Use that, and when
+   * there is no ask from either source, refuse: no ask → no trade. An arb leg
+   * cannot be priced off anything but an ask.
    */
   const upAsk = Number(depth?.up?.bestAsk || prices?.upAsk || 0);
   const downAsk = Number(depth?.down?.bestAsk || prices?.downAsk || 0);
@@ -126,16 +123,14 @@ export async function detectAndExecuteArbPackage({
   // rate × (p(1−p))^e per share. So break-even is a function of the book, not a
   // constant: 3.5% at 50/50, 1.88% at 0.83/0.15, 1.26% at 0.10/0.90.
   //
-  // A flat threshold is wrong in *both* directions. The shipped 0.015 default
-  // loses money on any book between roughly $0.12 and $0.88; a 0.035 stop-gap
-  // is right at 50/50 but throws away profitable skewed books. Measured on the
-  // 2026-08-18 overnight run, this gate rejects both losing packages and keeps
-  // all four winners, including one a flat 0.035 would have refused.
+  // A flat threshold is wrong in *both* directions: 0.015 loses money on any
+  // book between roughly $0.12 and $0.88, and 0.035 is right at 50/50 but
+  // throws away profitable skewed books.
   //
   // Live params when they are already cached, category schedule otherwise —
   // `peekClobFeeParams` never fetches. Deliberate: this gate runs per market
-  // per scan, and putting a 4s-timeout network call in the arb path is the
-  // shape that caused the 2026-08-12 outage. The fallback is not a compromise
+  // per scan, and a network call with a timeout here would stall the scan loop
+  // behind it. The fallback is not a compromise
   // on these markets anyway — crypto reports {"r":0.07,"e":1} live, which is
   // exactly FEE_RATES.crypto with exponent 1. Both legs share one conditionId,
   // so one lookup covers the pair, and the fill path warms the cache for the
@@ -211,8 +206,7 @@ export async function detectAndExecuteArbPackage({
    *   budget   shares ≤ shareBudget / sum                        pushes DOWN
    *
    * The floor exists because the exchange rejects a marketable BUY under
-   * $1.00 notional — settled 2026-09-10 by live rejection, see
-   * research/polymarket-domain-facts.md. Share parity means the *cheap* leg
+   * $1.00 notional (domain facts §5). Share parity means the *cheap* leg
    * sets it for the whole package: a $0.04 leg needs 25 shares, so the package
    * costs ~$24.50 however small the expensive side would rather be.
    *
@@ -223,8 +217,8 @@ export async function detectAndExecuteArbPackage({
    *
    * Why together: capping to depth *alone* can drag the cheap leg back under
    * $1.00, which fills leg one and gets leg two rejected — the unhedged
-   * position that cost −$12.83 on 2026-08-28 and that this whole package
-   * design exists to prevent. When floor > either ceiling there is no valid
+   * position this whole package design exists to prevent. When floor > either
+   * ceiling there is no valid
    * size and the only correct action is to skip.
    */
   const MIN_LEG_NOTIONAL_USD = 1.0;
@@ -236,15 +230,11 @@ export async function detectAndExecuteArbPackage({
    * (`bot.ts:1011`), so only the top level is reachable. Asking for 100% of it
    * is the most race-prone size that exists: one other participant taking a
    * single share leaves the level short, the FOK cannot fill in full, and the
-   * package dies with zero fills. 10 of the 15 sampled packages in the
-   * 2026-09-09/10 overnight paper run were sized at exactly 100%.
+   * package dies with zero fills.
    *
-   * **This factor is a hypothesis, not a measurement.** No size-race kill has
-   * ever been observed on this bot — paper fills by definition, and the one
-   * live attempt (9/9 rejected, 2026-09-09) failed earlier in the chain, on a
-   * midpoint reaching `maxPrice` (items 70/71). The cushion is held because it
-   * is cheap, not because it is evidence-backed: on any book deep enough for
-   * the budget to bind it changes nothing at all. `arb.decision` records
+   * **This factor is a hypothesis, not a measurement** (item 76). The cushion
+   * is held because it is cheap, not because a size race has been observed:
+   * on any book deep enough for the budget to bind it changes nothing at all. `arb.decision` records
    * `restingShares` alongside `depthShares` on every attempt so the assumption
    * can eventually be tested against real fills rather than re-asserted.
    */
@@ -255,8 +245,8 @@ export async function detectAndExecuteArbPackage({
 
   // `bestAskSize` is published by both branches of `getDepthForMarket`
   // (`clob.ts`). Absent means "no depth information", not "infinite depth" —
-  // sizing blind against a fill-or-kill order is what produced nine consecutive
-  // rejections on 2026-09-09 — but the *refusal* is deferred until after the
+  // a fill-or-kill order sized blind is a rejection waiting to happen — but the
+  // *refusal* is deferred until after the
   // affordability gate below. An account that cannot fund the trade is refused
   // for that reason whatever the book looks like; money first, microstructure
   // second. `Infinity` here only lets sizing proceed to the point where those
@@ -321,8 +311,8 @@ export async function detectAndExecuteArbPackage({
    * The account can fund this. Whether the *market* can fill it is a separate
    * question, and these are the three ways it cannot. Each carries its own
    * skip code so the dashboard can tell "book too thin" from "budget too
-   * small" from "we are flying blind" — during the 2026-09-09 run all three
-   * were indistinguishable from a generic rejection.
+   * small" from "we are flying blind" — without them all three look like a
+   * generic rejection.
    */
   if (!depthKnown) {
     arbDecision('skip', 'depth_unknown',
@@ -372,12 +362,10 @@ export async function detectAndExecuteArbPackage({
   const packageId = `pkg-${market.symbol.toLowerCase()}-${Date.now().toString(36)}`;
   const expectedPayout = Math.round(shares * 1.00 * 100) / 100;
 
-  // Locked profit is reported NET (backlog item 7, second half). It used to be
-  // `expectedPayout − totalCost`, gross of fees, so the UI overstated every
-  // package — the 2026-08-18 run reported $2.66 against a real $0.85. That also
-  // fed item 24: `getArbPackageMetrics` falls back to `lockedProfitUsd` for any
-  // package whose leg trades are gone, so the gross figure became permanent,
-  // uncorrectable phantom profit.
+  // Locked profit is reported NET (backlog item 7, second half). A gross figure
+  // overstates every package, and it cannot be corrected later:
+  // `getArbPackageMetrics` falls back to `lockedProfitUsd` for any package whose
+  // leg trades are gone (item 24), so whatever is written here is permanent.
   //
   // Only the two entry fees apply. Holding to settlement redeems the set
   // fee-free (FEE_FREE_EXIT_REASONS), which is exactly why the strategy works.
@@ -453,8 +441,7 @@ export async function detectAndExecuteArbPackage({
       // parity* that makes this strategy work: a full set redeems to exactly
       // $1.00 because one token pays $1 and its complement pays $0. Shares held
       // on one side beyond the matched pair are not arbitrage at all — they are
-      // an unhedged directional bet, which is the position that expired at zero
-      // on 2026-08-28.
+      // an unhedged directional bet.
       const downCostActual = Math.round(upShares * downAsk * 100) / 100;
       downShares = await executeArbLeg({
         outcome: 'down', price: downAsk, cost: downCostActual, shares: upShares, pkg, market, executeTrade, mode, depth,
@@ -467,11 +454,10 @@ export async function detectAndExecuteArbPackage({
   }
 
   // Record what actually matched *before* branching. `abortReason` below is
-  // built from `upShares > 0`, so if the flags are only written on the LOCKED
-  // path the two disagree on exactly the case that matters: package
-  // pkg-btc-mtbtgyzj (2026-08-27) carried `abortReason: "UP=OK, DOWN=FAIL"`
-  // beside `legs.up.filled: false`, and 25.99 real UP shares expired worthless
-  // because every reconciler that reads the flag saw nothing to unwind.
+  // built from `upShares > 0`, so if the flags were only written on the LOCKED
+  // path the two would disagree on exactly the case that matters — an aborted
+  // package with a filled leg recorded as unfilled, which every reconciler that
+  // reads the flag would see as nothing to unwind.
   pkg.legs.up.filled = upShares > 0;
   pkg.legs.up.shares = upShares;
   pkg.legs.down.filled = downShares > 0;
@@ -563,9 +549,8 @@ export async function detectAndExecuteArbPackage({
     /*
      * UP executes first and DOWN only runs `if (upShares > 0)`, so a failed UP
      * leaves DOWN *never attempted* rather than rejected. The status string
-     * says so, instead of reporting both as FAIL — during the 2026-09-09 run
-     * every abort read "UP=FAIL, DOWN=FAIL" when DOWN was never sent, which
-     * makes a one-sided rejection indistinguishable from a two-sided one.
+     * says so, instead of reporting both as FAIL, which would make a one-sided
+     * rejection indistinguishable from a two-sided one.
      */
     const upState = upShares > 0 ? 'OK' : 'FAIL';
     const downState = upShares > 0 ? (downShares > 0 ? 'OK' : 'FAIL') : 'NOT_ATTEMPTED';
@@ -896,16 +881,13 @@ export async function reconcilePendingPackages({
   const result = { checked: stuck.length, locked: 0, aborted: 0, discarded: 0, orphansUnwound: 0 };
 
   // ── ABORTED packages holding exactly one open leg (backlog 43) ────────────
-  // `closed` is the idempotence latch: `unwindLeg` sets it, so a leg is swept at
-  // most once and a live sell can never be issued twice for the same shares.
-  // (A weak latch — backlog 34 lets a *failed* unwind set it too — but
-  // re-selling shares we no longer hold is the worse error, so this under-acts.)
-  // The abort path unwinds inline, but that unwind could not fill for the whole
-  // of the live canary: it wrote local state only until 72c27ac, then issued an
-  // unpriced sell (backlog 35) until 2026-09-01. Nothing swept the leftovers,
-  // because the only reconciler here filtered on PENDING_FILL. This is that
-  // sweep. Both legs open is deliberately left alone — that is a hedge that was
-  // mislabelled, not an orphan, and selling both would realise a loss.
+  // `closed` is the idempotence latch: `unwindLeg` sets it only once a sell has
+  // succeeded, so a leg is never sold twice. A refused sell leaves the position
+  // open with `unwindAttempts` incremented, and this sweep retries it until
+  // `unwindBlocked` (backlog 34).
+  // The abort path unwinds inline; this sweep catches any leg that inline unwind
+  // left behind. Both legs open is deliberately left alone — that is a hedge
+  // that was mislabelled, not an orphan, and selling both would realise a loss.
   for (const { pkg, outcomes } of orphanCandidates.values()) {
     if (outcomes.size !== 1) {
       if (log) log(`⚠️ ARB RECONCILE ${pkg.symbol} ${pkg.packageId} — ABORTED but both legs still open · left intact for review`, 'error', { packageId: pkg.packageId, slug: pkg.slug });

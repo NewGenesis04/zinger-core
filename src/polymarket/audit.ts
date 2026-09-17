@@ -177,10 +177,10 @@ export function runAudit({
     );
   }
   // Baseline diverging from the lifetime figure means one of two opposite
-  // things, and the direction says which. Reporting both as "rebase after
-  // deposits" is how a real drawdown got filed as a bookkeeping chore: after
-  // the Aug-27 canary the baseline was rebased from $285.29 to $275.16, so the
-  // header read $0.00 net while $10.13 had actually been lost.
+  // things, and the direction says which. A baseline BELOW lifetime means a
+  // drawdown was rebased over and is missing from net PnL; reporting it as
+  // "rebase after deposits" would file a real loss as a bookkeeping chore
+  // (backlog 46).
   if (!isPaper && baseline != null && lifetimeBaseline != null && Math.abs(baseline - lifetimeBaseline) > 5) {
     const delta = Math.round((baseline - lifetimeBaseline) * 100) / 100;
     notes.push(delta < 0

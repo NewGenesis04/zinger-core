@@ -5,12 +5,9 @@
  * ── Why this exists ──────────────────────────────────────────────────────────
  *
  * The telemetry bus is a bounded ring and nothing else (`events.ts:423-427`).
- * The 2026-09-09/10 overnight paper run — nine hours, run specifically to
- * produce a skip-code distribution — exported `evicted: 354266` and retained
- * about ninety seconds of history. Roughly 80% of all events are
- * `gap_below_breakeven`, emitted for every market on every scan that finds
- * nothing, and that traffic pushes everything else off the back of the buffer
- * long before anyone reads it.
+ * `gap_below_breakeven` dominates it — emitted for every market on every scan
+ * that finds nothing — and that traffic pushes everything else off the back of
+ * the buffer within minutes, long before anyone reads it.
  *
  * Raising `EVENT_BUFFER_CAP` would buy hours, not nights, and would do it by
  * holding hundreds of thousands of uninteresting objects in the heap of a

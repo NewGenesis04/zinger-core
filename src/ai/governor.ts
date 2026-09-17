@@ -78,18 +78,17 @@ const LIVE_PROTECTED = new Set(['arbOnlyUntilEdge', 'requireEdgeForLive', 'force
 
 /**
  * Arb thresholds and sizing. The governor may not write these — ever, in any
- * mode (operator decision, 2026-08-21).
+ * mode. This is an operator decision.
  *
  * The regime detector reads ADX and ATR on BTC/ETH spot. That tells it something
  * about *directional* conditions. It says nothing about whether a Polymarket
  * order book is offering a mispriced complementary pair, which is the only thing
- * an arb threshold should respond to. The `arb-only` profile was setting
- * `minArbGap: 0.012` on that basis — an arb dial moved by a directional signal,
- * with no mechanism connecting the two.
+ * an arb threshold should respond to. A regime profile that moves an arb dial is
+ * connecting a directional signal to a book property with no mechanism between
+ * them.
  *
- * Since item 7 the real gate is fee-aware (`arbBreakEvenGap` + `arbMinMarginPct`)
- * and `minArbGap` is only an absolute floor beneath it, so the blast radius was
- * small. The reason to remove it is that there was never an argument for it.
+ * The profitability gate is fee-aware (`arbBreakEvenGap` + `arbMinMarginPct`,
+ * item 7); `minArbGap` is only an absolute floor beneath it.
  *
  * Deliberately NOT forbidden: `clobArbEnabled` and `arbOnlyUntilEdge`. Those are
  * "should we be doing arb at all right now", which is exactly the regime call the

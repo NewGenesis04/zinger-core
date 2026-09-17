@@ -2,12 +2,10 @@
 /**
  * Who changed this setting, when, and why (D3 · reading C).
  *
- * The config store has always kept a *value* and never a *writer*, so
- * "why is kellyFraction 0.1?" had no answer anywhere in the system. Measured on
- * the real store 2026-08-21: the paper profile held five fields matching the
- * `arb-only` overlay and five matching `trend-ride` — two regimes that cannot
- * both have been active — plus values the optimizer also writes. The profile was
- * sediment, and nothing could separate it.
+ * The config store keeps a *value* but not a *writer*, so without this a
+ * question like "why is kellyFraction 0.1?" has no answer anywhere in the
+ * system. Several writers overlay the same profile, and a value's origin cannot
+ * be recovered from the value itself.
  *
  * There are three automated writers and one human:
  *

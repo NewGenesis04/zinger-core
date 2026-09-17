@@ -211,8 +211,8 @@ export async function checkReadiness(config = {}) {
    * the previous order (the dashboard renders the array as-is), and every leg
    * keeps its original failure branch. Only the waiting overlaps.
    *
-   * Cost of the change: four concurrent calls to polygon-bor.publicnode.com
-   * instead of four sequential ones. Agreed with the operator 2026-09-07.
+   * Cost: four concurrent calls to polygon-bor.publicnode.com instead of four
+   * sequential ones, accepted by the operator.
    */
   const geoblockP = leased('geoblock', checkGeoblock,   // never rejects — proxyEnv.ts:180
     (v) => (v?.ok && !v.blocked ? TTL.geoblockAllowed : TTL.geoblockBlocked));

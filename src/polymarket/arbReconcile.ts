@@ -1,48 +1,31 @@
 /**
- * Did the leg fill? — the dual-door reconciler (backlog item 80).
+ * Dual-door reconciler for live arbitrage buy legs.
  *
- * WHO OWNS THIS: `executePendingTrade` owns the answer to "did this arb leg
- * fill". The rule this module exists to enforce is that it may never return
- * `{ ok: false }` without having asked the venue. Before item 80, a thrown
- * `placeMarketBuy` became `{ ok: false, error }` (bot.ts:1105), which
- * `arbEngine.ts:631` reads as "zero shares" — an assumption, made about money,
- * with no evidence behind it.
+ * Guarantees that `executePendingTrade` never reports `{ ok: false }` without
+ * verifying directly with the venue whether an order actually matched.
  *
- * The 2026-09-11 ghost is what that costs. `pkg-btc-mtwep5v2` aborted at
- * 03:38:25.612 with `legs.up.shares = 0`; the chain shows 4.682223 UP shares
- * bought at 03:38:27 and redeemed at 03:46:39 for $4.682223. The bot held a
- * naked position for 8.2 minutes and had no record of it. It won $3.38. That is
- * the problem, not the consolation: the same coin flip pays -$1.24 just as
- * easily, and nothing in the engine would have noticed either way.
+ * TWO DOORS (covering distinct transport failure modes):
+ *   Door B — Venue Order Record (`getOrder(id).size_matched`).
+ *            Primary check when an orderId exists. Returns positive confirmation
+ *            of matched shares, or confirms "0 matched" on a clean FOK kill.
+ *   Door A — Wallet Token Balance (Data API `/positions`).
+ *            Fallback check when transport dropped before an orderId was returned.
  *
- * TWO DOORS, because the two failure shapes leave different evidence:
+ * POLLING WINDOW (4.5s):
+ *   Door B resolves immediately via the CLOB API.
+ *   Door A relies on on-chain token settlement, which takes ~2-3 seconds on Polygon.
+ *   Probes are scheduled across 4.5s so the final probe lands comfortably past
+ *   the on-chain settlement and indexing window.
  *
- *   Door B — the venue's own record of our order (`getOrder(id).size_matched`).
- *            Exact when we have an orderID. Says "0 matched" on a clean FOK
- *            kill, which is the only *positive* evidence of not-filled we get.
- *   Door A — the wallet's token balance (data-api `/positions`). Works when the
- *            transport dropped before any orderID came back, which is the case
- *            Door B structurally cannot cover.
- *
- * WHY POLLING, AND WHY 4.5 SECONDS. The chain settled the ghost 2.9s after the
- * order was signed. The existing defensive flatten (bot.ts:1083) fired at
- * ~1.5s — before the match — and was rejected for shares that did not exist
- * yet, then logged "likely never filled". A single probe is not a reconciler,
- * it is a coin toss against indexing lag. Probes are spread so the last one
- * lands comfortably past the observed settle latency.
- *
- * WHY THE BAND IS ASYMMETRIC. A fixed-dollar FOK buy commits `amount / price`
- * shares at the *limit* price, and the book may fill it better — the ghost paid
- * 0.26483 against a 0.27 bound and received 4.682 shares against 4.59 expected.
- * Fills can only ever come in ABOVE the expected count, never below (FOK does
- * not partially fill). The symmetric ±2% band `verifyFilledShares` used at the
- * time rejected the real fill by 0.0004 shares. Here the upper bound is derived
- * from what the venue could actually have done: at best one tick per share.
- * Since item 81 the fill path uses this same band (`trade.ts:shareBand`).
+ * ASYMMETRIC SHARE BAND:
+ *   Fixed-dollar FOK buy orders commit `amount / price` shares at the limit price.
+ *   Because books can fill at price improvements, fills may yield more shares than
+ *   expected, but never fewer (FOK does not partially fill). The verification band
+ *   is asymmetric at the top to accept legitimate price improvements.
  */
 import { getOrderMatchedShares, shareBand, resolveInBand } from './trade.js';
 
-/** Probe offsets from the throw, in ms. Last probe clears the observed 2.9s settle. */
+/** Probe offsets from the throw in milliseconds, spanning the on-chain settlement window. */
 export const PROBE_SCHEDULE_MS = [0, 2250, 4500];
 
 
@@ -219,15 +202,9 @@ export async function reconcileArbLeg({
 /* ------------------------------------------------------------------ *
  * The sweep
  *
- * Reconciliation is a 4.5-second window and every window can be raced. This is
- * the part that cannot be: it re-reads what the wallet holds against what the
- * bot thinks it holds, on a schedule, forever. If a fill materialises after
- * reconciliation gave up — the exact 2026-09-11 shape — the next sweep sees a
- * token balance nothing in the process claims, and sells it back to cash.
- *
- * This gap had no backstop before item 80. The existing orphan sweep
- * (`arbEngine.ts:825`) iterates `botState.positions`, so it can only find legs
- * the bot already recorded; a ghost fill is by definition one it did not.
+ * Backstop for unrecorded wallet holdings. If an order fill confirms on-chain
+ * after reconciliation has concluded, this background sweep detects the unclaimed
+ * token balance in the wallet and liquidates it back to cash.
  * ------------------------------------------------------------------ */
 
 /** Tokens with an order in flight, so the sweep cannot race a fill being booked. */

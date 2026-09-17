@@ -1375,7 +1375,17 @@ to move.
 is a `ReferenceError` in the live entry path, on the branch that runs when an
 order rests — caught only because a test asserted the import exists.
 
-### 33. The CLOB order-response wire format is inferred, not verified
+### 33. The CLOB order-response wire format is inferred, not verified ✅ CLOSED 2026-09-17
+
+**CLOSED from primary source** (VPS receipts for the 2026-09-11 ghost order,
+domain facts §9a). BUY response `takingAmount: "4.682223"` (shares) and
+`makingAmount: "1.24"` (dollars) are **decimal, human units, not 1e6-scaled**;
+`getOrder().size_matched` likewise. Only the *signed* order is 6-decimal
+(`order amount: 4590000`). The `takingAsShares` derived field (÷1e6) recorded
+0.0000046 — the wrong guess, which is why resolving against a band rather than
+assuming a scale was the right design. No code change: the 1e6 branch stays as a
+defence. Status vocabulary also observed (§9e): POST `"matched"`, `getOrder`
+`"MATCHED"`. Still not gated on.
 
 `OrderResponse.makingAmount` / `takingAmount` are typed bare `string` in
 `clob-client-v2/dist/types/clob.d.ts:57-58` with no documented units or scale.
@@ -4496,7 +4506,52 @@ does not earn a live-money edit.
 
 ---
 
-### 82. `data/clob_receipts.jsonl` on the VPS is still the unread primary source
+### 82. `data/clob_receipts.jsonl` on the VPS is still the unread primary source ✅ CLOSED 2026-09-17
+
+**CLOSED — read by the operator 2026-09-17.** Four receipts in the 03:38 window,
+plus the settlement block fetched from Polygon. Full write-up: domain facts §9.
+
+| time (UTC) | event |
+|---|---|
+| 03:38:24.848 | POST response: **`status: "matched"`, `takingAmount: "4.682223"`**, tx hash present |
+| 03:38:25.025 | `getOrder`: **`MATCHED`, `size_matched: "4.682223"`**, `original_size: "4.5925"` |
+| 03:38:25.026 | `placeMarketBuy/verified`: `resolvedShares: null`, **`UNVERIFIED_FILL`** |
+| 03:38:25.241 | flatten SELL 4.59 sh → 400 **`balance: 0`** |
+| 03:38:25.612 | package ABORTED |
+| 03:38:27 | block 93,595,249 — settlement tx, `status 0x1` |
+
+**What it confirms.** Everything item 80's reconstruction predicted about the
+verification: `UNVERIFIED_FILL`, both rungs rejected, 4.682223 against 4.59.
+
+**What it corrects — the causal story, in three places.**
+
+1. **The venue did not match "at 03:38:27". It matched at 03:38:24.848, and said
+   so, twice, with the exact count.** 03:38:27 is on-chain *settlement*. The
+   addendum's "1.4 s before the venue matched the buy at 03:38:27" (above, in
+   item 80) conflates the two. The bot held positive, exact proof of the fill
+   0.18s before it discarded it.
+2. **So item 81's band was the sole cause, not one of two.** There was no
+   indexing lag for a poller to wait out on Door B: `getOrder` was exact at
+   +0.18s. The 4.5s polling window is still right for **Door A** (wallet balance
+   follows settlement, ~2s), but the recorded rationale for it is wrong.
+3. **The flatten did not sell "shares that did not exist yet" in the sense of an
+   unfilled order.** The order had filled; the tokens were not yet *settled*,
+   and the venue's own balance check reads settled holdings (§9d).
+
+The fix already shipped handles this exact receipt: checked 2026-09-17 against
+the verbatim VPS JSON, `verifyFilledShares` resolves 4.682223 on the receipt
+rung with zero `getOrder` calls. Old band missed by 0.000423.
+
+**Stale comments carrying the wrong account — CORRECTED 2026-09-17** (comment-only change; the Door A / Door B polling rationale now rests on settlement lag, not match lag):
+`arbReconcile.ts:27-31` and `:45` ("chain settled … 2.9s", "before the match",
+"indexing lag"); `bot.ts:1236-1238` ("chain matched at +2.9s", "a leg that was
+about to fill"). The first number is also off: match → settlement was 2.15s
+(block timestamp, whole seconds), not 2.9s.
+
+**Minor, noted not fixed.** The flatten sold `expectedShares` (4.59), not the
+4.682223 actually matched. That sizing survives at `bot.ts:1332-1334`, now only
+on the `unknown` branch after a 4.5s window; a shortfall is caught by
+`sweepUnrecordedHoldings` (item 80).
 
 **Filed 2026-09-14.** The item 80 addendum reconstructs the 03:38:24–27 sequence
 from package JSON, the activity API and the verification arithmetic. It is
@@ -4577,6 +4632,11 @@ from the live receipts: `unmatchedFailures` / the vocabulary map in
 
 **Found 2026-09-15**, immediately after the item 78 probe made FOK kills a
 first-class, correctly-reported outcome rather than a mystery.
+
+**Why kills are the common case** (moved here from a `bot.ts` comment,
+2026-09-17): 20 of the 21 live canary packages never filled (item 79); the one
+that did was the ghost fill (items 80, 82). A per-kill stall therefore lands on
+nearly every live attempt.
 
 The markets loop is sequential and the arb call is awaited inside it:
 
@@ -5048,6 +5108,49 @@ the lattice is a correct piece of arithmetic in search of a problem.
 — `getMarketOrderRawAmounts` rounds maker to `size`, `getOrderRawAmounts` to
 `amount` — and was not cross-checked before the flag was turned on. The probe was
 treated as sufficient evidence for a route whose validation it could not exercise.
+
+---
+
+### 90. An arb unwind issued within ~2s of leg 1's match is refused, and the retry is 2 minutes away
+
+**Found 2026-09-17** from the item 82 receipts (domain facts §9d).
+
+A SELL 0.39s after a matched BUY was refused: `not enough balance / allowance
+… balance: 0`. The tokens settled on-chain 2.15s after the match response. For
+about two seconds after "matched", the venue does not consider the shares held.
+
+**Where that bites.** `arbEngine.ts:592-595` unwinds leg 1 inline when leg 2
+fails. With leg 1 now verified synchronously (item 81) and a leg-2 FOK kill
+fast-aborting (item 84), that unwind can plausibly land inside the settlement
+gap:
+
+```
+leg 1 POST → "matched"            t = 0
+leg 2 POST → rejected / killed    t ≈ 0.3–0.8s
+unwindLeg(leg 1) → SELL           t ≈ 0.5–1.0s   ← venue: balance 0
+settlement                        t ≈ 2.15s
+```
+
+`unwindLeg` handles the refusal safely (`arbEngine.ts:767-791`): position left
+open, `unwindAttempts = 1`, nothing booked. But the retry comes from
+`reconcilePendingPackages`, which only considers packages older than
+`minAgeMs = 120_000` (`arbEngine.ts:856`, `bot.ts:661`). So a refused unwind
+means **~2 minutes naked on a leg that was sellable 2 seconds later**, on 5- and
+15-minute windows. Bounded: item 74a's stop-loss applies to it, item 74b's cap
+covers the day, and 3 attempts (`arbUnwindMaxAttempts`) are not exhausted by
+this since only the first lands in the gap.
+
+**Uncertainty, stated.** The 2.15s gap is one sample. Timings of the leg-2
+round trip are estimates, not measured. And item 84's note applies: if the
+market route's kill wording isn't matched, leg 2 takes the 4.5s reconciliation
+instead, which would *accidentally* push the unwind past settlement.
+
+**Not fixed** — a timing change on the money path, needs a decision. Options,
+none chosen: wait for settlement (poll wallet balance, Door A, before the
+unwind sell); retry a `balance: 0` refusal inline after ~2.5s instead of
+handing it to the 2-minute sweep; or lower `minAgeMs` for orphans only. The
+first live leg-2 failure will show which case happens: look for `⚠️ LIVE ARB
+UNWIND FAILED (attempt 1/3)` with `balance: 0`.
 
 ---
 

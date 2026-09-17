@@ -91,12 +91,11 @@ export function takerFeeUsdc(shares, price, categoryOrRate = 'crypto') {
  * Live fee params for a token **only if already cached** — never fetches.
  *
  * For use on hot paths that must not block. The arb gap gate is the motivating
- * caller: it runs per market per scan, and the 2026-08-12 outage was caused by
- * exactly this shape — a network fetch sitting in `scan()` upstream of the arb
- * engine, which needs nothing but the order book. A 4s timeout per market per
- * window rollover is not worth trading for parameters that are, on every market
- * this bot touches, identical to the category schedule (verified live:
- * `{"r":0.07,"e":1,"to":true}` vs `FEE_RATES.crypto = 0.07`, exponent 1).
+ * caller: it runs per market per scan, and a network fetch there stalls the
+ * whole scan loop behind a timeout for data the arb engine does not need — it
+ * needs only the order book. The category schedule is an exact substitute on
+ * the markets this bot trades (live params `{"r":0.07,"e":1}` equal
+ * `FEE_RATES.crypto` with exponent 1).
  *
  * The fill path already calls `takerFeeUsdcForToken`, so the cache warms itself
  * and later scans in the same window get the live numbers for free.
@@ -118,8 +117,7 @@ export function peekClobFeeParams(tokenId) {
  *
  *   break-even gap = rate × [ (u(1−u))^e + (d(1−d))^e ]
  *
- * which is **price-dependent, not flat**. Verified against the recomputed
- * 2026-08-18 overnight sample (backlog item 7):
+ * which is **price-dependent, not flat** (backlog item 7):
  *
  *   0.50 / 0.50 → 3.50%      0.23 / 0.77 → 2.48%      0.10 / 0.90 → 1.26%
  *
