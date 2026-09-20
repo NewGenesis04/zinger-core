@@ -654,6 +654,10 @@ async function arbHousekeeping(reason = 'scan') {
       positions: botState.positions,
       trades: botState.trades,
       minAgeMs: Number(botState.config.arbPendingReconcileMs ?? 120_000),
+      // Item 100. An ABORTED package has no legs in flight, so it does not need
+      // the PENDING_FILL interlock — only enough delay not to race the inline
+      // unwind that runs at the end of dispatch.
+      orphanMinAgeMs: Number(botState.config.arbOrphanReconcileMs ?? 5_000),
       cfg: botState.config,
       botState,
       log,

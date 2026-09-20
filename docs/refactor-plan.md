@@ -5333,6 +5333,13 @@ handing it to the 2-minute sweep; or lower `minAgeMs` for orphans only. The
 first live leg-2 failure will show which case happens: look for `⚠️ LIVE ARB
 UNWIND FAILED (attempt 1/3)` with `balance: 0`.
 
+**Resolved by observation, 2026-09-20.** The 2026-09-18 canary produced exactly
+the predicted signature — `⚠️ LIVE ARB UNWIND FAILED (attempt 1/3)` with
+`balance: 0` — on both live packages, and both legs stayed naked ~121s. The
+three options above are now decided against evidence: item 100 takes the third
+(split the age gate), item 101 explains why the second is unsafe as stated, and
+item 102 records why any fixed-interval sleep is a guess.
+
 ---
 
 ### 91. The scan loop froze for 13 hours and nothing noticed ✅ FIXED 2026-09-17 (cause unidentified)
@@ -5569,6 +5576,283 @@ that still reports connected makes every book stale without anything saying so �
 and stale books are what item 70 was about. The feed is direct, not proxied, so
 this is independent of items 91/92. Needs a staleness threshold that marks the
 feed unhealthy, and a reconnect.
+
+---
+
+### 97. Leg 2 is signed from a scan-time quote taken before leg 1 was dispatched
+
+**Found 2026-09-20** from the 2026-09-18 canary. Both live packages filled UP
+and lost DOWN. That is not symmetry — leg 2 is structurally the exposed one.
+
+The legs are sequential, and the code says so (`arbEngine.ts:571-573`): *"UP
+executes first and DOWN only runs `if (upShares > 0)`."* Leg 2 is then priced
+from `downAsk`, the value captured during the scan, and the book is never
+re-read before signing (`arbEngine.ts:467-469`). A 40ms nonce sleep sits between
+them (`:456`).
+
+```
+t=0       scan quotes upAsk + downAsk
+t=0       leg 1 (UP) dispatched        ─┐ full proxy round trip
+t≈750ms   leg 1 returns "matched"      ─┘
+t≈790ms   40ms nonce sleep (:456)
+t≈790ms   leg 2 (DOWN) signed at downAsk  ← quote already ~800ms old
+t≈1.5s    leg 2 reaches the matching engine
+```
+
+So DOWN carries leg 1's entire round trip as staleness *before* paying its own
+transit: roughly 1.5s of drift exposure against leg 1's 0.75s. `maxPrice` is
+signed at exactly that stale ask (`bot.ts:1143`, from `plan.entryPrice` at
+`bot.ts:1055`) with no tolerance, so a single tick of upward drift leaves zero
+shares at or below the bound and the FOK dies with the book untouched.
+
+**This explains both failure shapes.** The 2026-09-18 BTC kill asked for 5.32
+shares against a 109.3-share book — 5% of top of book. Depth cannot explain
+that; price drift can. The ETH kills are the other shape: sized at exactly
+`0.90 × bestAskSize` (`arbEngine.ts:262,284`) on 5–15 share books, where a
+competing taker of half a share is enough.
+
+**Three options, none chosen.** Each spends something different:
+- *Price buffer* — sign leg 2 at `bestAsk + 1 tick`. Spends edge. Also lifts the
+  reachable book past top-of-book, which is the premise `DEPTH_UTILISATION`
+  rests on (`arbEngine.ts:248-262`), so it helps the thin-book case too.
+- *Re-read the DOWN book after leg 1 fills.* Spends no edge; costs one more
+  call on the metered proxy and still leaves leg 2's own transit exposed.
+- *Both.*
+
+**If a buffer is chosen, budget it at the gate.** The decision currently tests
+`gap > breakEven + margin` before any buffer is spent. Spending a cent
+afterwards can land the fill under break-even with nothing having re-checked.
+The gate needs `gap − buffer > breakEven + margin`. Worked example, the
+2026-09-18 BTC book (up $0.48, down $0.46): gap 6.00%, break-even 3.486%
+(`arbBreakEvenGap`, `fees.ts:134-146`), live margin 1.0% (`modeConfig.ts:190`)
+→ 1.5¢/share of headroom. One tick fits; two do not.
+
+**Note the economics are asymmetric.** Once leg 1 has filled, the alternative to
+paying up is not "no trade" — it is holding a naked directional leg. A cent of
+edge is cheap against that, so the buffer should be sized by what it takes to
+fill, not by what keeps the package nominally profitable.
+
+**Stale references, while here.** `arbEngine.ts:234` and `:250` both cite
+`bot.ts:1011` as where `maxPrice` is signed. It is `bot.ts:1143` now.
+
+---
+
+### 98. A post-close orphan is sold at a discount when it should be redeemed
+
+**Found 2026-09-20** from the 2026-09-18 BTC trade (VPS ledger, secondary).
+
+`btc-updown-5m-1789716600` ran 07:30:00–07:35:00 UTC — the slug epoch is the
+window *start* (`windows.ts:4`) and 5m is 300s (`config.ts:22`). The orphan was
+sold at 07:36:34, **94 seconds after the window closed**, at $0.99.
+
+That $0.99 is not a price the unwind negotiated; it is a resolved market
+converging on redemption. And `arb_rollback` is deliberately excluded from
+`FEE_FREE_EXIT_REASONS` (`arbEngine.ts:801-803`), so the sale paid a taker fee
+that redemption would not have. Holding 9.3472 shares to redemption pays exactly
+$1.00/share, fee-free; selling paid $0.99 less $0.00648. Cost of the wrong
+action: ~$0.10.
+
+**The general case.** After window close an orphan is one of two things, and the
+unwind is wrong for both:
+- *winning* → worth $1.00 at redemption, sold at a discount plus fee
+- *losing* → worth $0.00, and the sell is futile
+
+`unwindLeg` has no notion of the window at all. `arbEngine.ts` contains no
+reference to window end, time remaining, or `marketWindow()` — which
+`windows.ts:48` already exports.
+
+**Not fixed** — the branch is small (post-close orphans hold to redemption
+rather than unwind) but it changes money-path behaviour and interacts with item
+74a's stop-loss, which currently owns the orphan.
+
+---
+
+### 99. Nothing stops a package opening seconds before its window closes
+
+**Found 2026-09-20.** The 2026-09-18 BTC package entered at 07:34:33 against a
+window closing 07:35:00 — **27 seconds of window left**.
+
+For a package that locks, this is harmless: both legs redeem to $1.00 whenever
+the window ends. For a package that orphans, it is the worst possible moment.
+The orphan path — abort, reconcile, unwind, retry — is built to manage exposure
+over seconds to minutes, and there is no time for any of it. The position
+resolves before the machinery can act, which converts a managed directional
+exposure into an unmanaged coin flip.
+
+Note what this means for the 2026-09-18 result: the +41.4% was a 70/30 bet
+settling in 27 seconds, not a directional read. Fair odds, zero edge, full
+variance — the opposite of what an arb package exists to produce.
+
+`arbEngine.ts` has no time-to-close check (grepped 2026-09-20: no `windowEnd`,
+`secondsLeft`, `windowSeconds` or `marketWindow` reference).
+
+**Not fixed.** A minimum-seconds-remaining gate is a few lines, but the
+threshold is a real decision and should be derived from the orphan path's
+actual latency — abort plus settlement-credit plus one retry — not guessed.
+
+**Unblocked 2026-09-20** by items 100 and 101. That latency is no longer ~121s;
+it is the orphan gate (5s) plus however long the venue takes to credit, retried
+until it does. The next live orphan measures it, and the gate should be set from
+that measurement rather than from the old figure.
+
+---
+
+### 100. One age gate serves two jobs with different safety requirements ✅ FIXED 2026-09-20
+
+**FIXED.** The predicate is split. `reconcilePendingPackages` now filters twice
+from one unfiltered `mine` list: `PENDING_FILL` against `minAgeMs` (120s,
+unchanged — it is a real interlock), `ABORTED` against a new `orphanMinAgeMs`
+(5s, `arbOrphanReconcileMs`, wired at `bot.ts:656-660`).
+
+Not zero, deliberately: the inline unwind at the end of dispatch runs first, and
+the gate keeps the sweep from racing it for the same leg.
+
+Invariants in `tests/unit/invariants.orphanUnwind.test.ts` — the orphan is
+reconciled without serving the interlock, a fresh abort is still left alone, and
+a young `PENDING_FILL` package is still untouched. Verified load-bearing: with
+the gate restored to 120s the first of those fails.
+
+**Found 2026-09-20.** This is the measured cause of the 121s and 123s orphan
+hold times on 2026-09-18, and it refines item 90.
+
+`reconcilePendingPackages` filters every package through one predicate
+(`arbEngine.ts:870-872`):
+
+```js
+const all = loadPackages().filter((p) => (
+  p.mode === mode && (now - Number(p.createdAt || 0)) > minAgeMs
+));
+```
+
+`minAgeMs` is `arbPendingReconcileMs ?? 120_000` (`bot.ts:656`); no config sets
+it, so it is 120s. Both consumers read from `all`:
+
+1. **`PENDING_FILL` promotion.** Here 120s is correct and the comment says why
+   (`arbEngine.ts:854-856`): it must outlast a dispatch, or the sweep could
+   abort a package whose legs are still in flight.
+2. **Orphan retry on an `ABORTED` package.** Here the rationale does not apply
+   at all. The package has already resolved; nothing is in flight. It is held
+   naked for 120s for a reason that belongs to the other case.
+
+The sweep cadence is not the delay. `arbHousekeeping('scan')` runs on every scan
+pass (`bot.ts:2710`) and calls `reconcilePendingPackages` unthrottled — the 30s
+`SWEEP_INTERVAL_MS` (`bot.ts:579`) gates only `sweepUnrecordedHoldings`, the item
+80 wallet sweep. At ~1.35 passes/sec the reconciler therefore ran some 160 times
+during the 121s hold and declined to act every time, because the age filter hid
+the package from it. The gate is the entire delay.
+
+*(Corrected 2026-09-20: first written as though the 30s throttle applied to the
+reconciler. It does not. The conclusion is unchanged and the mechanism is
+simpler — nothing was waiting on a timer.)*
+
+**Fix shape.** Split the predicate: keep 120s for `PENDING_FILL`, use a short
+age (~5s) for orphan candidates. No new timing assumption, no blocking inside
+the dispatch path. This is item 90's third option and, with item 101, the
+reason the first two are not needed.
+
+---
+
+### 101. `unwindAttempts` spends a permanent-failure budget on a transient one ✅ FIXED 2026-09-20
+
+**FIXED.** The refusal is classified before it is charged.
+
+- `isSettlementCreditRefusal()` (pure, exported): the venue's `balance: 0`
+  wording specifically. A *partial* balance is not it — shares exist and
+  something else is wrong — and an unrecognised message is treated as permanent,
+  which costs a retry rather than an unbounded loop.
+- A credit refusal no longer touches `unwindAttempts`. It increments
+  `unwindCreditRefusals` and is bounded on **wall clock** instead
+  (`arbUnwindCreditGraceMs`, 60s) — deliberately not on attempts, because the
+  length of the credit gap is unmeasured (item 102), and any attempt count would
+  encode a guess about a distribution we have not sampled.
+- A successful sell clears the grace clock, so a later refusal is judged as its
+  own fault rather than inheriting a spent window.
+- New log line `⏳ LIVE ARB UNWIND DEFERRED` at `system`, not `error`: waiting
+  for settlement is expected behaviour, and the existing `error` line was what
+  made a normal credit gap read as a failure.
+
+Invariants in `tests/unit/invariants.orphanUnwind.test.ts`, including the
+property this must not weaken — an unsellable leg still spends the budget and
+still stops emitting live orders (backlog 34). Verified load-bearing: with the
+classifier forced to `false`, the retry invariant fails.
+
+**Found 2026-09-20.** This is why the obvious fast-retry fix is unsafe, and it
+should be settled before item 100 is implemented.
+
+`arbUnwindMaxAttempts` defaults to 3 (`arbEngine.ts:781`). Every refusal
+increments the counter (`:782`), `unwindBlocked` latches at 3 (`:785`), and the
+orphan sweep then skips the position permanently (`:885`), logging *"STILL HELD
+and will settle at expiry"* (`:790`).
+
+That cap exists for a genuinely unsellable leg — no bid at any price, an expired
+window — which is a **permanent** condition where emitting a live order every
+tick forever is the failure being prevented (backlog 34).
+
+`balance: 0` is a **transient** condition. Domain facts §9d: the venue does not
+treat bought shares as held until on-chain settlement, and it clears on its own
+in seconds.
+
+Both consume the same budget. So the fix that suggests itself — an inline
+backoff at 3s/6s/10s — would have destroyed both 2026-09-18 wins:
+
+```
+1.9s   attempt 1 → balance: 0
+3.0s   attempt 2 → balance: 0
+6.0s   attempt 3 → balance: 0   → unwindBlocked
+                                → sweep skips it forever
+                                → naked leg held to expiry
+```
+
+The observed runs survived *because* only one attempt was burned, leaving two in
+the budget for the sweep at 121s. A retry loop that exhausts the budget inside
+the credit window disables the fallback that worked.
+
+Two further reasons not to take that shape: `unwindLeg` is called inline from
+the dispatch path, so a 3+6+10 backoff puts up to 19s of blocking sleep back
+into the scan loop — which is what item 84 removed. And "the tokens will have
+settled by second 5" is a guess; see item 102.
+
+**Fix shape.** Classify the refusal. A `balance: 0` rejection should not count
+against `unwindAttempts`, or better, the retry should be gated on *observed*
+balance via the Door A/B machinery item 80 already built (`arbReconcile.ts`) —
+evidence rather than a sleep.
+
+---
+
+### 102. The settlement-credit gap is wider than §9d's single sample ✅ CLOSED 2026-09-20
+
+**CLOSED.** Both samples are folded into §9d's confidence note in
+`docs/research/polymarket-domain-facts.md`, where the fact lives. Item 101 acts
+on the consequence: the credit wait is bounded on wall clock rather than on any
+assumption about how long the gap is.
+
+Note `docs/research/` is gitignored (`.gitignore:53`), so that edit is on disk
+but untracked — it will not survive a fresh clone and appears in no diff.
+
+**Found 2026-09-20.** Domain facts §9d rests on one observation — a SELL 0.39s
+after a match refused with `balance: 0`, settling on-chain 2.15s after the match
+response — and states the limit plainly: *"Confidence: High for this order; the
+length of the gap is one sample."*
+
+The 2026-09-18 canary adds two refusals (VPS ledger, secondary source):
+
+| package | entry | first unwind | Δ | result |
+|---|---|---|---|---|
+| `pkg-btc-mu6n7tdc` | 07:34:33.075 | 07:34:34.982 | 1.91s | `balance: 0` |
+| `pkg-eth-mu6onvgn` | 08:15:01.898 | 08:15:04.745 | 2.85s | `balance: 0` |
+
+Both are *failure* timestamps, so the requests left earlier — but the ETH
+refusal was recorded 0.7s past §9d's settlement time, which the single sample
+does not account for.
+
+This does not overturn 9d. It does mean any fix that sleeps a fixed interval and
+then sells is guessing, including item 90's "retry inline after ~2.5s" — which
+would have failed on ETH. Argues for item 101's balance-gated retry over any
+timer.
+
+**Action:** fold these two samples into §9d's confidence note in
+`docs/research/polymarket-domain-facts.md` so the band is recorded where the
+fact is, not only here.
 
 ---
 

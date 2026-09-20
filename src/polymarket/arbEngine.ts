@@ -728,6 +728,36 @@ async function executeArbLeg({ outcome, price, cost, shares, pkg, market, execut
  * have to change together, and the invariant that catches it is
  * "cash reconciles to trades + fees + open cost".
  */
+
+/**
+ * Is this refusal the venue not having credited the shares yet (item 101)?
+ *
+ * A bought token is not sellable until on-chain settlement (domain facts §9d),
+ * so a SELL issued in the seconds after a matched BUY is refused with
+ * `balance: 0`. That is **transient** — it clears on its own, with no action
+ * available to us but waiting.
+ *
+ * It has to be told apart from a permanently unsellable leg (no bid at any
+ * price, an expired window), because the attempt budget exists for that case
+ * and only that case: `arbUnwindMaxAttempts` is what stops the bot emitting a
+ * live order every housekeeping tick forever (backlog 34). Spending a
+ * permanent-failure budget on a condition that resolves in seconds is how a
+ * two-minute delay becomes a naked position held to expiry.
+ *
+ * Matched on the venue's own wording rather than a status code, because the
+ * refusal arrives as an HTTP 400 like every other rejection. Deliberately
+ * narrow: an unrecognised message is treated as permanent, which costs a
+ * retry rather than an unbounded loop.
+ */
+export function isSettlementCreditRefusal(message): boolean {
+  const m = String(message || '').toLowerCase();
+  if (!m) return false;
+  const noBalance = /not enough balance\s*\/\s*allowance|balance is not enough/.test(m);
+  // `balance: 0` is the distinguishing part. A *partial* balance means the
+  // shares exist and something else is wrong, which is not this case.
+  return noBalance && /balance:\s*0(\D|$)/.test(m);
+}
+
 async function unwindLeg({ outcome, pkg, market, mode, cfg, botState, log, adjustPaperCash, saveTrade }) {
   const pos = botState.positions.find((p) => p.packageId === pkg.packageId && p.outcome === outcome && !p.closed);
   if (!pos) return { ok: false, closed: false, missing: true };
@@ -754,6 +784,11 @@ async function unwindLeg({ outcome, pkg, market, mode, cfg, botState, log, adjus
         tickSize: pos.tickSize || '0.01',
       });
       pos.unwindAttempts = 0;
+      // Item 101: the credit-refusal grace clock is per unwind, not per
+      // position. A sell that succeeded proves the shares were credited, so a
+      // later refusal is a different fault and gets its own window.
+      pos.unwindCreditRefusals = 0;
+      pos.firstCreditRefusalAt = null;
       // Backlog 44. The book pays what it pays; copying the entry price here
       // booked every live rollback as break-even-minus-fees. `fillPrice` comes
       // from the receipt (`readSellFill`); `sellRes.price` is the slippage
@@ -779,9 +814,53 @@ async function unwindLeg({ outcome, pkg, market, mode, cfg, botState, log, adjus
       // (no bid at any price, an expired window) would otherwise emit a live
       // order every tick forever.
       const maxAttempts = Math.max(1, Number(cfg?.arbUnwindMaxAttempts ?? 3));
-      pos.unwindAttempts = Number(pos.unwindAttempts || 0) + 1;
+      const now = Date.now();
       pos.lastUnwindError = String(err?.message || err).slice(0, 200);
-      pos.lastUnwindAt = Date.now();
+      pos.lastUnwindAt = now;
+
+      if (isSettlementCreditRefusal(pos.lastUnwindError)) {
+        /*
+         * Item 101. The venue has not credited the shares yet. Nothing about
+         * retrying sooner or later changes that, so this must not consume the
+         * attempt budget — but it cannot retry forever either, because a
+         * balance that is zero for a reason *other* than settlement lag looks
+         * identical from here.
+         *
+         * Bounded on wall clock rather than attempts, deliberately: the length
+         * of the credit gap is not known. §9d measured ~2.15s on one order and
+         * the 2026-09-18 canary was still refused at 2.85s, so any fixed
+         * attempt count is a guess about a distribution we have not sampled.
+         * A grace window only has to be comfortably longer than the gap, and
+         * `arbUnwindCreditGraceMs` is ~20x the largest seen while staying well
+         * inside a 5-minute window.
+         */
+        const graceMs = Math.max(0, Number(cfg?.arbUnwindCreditGraceMs ?? 60_000));
+        pos.unwindCreditRefusals = Number(pos.unwindCreditRefusals || 0) + 1;
+        if (pos.firstCreditRefusalAt == null) pos.firstCreditRefusalAt = now;
+        const waitedMs = now - Number(pos.firstCreditRefusalAt);
+        pos.unwindBlocked = waitedMs > graceMs;
+
+        if (log) {
+          log(
+            pos.unwindBlocked
+              ? `🛑 LIVE ARB UNWIND GAVE UP — ${pos.symbol} ${outcome.toUpperCase()} ${shares}sh: venue still reports balance 0 after ${(waitedMs / 1000).toFixed(1)}s (grace ${(graceMs / 1000).toFixed(0)}s). STILL HELD and will settle at expiry · ${pos.lastUnwindError}`
+              : `⏳ LIVE ARB UNWIND DEFERRED — shares not credited yet (${pos.unwindCreditRefusals} refusal${pos.unwindCreditRefusals === 1 ? '' : 's'}, ${(waitedMs / 1000).toFixed(1)}s waited). Attempt budget untouched, retrying.`,
+            pos.unwindBlocked ? 'error' : 'system',
+            {
+              packageId: pkg.packageId, slug: market?.slug, outcome,
+              creditRefusals: pos.unwindCreditRefusals, waitedMs, graceMs,
+              attempts: Number(pos.unwindAttempts || 0), blocked: pos.unwindBlocked,
+              err: pos.lastUnwindError,
+            },
+          );
+        }
+        return {
+          ok: false, closed: false, transient: true,
+          attempts: Number(pos.unwindAttempts || 0), blocked: pos.unwindBlocked,
+        };
+      }
+
+      pos.unwindAttempts = Number(pos.unwindAttempts || 0) + 1;
       pos.unwindBlocked = pos.unwindAttempts >= maxAttempts;
 
       if (log) {
@@ -860,6 +939,7 @@ export async function reconcilePendingPackages({
   positions = [],
   trades = [],
   minAgeMs = 120_000,
+  orphanMinAgeMs = 5_000,
   cfg = {},
   botState = null,
   log = null,
@@ -867,10 +947,31 @@ export async function reconcilePendingPackages({
   saveTrade = null,
 }: any = {}) {
   const now = Date.now();
-  const all = loadPackages().filter((p) => (
-    p.mode === mode && (now - Number(p.createdAt || 0)) > minAgeMs
-  ));
-  const stuck = all.filter((p) => p.status === 'PENDING_FILL');
+  const mine = loadPackages().filter((p) => p.mode === mode);
+  const ageMs = (p) => now - Number(p.createdAt || 0);
+
+  /*
+   * Two age gates, because the two jobs below have different safety
+   * requirements (item 100). One predicate served both, and the orphan case
+   * inherited a threshold that belongs to the other.
+   *
+   *   PENDING_FILL  → minAgeMs (120s). The interlock described above: the
+   *                   package may still have legs in flight, and promoting it
+   *                   early could abort a live dispatch.
+   *
+   *   ABORTED       → orphanMinAgeMs (5s). Nothing is in flight. The dispatch
+   *                   path already ran, already failed, and already wrote the
+   *                   status. The only thing a long wait buys here is a longer
+   *                   naked position — measured at ~121s on 2026-09-18, on a
+   *                   five-minute window.
+   *
+   * The orphan gate is not zero: the inline unwind at the end of dispatch runs
+   * first, and this sweep exists to catch what that left behind. A few seconds
+   * keeps the two from racing for the same leg.
+   */
+  const stuck = mine.filter((p) => p.status === 'PENDING_FILL' && ageMs(p) > minAgeMs);
+  const orphanAgeMs = Math.max(0, Number(orphanMinAgeMs));
+  const settled = mine.filter((p) => p.status === 'ABORTED' && ageMs(p) > orphanAgeMs);
 
   // Driven from open positions, not from the package list. An orphan is by
   // definition a position still on the book, and there are at most a handful of
@@ -883,7 +984,7 @@ export async function reconcilePendingPackages({
     // issuing live orders for it. It stays open because it is still held, and
     // will settle at expiry like any other position.
     if (pos.unwindBlocked) continue;
-    const pkg = all.find((p) => p.packageId === pos.packageId && p.status === 'ABORTED');
+    const pkg = settled.find((p) => p.packageId === pos.packageId);
     if (!pkg) continue;
     const seen = orphanCandidates.get(pkg.packageId) || { pkg, outcomes: new Set() };
     seen.outcomes.add(pos.outcome);
