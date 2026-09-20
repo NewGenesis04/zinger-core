@@ -24,6 +24,8 @@ describe('Atomic Arb Engine', () => {
 
     const cfg = {
       clobArbEnabled: true,
+      arbLeg2BufferTicks: 0,
+      arbLeg2RereadBook: false,
       minArbGap: 0.015,
       maxArbPackages: 4,
       paperBankroll: 100,
@@ -72,7 +74,7 @@ describe('Atomic Arb Engine', () => {
     const market = { symbol: 'BTC', slug: 'btc-5m-test', conditionId: '0xbtc5m', outcomes: ['Up', 'Down'], tokenIds: { up: 'u', down: 'd' } };
     const depth = { up: { bestAsk: 0.51, bestAskSize: 5000 }, down: { bestAsk: 0.50, bestAskSize: 5000 } }; // sum = 1.01 (no gap)
 
-    const cfg = { clobArbEnabled: true, minArbGap: 0.015, maxArbPackages: 4, paperBankroll: 100 };
+    const cfg = { clobArbEnabled: true, minArbGap: 0.015, maxArbPackages: 4, paperBankroll: 100, arbLeg2BufferTicks: 0, arbLeg2RereadBook: false };
 
     const pkg = await detectAndExecuteArbPackage({
       market,
@@ -104,7 +106,7 @@ describe('Atomic Arb Engine', () => {
       negRisk: false,
     };
     const depth = { up: { bestAsk: 0.34, bestAskSize: 5000 }, down: { bestAsk: 0.62, bestAskSize: 5000 } };
-    const cfg = { clobArbEnabled: true, minArbGap: 0.015, maxArbPackages: 4, paperBankroll: 100, mode: 'paper' };
+    const cfg = { clobArbEnabled: true, minArbGap: 0.015, maxArbPackages: 4, paperBankroll: 100, arbLeg2BufferTicks: 0, arbLeg2RereadBook: false, mode: 'paper' };
 
     const pkg = await detectAndExecuteArbPackage({
       market, depth, prices: { up: 0.34, down: 0.62 }, cfg, mode: 'paper',
@@ -123,7 +125,7 @@ describe('Atomic Arb Engine', () => {
   ])('rejects arb execution on a market with %s', async (_label, marketShape) => {
     const market = { symbol: 'ETH', slug: 'eth-not-a-binary', ...marketShape };
     const depth = { up: { bestAsk: 0.34, bestAskSize: 5000 }, down: { bestAsk: 0.62, bestAskSize: 5000 } }; // big gap, would lock if allowed
-    const cfg = { clobArbEnabled: true, minArbGap: 0.015, maxArbPackages: 4, paperBankroll: 100, mode: 'paper' };
+    const cfg = { clobArbEnabled: true, minArbGap: 0.015, maxArbPackages: 4, paperBankroll: 100, arbLeg2BufferTicks: 0, arbLeg2RereadBook: false, mode: 'paper' };
 
     const pkg = await detectAndExecuteArbPackage({
       market, depth, prices: { up: 0.34, down: 0.62 }, cfg, mode: 'paper',
@@ -138,7 +140,7 @@ describe('Atomic Arb Engine', () => {
     const market1 = { symbol: 'ETH', slug: 'eth-1', conditionId: '0xeth1', outcomes: ['Up', 'Down'], tokenIds: { up: 'u1', down: 'd1' } };
     const market2 = { symbol: 'ETH', slug: 'eth-2', conditionId: '0xeth2', outcomes: ['Up', 'Down'], tokenIds: { up: 'u2', down: 'd2' } };
 
-    const cfg = { clobArbEnabled: true, minArbGap: 0.015, maxArbPackages: 1, paperBankroll: 100, mode: 'paper' };
+    const cfg = { clobArbEnabled: true, minArbGap: 0.015, maxArbPackages: 1, paperBankroll: 100, mode: 'paper', arbLeg2BufferTicks: 0, arbLeg2RereadBook: false };
     const depth = { up: { bestAsk: 0.34, bestAskSize: 5000 }, down: { bestAsk: 0.62, bestAskSize: 5000 } };
 
     // Package 1 fills successfully
@@ -176,7 +178,7 @@ describe('Atomic Arb Engine', () => {
   it('passes valid numeric entryPrice in order plans to trade execution', async () => {
     const market = { symbol: 'ETH', slug: 'eth-plan-test', conditionId: '0xethplan', outcomes: ['Up', 'Down'], tokenIds: { up: 'u', down: 'd' } };
     const depth = { up: { bestAsk: 0.34, bestAskSize: 5000 }, down: { bestAsk: 0.62, bestAskSize: 5000 } };
-    const cfg = { clobArbEnabled: true, minArbGap: 0.015, paperBankroll: 100, mode: 'paper' };
+    const cfg = { clobArbEnabled: true, minArbGap: 0.015, paperBankroll: 100, mode: 'paper', arbLeg2BufferTicks: 0, arbLeg2RereadBook: false };
 
     const capturedPlans: any[] = [];
     const interceptExecuteTrade = async (pending: any) => {
@@ -250,6 +252,8 @@ describe('Arb entry invariants — fill-or-kill share parity', () => {
     minArbGap: 0.01,
     maxArbPackages: 4,
     paperBankroll: 100,
+    arbLeg2BufferTicks: 0,
+    arbLeg2RereadBook: false,
     arbBankrollFrac: 0.2,
     arbMaxUsd: 50,
     minPositionSize: 0.5,

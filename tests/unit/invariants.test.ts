@@ -45,6 +45,8 @@ const market = (over = {}) => ({
 
 const cfg = (over = {}) => ({
   clobArbEnabled: true,
+  arbLeg2BufferTicks: 0,
+  arbLeg2RereadBook: false,
   minArbGap: 0.015,
   maxArbPackages: 4,
   paperBankroll: 100,

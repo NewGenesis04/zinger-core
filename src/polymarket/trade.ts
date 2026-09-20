@@ -737,6 +737,38 @@ export function sellFloor(mark, { tickSize = 0.01, slippagePct = 0.25 } = {}) {
 }
 
 /**
+ * The highest price a marketable BUY may pay: the ask, lifted by whole ticks.
+ *
+ * The mirror of `sellFloor`, and it exists for the same reason — an order
+ * signed at exactly the quoted price cannot survive the book moving under it.
+ * A FOK BUY bounded at the best ask can only match orders at or below that
+ * bound, so one tick of upward drift between quote and arrival leaves *zero*
+ * reachable shares and the order is killed with the book untouched. That is
+ * not a depth problem and no amount of depth fixes it (item 97).
+ *
+ * The lift is an option, not a premium: the matching engine fills the best
+ * price first, so a buy signed a tick high still pays the ask when the book has
+ * not moved. It costs a tick only in the case where it is the difference
+ * between filling and not filling at all.
+ *
+ * Rounded UP to the grid before the ticks are added, so an off-grid quote
+ * cannot silently consume the buffer. Capped one tick below $1.00: a binary
+ * token has no value above par, and an order priced at par is not marketable.
+ */
+export function buyCeiling(ask, { tickSize = 0.01, bufferTicks = 1 } = {}) {
+  const tick = Number(tickSize) || 0.01;
+  const a = Number(ask);
+  if (!Number.isFinite(a) || a <= 0) return 0;
+  const ticks = Math.max(0, Math.floor(Number(bufferTicks) || 0));
+  // The epsilon keeps a grid-aligned quote on its own tick: 0.46 / 0.01 is
+  // 45.999999999999993 in binary floating point, and a bare ceil would lift it
+  // a tick before the buffer is even applied.
+  const onGrid = Math.ceil((a / tick) - 1e-9) * tick;
+  const bounded = Math.min(onGrid + (ticks * tick), 1 - tick);
+  return Math.round(bounded * 1e6) / 1e6;
+}
+
+/**
  * The realised price of a market SELL, read from its receipt.
  *
  * For a SELL the CLOB reports `makingAmount` = tokens given up and

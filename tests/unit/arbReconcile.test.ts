@@ -300,6 +300,7 @@ describe('INVARIANT: a blind leg stops the engine', () => {
       prices: { upAsk: 0.04, downAsk: 0.94 },
       cfg: {
         clobArbEnabled: true, minArbGap: 0.01, maxArbPackages: 4,
+        arbLeg2BufferTicks: 0, arbLeg2RereadBook: false,
         arbBankrollFrac: 1.0, arbMaxUsd: 50, minPositionSize: 0.5, instantCtfMerge: false,
       },
       mode: 'live',

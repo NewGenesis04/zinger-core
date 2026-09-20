@@ -38,6 +38,8 @@ const market = {
 
 const baseCfg = {
   clobArbEnabled: true,
+  arbLeg2BufferTicks: 0,
+  arbLeg2RereadBook: false,
   minArbGap: 0.01,
   maxArbPackages: 4,
   arbBankrollFrac: 1.0,

@@ -5579,7 +5579,51 @@ feed unhealthy, and a reconnect.
 
 ---
 
-### 97. Leg 2 is signed from a scan-time quote taken before leg 1 was dispatched
+### 97. Leg 2 is signed from a scan-time quote taken before leg 1 was dispatched ✅ FIXED 2026-09-20
+
+**FIXED — both defences, operator's call.** They cover different windows: the
+re-read removes staleness that already happened, the buffer covers drift still
+to come.
+
+- **Re-read** (`arbLeg2RereadBook`, on). After leg 1 returns, the DOWN book is
+  read again and leg 2 is signed off that. Only the DOWN token is requested, so
+  it is a single book — free from the WS cache (`clob.ts:179`, and that feed is
+  direct, not proxied), one REST call when the cache is cold. A failed re-read
+  falls back to the scan quote, which is the behaviour that shipped before.
+- **Buffer** (`arbLeg2BufferTicks`, 1). Leg 2 is bounded at `buyCeiling(ask)` —
+  new in `trade.ts`, the mirror of `sellFloor`. The lift is an *option, not a
+  premium*: the engine fills best-price-first, so it costs a tick only in the
+  case where it is the difference between filling and not filling.
+- **Charged at the gate.** `requiredGap = breakEven + margin + leg2Buffer`, and
+  every money figure is computed against the ceiling rather than the quote, so
+  the buffer can never be spent by a package no gate had priced.
+- **Hedge-or-orphan** (`arbMaxHedgeLossPct`, 0.03 of package cost). Once leg 1 is
+  filled the alternative to hedging is a naked leg — a fair bet at market odds,
+  zero edge and full variance — so a small *certain* loss is the better side and
+  leg 2 deliberately buys above break-even to take it. Bounded, because that
+  stops being true once the book has moved far enough; past the cap the leg goes
+  to the item 100/101 unwind path instead.
+- **Parity tolerance is buffer-aware.** Funded at the ceiling and filled at the
+  ask, the same dollars buy `tick / price` extra shares — 2.2% at $0.46, 7.1% at
+  $0.14. That is the buffer working, and the old flat 2% would have logged
+  `PARITY BREACH` on exactly the skewed books this strategy wants.
+
+**Known cost, stated.** The gate charge raises the bar by a full tick: at 50/50
+with live margin, 4.5% → 5.5%. Two of the fifteen packages in the 2026-09-15
+sample (the 4.0% gaps) would no longer open. Deliberate — those had the least
+room to survive a one-tick move — but it is a real reduction in frequency and
+the first thing to look at if fills dry up.
+
+**Not carried:** `breakEvenGap` is still evaluated at the quoted down price, not
+the ceiling. The fee curve is not monotone in price, the difference is
+second-order against the buffer itself, and folding it in would make the gate
+depend on a price the package may not pay. Noted rather than silently assumed.
+
+Invariants in `tests/unit/invariants.leg2Repricing.test.ts` (18). Verified
+load-bearing: neutralise the gate charge, the buffer and the re-read and 7 of
+them fail. Six existing arb suites now set `arbLeg2BufferTicks: 0` and
+`arbLeg2RereadBook: false` explicitly — their subject is depth, sizing or
+parity, and the opt-out keeps them testing that rather than the new gate.
 
 **Found 2026-09-20** from the 2026-09-18 canary. Both live packages filled UP
 and lost DOWN. That is not symmetry — leg 2 is structurally the exposed one.

@@ -5,6 +5,8 @@ import {
   arbBreakEvenGap,
   peekClobFeeParams,
 } from './fees.js';
+import { buyCeiling } from './trade.js';
+import { getDepthForMarket } from './clob.js';
 import { executeCtfMerge } from './ctf/merge.js';
 import { emitEvent } from './telemetry/events.js';
 import { isArbHalted } from './arbReconcile.js';
@@ -47,6 +49,9 @@ export async function detectAndExecuteArbPackage({
   adjustPaperCash,
   saveTrade,
   botState,
+  // Item 97. Injected so the leg-2 re-read is deterministic under test; in
+  // production this is the same book reader the scan used.
+  refetchDepth = getDepthForMarket,
 }) {
   if (cfg.clobArbEnabled === false) return null;
   /**
@@ -139,10 +144,27 @@ export async function detectAndExecuteArbPackage({
     || (cfg.feeCategory || 'crypto');
   const breakEvenGap = arbBreakEvenGap(upAsk, downAsk, feeParams);
   const marginPct = Number(cfg.arbMinMarginPct ?? 0.005);
-  const requiredGap = breakEvenGap + marginPct;
+
+  /*
+   * Item 97. Leg 2 is signed a tick above the ask so transit drift cannot kill
+   * it, and that tick has to be *budgeted here* rather than discovered at the
+   * fill. Spending it after the gate has already approved the package is how a
+   * trade that cleared break-even by half a cent fills below it.
+   *
+   * It is a ceiling on what leg 2 may pay, not a fee: when the book has not
+   * moved the fill is at the ask and the buffer costs nothing (`buyCeiling`).
+   * Requiring the package to absorb it regardless is the conservative reading —
+   * the worst case is the one that has to be affordable.
+   *
+   * `arbLeg2BufferTicks: 0` restores the old zero-tolerance behaviour exactly.
+   */
+  const tickSize = Number(market.tickSize || 0.01) || 0.01;
+  const bufferTicks = Math.max(0, Math.floor(Number(cfg.arbLeg2BufferTicks ?? 1)));
+  const leg2Buffer = Math.round(tickSize * bufferTicks * 1e6) / 1e6;
+  const requiredGap = breakEvenGap + marginPct + leg2Buffer;
   if (!(gap > requiredGap)) {
     arbDecision('skip', 'gap_below_breakeven',
-      { gap, breakEvenGap, requiredGap, marginPct },
+      { gap, breakEvenGap, requiredGap, marginPct, leg2Buffer },
       { breakEvenGap, requiredGap, fees: { feeParams } });
     if (log && gap > 0) {
       log(
@@ -261,7 +283,20 @@ export async function detectAndExecuteArbPackage({
    */
   const DEPTH_UTILISATION = 0.90;
 
-  const budgetShares = shareBudget / sum;
+  /*
+   * Item 97. Every money figure below is computed against `downCeiling` — the
+   * highest price leg 2 is allowed to pay — not against the quote. The buffer
+   * would otherwise be spendable money that no gate had seen: sizing to the
+   * quote and signing a tick higher lets a package pass the affordability check
+   * at one number and commit a larger one.
+   *
+   * `sum` stays what it was, a statement about the *book*. `gap` is derived from
+   * it and must keep describing the dislocation that was observed.
+   */
+  const downCeiling = bufferTicks > 0 ? buyCeiling(downAsk, { tickSize, bufferTicks }) : downAsk;
+  const costSum = upAsk + downCeiling;
+
+  const budgetShares = shareBudget / costSum;
   const floorShares = MIN_LEG_NOTIONAL_USD / Math.min(upAsk, downAsk);
 
   // `bestAskSize` is published by both branches of `getDepthForMarket`
@@ -301,7 +336,10 @@ export async function detectAndExecuteArbPackage({
   }
 
   const costUp = Math.round(shares * upAsk * 100) / 100;
-  const costDown = Math.round(shares * downAsk * 100) / 100;
+  // At the ceiling, not the quote — see `downCeiling`. A better fill is upside,
+  // and reporting the worst case means `lockedProfitUsd` is a floor rather than
+  // a figure that a one-tick move turns into a lie.
+  const costDown = Math.round(shares * downCeiling * 100) / 100;
   const totalCost = Math.round((costUp + costDown) * 100) / 100;
 
   /*
@@ -454,6 +492,104 @@ export async function detectAndExecuteArbPackage({
     if (upShares > 0) {
       // 40ms interval ensures distinct millisecond timestamps and strictly increasing nonces on CLOB
       await new Promise((r) => setTimeout(r, 40));
+
+      /*
+       * ── Leg 2 is priced here, not at the scan (item 97) ──────────────────
+       *
+       * `downAsk` was quoted before leg 1 was dispatched, so by this line it is
+       * stale by leg 1's entire round trip — ~750ms through the proxy plus the
+       * nonce gap — and leg 2 then pays its own transit on top. Signing that
+       * quote as a hard bound is why every live leg 2 died: a FOK bounded at a
+       * price the book has left has zero reachable shares.
+       *
+       * Two independent defences, because they fail differently:
+       *
+       *   re-read   removes the staleness that already happened. Free when the
+       *             WS book is live (`clob.ts:179` reads the socket cache, and
+       *             that feed is direct, not proxied), and when it is not, the
+       *             REST fallback is the same call the scan would have made.
+       *
+       *   buffer    covers the drift still to come, which no re-read can see.
+       *
+       * A failed re-read is not a failure: the scan quote remains the fallback,
+       * which is exactly the behaviour that shipped before this.
+       */
+      let freshDownAsk = downAsk;
+      let leg2Depth = depth;
+      let bookRefreshed = false;
+      if (cfg.arbLeg2RereadBook !== false) {
+        try {
+          // Only the DOWN token. `getDepthForMarket` walks `tokenIds`, so handing
+          // it the one leg being priced keeps this to a single book — free from
+          // the WS cache, and one REST call rather than two when that cache is
+          // cold.
+          //
+          // Typed `any` locally because `getDepthForMarket` builds its result
+          // from an empty literal and so has no inferred keys. Giving it a real
+          // return type is backlog work, not this change.
+          const reread: any = await refetchDepth({ ...market, tokenIds: { down: market.tokenIds?.down } });
+          const a = Number(reread?.down?.bestAsk);
+          if (a > 0.01 && a < 0.99) {
+            freshDownAsk = a;
+            // Merge rather than replace: the UP side of `depth` is still the
+            // book leg 1 was sized from, and `executeArbLeg` stamps leg
+            // diagnostics (`bookAgeMs`, `bookSource`) off whichever entry it is
+            // given. Dropping UP here would blank leg 1's provenance.
+            leg2Depth = { ...(depth || {}), down: reread.down };
+            bookRefreshed = true;
+          }
+        } catch { /* stale quote is the documented fallback */ }
+      }
+
+      const signedDownAsk = bufferTicks > 0
+        ? buyCeiling(freshDownAsk, { tickSize, bufferTicks })
+        : freshDownAsk;
+
+      /*
+       * The hedge-or-orphan decision, and the reason it leans toward hedging.
+       *
+       * Leg 1 is already filled. The alternative to completing the hedge is not
+       * "no trade" — it is holding a naked directional leg, which is a fair bet
+       * at market odds: zero expected edge and the full variance of the
+       * position. So a small *certain* loss is the better side of that trade,
+       * and this deliberately buys above break-even to get it.
+       *
+       * Bounded, because "better than a coin flip" stops being true once the
+       * book has moved far enough. Past `arbMaxHedgeLossPct` the leg goes to the
+       * orphan path instead, which since items 100/101 unwinds in seconds
+       * rather than minutes.
+       *
+       * `upAsk` stands in for leg 1's fill price, which is not returned here. It
+       * is the *bound* leg 1 was signed at and a FOK can only fill at or below
+       * it (§9b), so this overstates the cost — the safe direction.
+       */
+      const lockedLossUsd = Math.round(upShares * ((upAsk + signedDownAsk) - 1.00) * 100) / 100;
+      /*
+       * The cap scales with the package, because so does what it is being traded
+       * against. Orphaning leg 1 leaves a naked position whose variance is
+       * proportional to its size, so a *fixed dollar* ceiling is wrong in both
+       * directions — it forbids a 2c hedge on a $50 package while permitting one
+       * that is half the value of a $2 package.
+       *
+       * The floor keeps a very small package from being refused over grid
+       * rounding, where a single tick can exceed any sane fraction.
+       */
+      const hedgeLossPct = Math.max(0, Number(cfg.arbMaxHedgeLossPct ?? 0.03));
+      const hedgeLossCapUsd = Math.max(0.05, Math.round(totalCost * hedgeLossPct * 100) / 100);
+
+      if (lockedLossUsd > hedgeLossCapUsd) {
+        pkg.legs.down.error = `hedge refused: would lock -$${lockedLossUsd.toFixed(2)} (up $${upAsk.toFixed(3)} + down $${signedDownAsk.toFixed(3)} = $${(upAsk + signedDownAsk).toFixed(3)}) over cap $${hedgeLossCapUsd.toFixed(2)}`;
+        if (log) {
+          log(
+            `⛔ ARB HEDGE REFUSED ${market.symbol} — DOWN moved $${downAsk.toFixed(3)} → $${freshDownAsk.toFixed(3)}; hedging would lock -$${lockedLossUsd.toFixed(2)} over cap $${hedgeLossCapUsd.toFixed(2)}. Leg 1 goes to the unwind path.`,
+            'error',
+            {
+              packageId, slug: market.slug, quotedDownAsk: downAsk, freshDownAsk,
+              signedDownAsk, lockedLossUsd, hedgeLossCapUsd, upShares, bookRefreshed,
+            },
+          );
+        }
+      } else {
       // Size leg 2 from what leg 1 ACTUALLY matched, not from the plan.
       //
       // A CLOB market buy is denominated in dollars, not shares
@@ -463,10 +599,25 @@ export async function detectAndExecuteArbPackage({
       // $1.00 because one token pays $1 and its complement pays $0. Shares held
       // on one side beyond the matched pair are not arbitrage at all — they are
       // an unhedged directional bet.
-      const downCostActual = Math.round(upShares * downAsk * 100) / 100;
+      // Dollars at the signed ceiling, not the quote. `original_size` is
+      // `amountUsd / maxPrice` (§9b), so funding the quote while bounding a tick
+      // higher would sign *fewer* shares than leg 1 matched and break parity in
+      // the one direction that leaves a naked UP leg. At the ceiling the signed
+      // size is exactly `upShares`, and a better fill buys a small DOWN excess
+      // instead — a complete hedge plus a residual, which the parity check below
+      // now expects.
+      const downCostActual = Math.round(upShares * signedDownAsk * 100) / 100;
+      if (log && bookRefreshed && Math.abs(freshDownAsk - downAsk) >= tickSize) {
+        log(
+          `🔄 ARB LEG 2 REPRICED ${market.symbol} DOWN $${downAsk.toFixed(3)} → $${freshDownAsk.toFixed(3)} (signing $${signedDownAsk.toFixed(3)})`,
+          'system',
+          { packageId, slug: market.slug, quotedDownAsk: downAsk, freshDownAsk, signedDownAsk },
+        );
+      }
       downShares = await executeArbLeg({
-        outcome: 'down', price: downAsk, cost: downCostActual, shares: upShares, pkg, market, executeTrade, mode, depth,
+        outcome: 'down', price: signedDownAsk, cost: downCostActual, shares: upShares, pkg, market, executeTrade, mode, depth: leg2Depth,
       });
+      }
     }
   } catch (err) {
     if (log) log(`⚠️ Arb leg execution error: ${err.message}`, 'error', { packageId, error: err.message });
@@ -494,7 +645,21 @@ export async function detectAndExecuteArbPackage({
       // rather than discovering it in a settlement statement.
       const matched = Math.min(upShares, downShares);
       const residual = Math.round(Math.abs(upShares - downShares) * 1000) / 1000;
-      const legTolerance = Math.max(0.05, matched * 0.02);
+      /*
+       * Item 97 widened what "expected drift" means. Leg 2 is funded at the
+       * signed ceiling and the engine fills the best price first, so when the
+       * book has not moved the same dollars buy `tick / price` extra shares —
+       * 2.2% on a $0.46 leg, 7.1% on a $0.14 one. That is the buffer working,
+       * not a parity fault, and a threshold that flags it would fire on exactly
+       * the skewed books this strategy exists to trade.
+       *
+       * The 2% floor is retained for the pre-existing source of drift: a fixed
+       * dollar FOK matching above its signed size on price improvement (§9b, the
+       * 2026-09-11 leg that took 4.682223 against a signed 4.5925). The 1.1
+       * factor is rounding headroom on the grid, not a risk allowance.
+       */
+      const bufferFraction = (leg2Buffer > 0 && downAsk > 0) ? (leg2Buffer / downAsk) : 0;
+      const legTolerance = Math.max(0.05, matched * Math.max(0.02, bufferFraction * 1.1));
 
       if (residual > legTolerance) {
         pkg.residualShares = residual;

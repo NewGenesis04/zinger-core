@@ -46,6 +46,7 @@ export const STRATEGY_KEYS = [
   'evalBothSides', 'sideBalanceEnabled', 'sideBalanceWeight',
   'preferShortTf', 'shortTfWeight',
   'clobArbEnabled', 'minArbGap', 'arbMinMarginPct', 'arbExploreRate', 'maxArbPackages',
+  'arbLeg2BufferTicks', 'arbLeg2RereadBook', 'arbMaxHedgeLossPct',
   'maxDailyLossUsd',
   'arbOnlyUntilEdge', 'forceArbOnly', 'requireEdgeForLive',
   'edgeLookback', 'edgeMinTrades', 'edgeMinExpectancy',
@@ -147,6 +148,36 @@ export function defaultPaperStrategy() {
     minArbGap: 0.015,
     // Required profit *above* break-even, in gap terms. Profit = shares x this.
     arbMinMarginPct: 0.005,
+    /*
+     * Item 97. Leg 2 is signed this many ticks above the ask, because a FOK
+     * bounded at the quote has zero reachable shares the moment the book ticks
+     * up — which is what killed every live second leg through 2026-09-18.
+     *
+     * The cost is at the *gate*, not the fill: `requiredGap` carries the ticks,
+     * so a package only opens if it can absorb them. That raises the bar by a
+     * full tick — at 50/50 and live margin, 4.5% → 5.5% — and the 4.0% gaps in
+     * the 2026-09-15 sample would no longer open. Deliberate: those are the
+     * packages with the least room to survive a one-tick move.
+     *
+     * 0 restores the pre-97 zero-tolerance behaviour exactly.
+     */
+    arbLeg2BufferTicks: 1,
+    // Re-read the DOWN book after leg 1 fills instead of signing leg 2 from the
+    // scan quote, which is stale by leg 1's whole round trip. Free when the WS
+    // book is live; one REST call for one token when it is not.
+    arbLeg2RereadBook: true,
+    /*
+     * The most a completed hedge may lock in as a *certain* loss before the leg
+     * is sent to the unwind path instead, as a fraction of the package cost.
+     *
+     * Not zero on purpose. Once leg 1 has filled the alternative to hedging is a
+     * naked leg — a fair bet at market odds, so zero expected edge and the full
+     * variance of the position. A small certain loss is the better side of that.
+     * This bounds how far that reasoning is allowed to run, as a fraction of the
+     * capital committed — the variance being avoided scales with the position, so
+     * a fixed dollar ceiling would be wrong at both ends of the size range.
+     */
+    arbMaxHedgeLossPct: 0.03,
     arbExploreRate: 0.08,
     arbOnlyUntilEdge: false,
     forceArbOnly: false,
