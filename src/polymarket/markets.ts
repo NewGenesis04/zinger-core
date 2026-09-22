@@ -115,6 +115,27 @@ async function fetchMarketDirect(slug) {
   return Array.isArray(data) ? data[0] : null;
 }
 
+/**
+ * The resolved record for a market, or null.
+ *
+ * `closed=true` is required: a bare slug lookup does not return resolved
+ * markets (domain facts §6). null covers both "no answer" and "not resolved
+ * yet", because the caller does the same thing in both cases, which is to ask
+ * again later.
+ */
+export async function fetchResolvedMarket(slug, { timeoutMs = 4000, fetchImpl = fetch } = {}) {
+  if (!slug) return null;
+  try {
+    const url = `${POLY.gammaApi}/markets?slug=${encodeURIComponent(slug)}&closed=true`;
+    const res = await fetchImpl(url, { signal: AbortSignal.timeout(timeoutMs) });
+    if (!res.ok) return null;
+    const data = await res.json();
+    return Array.isArray(data) ? (data.find((m) => m?.slug === slug) ?? null) : null;
+  } catch {
+    return null;
+  }
+}
+
 async function discoverAssetMarkets(asset) {
   const windowSec = asset.windowSeconds || 300;
   const slugs = [getCurrentSlug(asset.slugPrefix, windowSec), getNextSlug(asset.slugPrefix, windowSec)];

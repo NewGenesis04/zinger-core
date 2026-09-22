@@ -5976,6 +5976,23 @@ closer that values positions from Gamma's payout vector (domain facts §6).
 Full design in `docs/live-settlement-design.md` (§1 explains why, §4.3 has the
 closer).
 
+**Fixed 2026-09-22 (uncommitted): design step 2.** `closeResolvedPositions`
+(`bot.ts`) runs detached each scan pass, before `arbHousekeeping`. It walks
+`botState.positions`: live, open, window ended. It polls Gamma through
+`markets.fetchResolvedMarket` (`closed=true`) at +55s and +95s, then every
+minute, then every 5 min past 15 min. At 15 min it logs and emits a
+`system.alert`. It closes each position at its payout through
+`positions/resolution.ts`, which accepts only an exact payout vector mapped by
+token id and never infers one. Each close writes the trade (id
+`<pos>-resolved`, `exitReason: 'redeem'`), then the position, then a
+`position.exit` event. It places no order and moves no cash.
+`syncPackageSettlements` then settles the package and frees the slot on the next
+pass. Pinned by `tests/unit/invariants.resolutionClose.test.ts`: the real Gamma
+record, the realized −0.164197 against cash, the package settling at −0.16, and
+a source check that the closer walks positions and never trades. It was also
+run against live Gamma for this slug. Not yet done: corroborating unverified
+fill sizes (closed with `quantityUnconfirmed`), and step 3's metrics change.
+
 ---
 
 ### 104. Live equity trusts the bot's own marks exactly when Polymarket says nothing is held

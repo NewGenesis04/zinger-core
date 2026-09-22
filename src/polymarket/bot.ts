@@ -1,5 +1,5 @@
 // @ts-nocheck
-import { findMarkets, fetchPriceToBeat } from './markets.js';
+import { findMarkets, fetchPriceToBeat, fetchResolvedMarket } from './markets.js';
 import {
   takerFeeUsdc,
   takerFeeUsdcForToken,
@@ -81,6 +81,7 @@ import {
 import { holdsToSettlement, capacityFor, skipsWindowEndSale } from './positions/policy.js';
 import { settleLogKind, formatSignedUsd } from './positions/settleLog.js';
 import { resolveSettlementPrice, positionWindowEndMs } from './positions/settle.js';
+import { payoutVectorFromGamma, resolutionPollDue, resolutionOverdue, resolvedExit } from './positions/resolution.js';
 import { decideExitShares, exitSharesFromSnapshot, GHOST_MIN_AGE_MS as DEFAULT_GHOST_MIN_AGE_MS } from './positions/inventory.js';
 import { evaluateEdgeGate, passesEdgeFilter } from './edge.js';
 import { buildDecision, resolveOrderSize, sideBalanceBonus } from './engines/directional.js';
@@ -642,6 +643,132 @@ async function sweepUnrecordedHoldings(reason = 'scan') {
     }
   }
   return { swept };
+}
+
+/**
+ * Close live positions whose market has resolved, at the payout (item 103).
+ *
+ * Indexed by the open positions, never by the markets being scanned. A position
+ * whose slug has left the scan set is exactly the one nothing else reaches, and
+ * by then its only exit is the account's redemption, which the bot does not
+ * perform and does not need to see. Valuation and scheduling live in
+ * `positions/resolution.ts`.
+ *
+ * Places no order and moves no cash. A resolved token cannot be sold, and the
+ * redemption's cash reaches the CLOB balance through the balance sync, not
+ * through here. Once both legs of a package are closed, `syncPackageSettlements`
+ * settles it on the next housekeeping pass, which frees its slot.
+ *
+ * Runs detached from the scan pass: a Gamma request must not hold up trading.
+ * `_resolutionRunning` keeps it to one run at a time.
+ */
+const _resolution = new Map(); // slug -> { payout, lastPollAt, overdueNoted, missingNoted }
+let _resolutionRunning = false;
+
+async function closeResolvedPositions(reason = 'scan') {
+  if (_resolutionRunning) return { closed: 0, skipped: 'running' };
+  _resolutionRunning = true;
+  let closed = 0;
+  try {
+    const now = Date.now();
+    const bySlug = new Map();
+    for (const pos of botState.positions) {
+      if (pos.closed || pos.mode !== 'live' || !pos.tokenId || !pos.slug) continue;
+      const windowEndMs = positionWindowEndMs(pos);
+      if (windowEndMs == null || now < windowEndMs) continue;
+      if (!bySlug.has(pos.slug)) bySlug.set(pos.slug, { windowEndMs, positions: [] });
+      bySlug.get(pos.slug).positions.push(pos);
+    }
+    for (const slug of _resolution.keys()) {
+      if (!bySlug.has(slug)) _resolution.delete(slug);
+    }
+
+    for (const [slug, { windowEndMs, positions }] of bySlug) {
+      const st = _resolution.get(slug) || { payout: null, lastPollAt: null, overdueNoted: false, missingNoted: new Set() };
+      _resolution.set(slug, st);
+
+      if (!st.payout && resolutionPollDue({ windowEndMs, now, lastPollAt: st.lastPollAt })) {
+        st.lastPollAt = now;
+        st.payout = payoutVectorFromGamma(await fetchResolvedMarket(slug));
+      }
+      if (!st.payout) {
+        if (!st.overdueNoted && resolutionOverdue({ windowEndMs, now })) {
+          st.overdueNoted = true;
+          const minutes = Math.round((now - windowEndMs) / 60_000);
+          log(`⏰ RESOLUTION OVERDUE ${slug} · window ended ${minutes}m ago, Gamma reports no payout · ${positions.length} live position(s) held open, still polling`, 'error', {
+            slug, windowEndMs, positions: positions.length,
+          });
+          emitEvent('system.alert', {
+            kind: 'health', level: 'warn',
+            message: `resolution overdue: ${slug}`,
+            detail: { slug, windowEndMs, minutesSinceEnd: minutes, positions: positions.map((p) => p.id) },
+          });
+        }
+        continue;
+      }
+
+      for (const pos of positions) {
+        const payout = st.payout[String(pos.tokenId)];
+        if (payout == null) {
+          // The resolved market does not list this token. Guessing a payout here
+          // is the one thing this function exists not to do.
+          if (!st.missingNoted.has(pos.id)) {
+            st.missingNoted.add(pos.id);
+            log(`⚠️ RESOLVED MARKET LACKS TOKEN ${pos.symbol} ${String(pos.outcome || '').toUpperCase()} · ${slug} resolved, but not for token ${String(pos.tokenId).slice(0, 12)}… — left open`, 'error', {
+              slug, tokenId: pos.tokenId, positionId: pos.id,
+            });
+          }
+          continue;
+        }
+        if (closeAtResolution(pos, payout)) closed += 1;
+      }
+    }
+  } finally {
+    _resolutionRunning = false;
+  }
+  return { closed, reason };
+}
+
+function closeAtResolution(pos, payout) {
+  if (!claimPositionExit(pos)) return false;
+  try {
+    const v = resolvedExit({ shares: positionShares(pos), payout, fill: pos.fill, costBasis: pos.costBasis });
+    const at = Date.now();
+    const fields = {
+      closed: true,
+      exitReason: 'redeem',
+      exitPrice: payout,
+      currentPrice: payout,
+      pnl: v.pnl,
+      pnlExactUsd: v.pnlExactUsd,
+      gainPct: v.gainPct,
+      unrealizedPnl: 0,
+      markValue: 0,
+      exitFee: 0,
+      feesPaid: v.feeUsd,
+      feeKnown: v.feeKnown,
+      costSource: v.costSource,
+      pendingRedeem: false,
+      payoutSource: 'gamma',
+      resolvedAt: at,
+      ...(pos.unverifiedFill || pos.sharesUnverified ? { quantityUnconfirmed: true } : {}),
+    };
+    // Trade first, then the position: a restart between the two re-closes the
+    // position, and the fixed trade id makes the second write a no-op.
+    saveTrade({ ...pos, ...fields, id: `${pos.id}-resolved`, timestamp: at, shares: v.shares });
+    Object.assign(pos, fields);
+    saveState();
+    emitPositionExit(pos, 'redeem', { exitPrice: payout, shares: v.shares });
+    const pnlTxt = `${v.pnl >= 0 ? '+' : '-'}$${Math.abs(v.pnl).toFixed(2)}`;
+    log(`🏁 LIVE RESOLVED ${pos.symbol} ${String(pos.outcome || '').toUpperCase()} · ${v.shares}sh × $${payout.toFixed(2)} · PnL ${pnlTxt}${v.feeKnown ? '' : ' (fee unknown)'}${fields.quantityUnconfirmed ? ' · quantity unconfirmed' : ''} · ${pos.slug}`, v.pnl >= 0 ? 'tp' : 'sl', {
+      positionId: pos.id, slug: pos.slug, outcome: pos.outcome, tokenId: pos.tokenId, payout,
+      shares: v.shares, proceedsUsd: v.proceedsUsd, costUsd: v.costUsd, feeUsd: v.feeUsd,
+      pnl: v.pnl, pnlExactUsd: v.pnlExactUsd, costSource: v.costSource, packageId: pos.packageId || null,
+    });
+    return true;
+  } finally {
+    releasePositionExit(pos);
+  }
 }
 
 async function arbHousekeeping(reason = 'scan') {
@@ -2780,6 +2907,9 @@ export async function scan() {
     return await runAsPass(passGen, async () => {
     maybeFinalizeCycle();
     prunePendingTrades();
+    // Detached: closes resolved live positions, which lets the package
+    // settlement below free their slot on a later pass (item 103).
+    void closeResolvedPositions('scan').catch(() => {});
     // Arb capacity has to drain without anyone watching (items 9 and 10).
     await arbHousekeeping('scan');
     notePassProgress();
