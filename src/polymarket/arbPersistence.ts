@@ -27,6 +27,16 @@ export interface ArbLegInfo {
   submittedAt?: number | null;
   /** What the sizing gate asked for, before the venue's own rounding. */
   requestedShares?: number | null;
+  /** The price bound this leg was signed at. Differs from `entryPrice` on leg 2 (item 97). */
+  signedPrice?: number | null;
+  /** Item 105: what the leg actually cost, copied from the position's `fill`. */
+  fill?: {
+    shares: number;
+    costUsd: number;
+    avgPrice: number;
+    feeUsd: number;
+    priceSource: string;
+  } | null;
   /** Item 80: how an unconfirmed leg was resolved, if it had to be. */
   reconcile?: { outcome: string; door: string | null; probes: number } | null;
 }
@@ -44,6 +54,16 @@ export interface ArbPackage {
   /** Net of both entry taker fees. Was gross until backlog item 7. */
   lockedProfitUsd: number;
   lockedProfitPct: number;
+  /** The pre-execution figure, from scan quotes. Kept for slippage measurement (item 105). */
+  plannedProfitUsd?: number;
+  /** Whether `lockedProfitUsd` comes from the fills or still from the plan. */
+  profitSource?: 'plan' | 'fills';
+  /** Both legs' actual spend, excluding fees. Set when `profitSource` is 'fills'. */
+  entryCostUsd?: number;
+  /** Both legs' taker fees, charged on top of `entryCostUsd` (domain facts §10e). */
+  entryFeesUsd?: number;
+  /** `plannedProfitUsd − lockedProfitUsd`: what execution cost against the quote. */
+  slippageUsd?: number;
   /** The two entry fees this package expects to pay. */
   feesEstUsd?: number;
   /** Gap at which this book would exactly break even — rate x [u(1-u)^e + d(1-d)^e]. */

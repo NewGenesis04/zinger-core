@@ -5900,6 +5900,401 @@ fact is, not only here.
 
 ---
 
+> **Items 103–112** come from `pkg-eth-mu9ef745`, the first live package to reach
+> LOCKED (2026-09-20 05:51 UTC, realized −$0.16). Full account in
+> `docs/first-locked-package-2026-09-20.md`. Everything up to the fill worked:
+> the `arb_decisions` open row shows item 97's buffer charged at the gate
+> (`required_gap` 0.05276 = 0.03276 + 0.005 + 0.01) and in sizing
+> (`capital_usd` 4.19 = 4.5×0.34 + 4.5×0.59), and leg 2 was signed at 0.68
+> against a 0.58 scan quote, which only the re-read can produce. These items are
+> about what happened after the fill.
+
+### 103. A locked live package is never closed after resolution — the position sweep is paper-only
+
+**Found 2026-09-21.** The Polymarket account has auto-redeem enabled
+(operator-stated; not in domain facts, because it's account configuration, not
+venue semantics). On resolution it redeemed the winning leg into cash, +$4.57,
+with no action from the bot. That's how a locked package exits. The bot's job
+is to notice the redemption and close its own books. It didn't: the package
+stayed LOCKED for about nine hours, until the operator stopped the bot.
+
+**A position-indexed sweep already exists, and excludes live.**
+`bot.ts:2741-2748` walks `botState.positions`, not the scanned markets, and
+settles anything past its own `positionWindowEndMs`. Its first line is
+`if (pos.closed || pos.mode !== 'paper') continue;`. The unimported duplicate
+`scan/exits.ts:10` has the same filter. That's why paper trading never showed
+this bug.
+
+For live, every path that could close the position is keyed on the market
+currently being scanned:
+
+- settle, `bot.ts:3541`, inside the per-market loop that finds positions with
+  `p.slug === market.slug` (`bot.ts:3300-3302`)
+- the ghost reconcile, `reconcileLiveGhostPosition` (`bot.ts:1672`). It's the
+  right tool, since it closes a local position when Polymarket holds no
+  inventory. But its callers are all per-market (`bot.ts:2595/2600, 2897/2902,
+  3307/3312`), and the fast path skips `holdsToSettlement` legs before reaching
+  it (`bot.ts:2580`)
+- `syncPackageSettlements` (`arbEngine.ts:1260-1275`), which marks SETTLED only
+  when both leg trades are `closed`. Nothing closes them.
+
+Once the slug leaves the scan set, the position is unreachable by all of them.
+
+**It also held the only arb slot.** LOCKED counts as active
+(`arbPersistence.ts:119`), the capacity gate refuses at
+`active >= maxArbPackages` (`arbEngine.ts:211-217`), and the account runs
+`maxArbPackages: 1`. `arb_decision_counts` for the day, `mode='live'`:
+
+| hour (UTC) | `package_capacity_full` |
+|---|---|
+| 10:00 | 1 |
+| 11:00 | 1 |
+| 12:00 | 2 |
+| 13:00 | 3 |
+
+Capacity is checked after break-even (`:166`), the operator floor (`:185`) and
+readiness (`:202`), so each count is a book that passed every gate and was
+refused only for the slot. That's at most 7 approved opportunities, and fewer
+if a gap persisted across passes (counts aren't deduplicated). 06:00–09:59 show
+only `gap_below_breakeven`, plus 3 `gap_below_operator_floor` at 08:00, so
+nothing else was blocked.
+
+**Not fixed.** The direction is to extend the position sweep to live, but the
+live action must be *reconcile*, not *sell*. A resolved token can't be sold
+(`invalid token id`, see item 108), and `executeSell(pos, 'settle')` is right
+only for paper. For live: compare against Polymarket inventory, close the legs
+through `reconcileLiveGhostPosition`, and move the package to SETTLED with its
+realized PnL, which frees the slot. Items 104 and 105 are downstream of this
+one.
+
+**Correction 2026-09-21: that direction doesn't work.** `reconcileLiveGhostPosition`
+(`bot.ts:1672-1697`) writes no trade, and `syncPackageSettlements` settles only
+on two closed leg trades (`arbEngine.ts:1265-1266`), so the package would stay
+LOCKED. It also books the leg at its stale mark. A redeemed winner isn't a
+ghost: it was held and paid $1.00. The replacement is a generic resolution
+closer that values positions from Gamma's payout vector (domain facts §6).
+Full design in `docs/live-settlement-design.md` (§1 explains why, §4.3 has the
+closer).
+
+---
+
+### 104. Live equity trusts the bot's own marks exactly when Polymarket says nothing is held
+
+**Found 2026-09-21.** `bot.ts:1822-1829`:
+
+```js
+const pmTracked = botTokenIds.size ? pmPositions.filter(...) : [];
+const openMarkValue = pmTracked.length
+  ? pmTracked.reduce((s, p) => s + Number(p.currentValue || 0), 0)
+  : liveBotOpen.reduce((s, p) => s + Number(p.markValue || 0), 0);
+```
+
+and `equity = cash + openMarkValue` (`bot.ts:1843`).
+
+The fallback is meant to survive an API gap. But it can't tell *"Polymarket
+returned nothing"* from *"you hold nothing."* After the auto-redeem burned the
+tokens, Polymarket correctly reported no inventory, and the bot fell back to its
+stale marks: $1.53 + $3.10. Reported equity was **$288.60** against real cash
+of **$283.96**.
+
+Who owns "this position still exists"? Today Polymarket owns it when its answer
+is non-empty, and bot memory owns it when the answer is empty. That's backwards
+in exactly the case that matters.
+
+Live arb sizing reads `readiness.spendableBalance`, not equity
+(`arbEngine.ts:228-230`), so the phantom did not inflate package size. Whether
+anything else reads live `equity` for a decision is unchecked.
+
+**Not fixed.** Item 103 removes the trigger for arb legs. This line is still
+wrong for any position that goes stale while the bot believes it's open.
+
+---
+
+### 105. Package profit is computed before execution and reported as realized
+
+**Found 2026-09-21.** `lockedProfitUsd` is computed at `arbEngine.ts:434` from
+plan-time quotes (`shares`, `upAsk`, `downAsk`, `downCeiling`), before either
+leg is sent. After the fills, `pkg.shares` and `pkg.expectedPayout` are updated
+(`arbEngine.ts:677-678`) but `lockedProfitUsd` isn't. That stale value is:
+
+- stored in the package record (`:464`)
+- printed in `📦 ATOMIC ARB PACKAGE LOCKED` (`:684`), which also prints
+  `downAsk`, the **scan** quote, and planned `shares`, not what was signed or
+  filled
+- the realized-PnL fallback for any package whose leg trades aren't both closed
+  (`:1293`), which after item 103 means every live package
+
+`pkg-eth-mu9ef745` was quoted at 0.34 + 0.58 = 0.92 and filled at 0.34 + 0.68.
+Its record, log line and dashboard all show a profit. The −$0.16 was recovered
+only from CLOB receipts.
+
+**Part 1 done 2026-09-22 (uncommitted): fill capture.** Each entry records
+`pos.fill` (shares, `makingAmount` cost, average price, fee, `priceSource`) at
+`bot.ts:recordEntryFill`. `lockFromFills` (`arbEngine.ts`) turns
+`lockedProfitUsd` into the guaranteed figure from the fills, and keeps
+`plannedProfitUsd` and `slippageUsd`. The lock line prints the fill and signed
+prices. Pinned by `tests/unit/invariants.fillCapture.test.ts`, which reproduces
+this package's −$0.164197 from its ledger. Part 2 (settlement records
+`realizedPnlUsd`, metrics stop falling back to the plan) is step 3 of
+`docs/live-settlement-design.md`.
+
+**Original note:** recompute from actual fills at lock, and print the signed price,
+not the scan quote. The comment at `:426-429` says whatever is written here is
+permanent, which is why it has to be right.
+
+---
+
+### 106. The hedge cap compares the hedge with a constant instead of with the other exit
+
+**Found 2026-09-21.** `arbEngine.ts:566-580` completes leg 2 when
+`upShares × (upAsk + signedDownAsk − 1)` is within `arbMaxHedgeLossPct` of
+package cost. On this package: $0.09 against a $0.13 cap, so it hedged.
+
+**The two branches are the same trade.** A full set redeems to $1.00, so buying
+DOWN at *p* turns a held UP share into exactly 1 − *p*, the same as selling UP
+at 1 − *p*. The taker fee is proportional to *p*(1 − *p*) on both. Priced before
+the outcome:
+
+| branch | expected | worst |
+|---|---|---|
+| hedge at fresh DOWN 0.67 / signed 0.68 | −$0.185 | −$0.23 |
+| sell 4.5 UP at 0.33 / 0.32 | −$0.185 | −$0.23 |
+
+Equal to the cent. The realized −$0.16 came from DOWN winning the 0.067-share
+residual, which is hindsight. **The loss happened when DOWN moved 0.58 → 0.67,
+not when leg 2 was bought.** From then on every exit realized about the same.
+
+Two consequences:
+
+- **Adding fees to the cap is the wrong fix.** Both branches pay one taker fee
+  on the same *p*(1 − *p*). Charging it to the hedge alone biases the engine
+  toward the unwind. The unwind is the branch with unpriced risk: it can't sell
+  until leg 1 settles on-chain (§9d, ~2–3s), and the leg is naked meanwhile.
+- **The right rule compares books:** take the cheaper of the DOWN ask and
+  1 − the UP bid, and charge the unwind for its credit window. The UP bid isn't
+  fetched at that point today. The re-read at `:520-541` asks for the DOWN token
+  only.
+
+An outside review (Gemini) recommended "never buy leg 2 above $1.00; unwind leg
+1." On this package that loses the same or more and adds the naked-leg window.
+
+**Not fixed.** Changes money-path behaviour.
+
+---
+
+### 107. The instant CTF merge is dead code that fails silently
+
+**Found 2026-09-21.** `arbEngine.ts:690-728` runs `executeCtfMerge` when
+`mode === 'live' && (botState.walletClient || botState.signer)`. Neither
+property is assigned anywhere in `src/`. `grep walletClient` finds only locals
+in `lib/pons.ts` and `swap.ts`, and the two reads at `:691` and `:698`. So the
+guard is never true.
+
+Had it run, `executeCtfMerge` returns `{ ok: false, … }` without a client
+(`ctf/merge.ts:53-55`), and the caller has no `else`: failure logs nothing.
+`market.collateralToken` is also never set (`markets.ts:68` sets `conditionId`
+only), so a working call would default to USDC.e (`ctf/merge.ts:5`), which is
+unverified for these markets.
+
+Config says `instantCtfMerge: true` (`modeConfig.ts:192`, `:239`), which tells
+the reader the opposite of what happens. The live exit path is the account's
+auto-redeem (item 103).
+
+**Not fixed.** Remove it, or make it say it's inactive. Wiring it up would be a
+new on-chain signing path, which is an architectural decision.
+
+---
+
+### 108. Sell-all sells tokens without checking Polymarket still holds them
+
+**Found 2026-09-21.** `executeSell` (`bot.ts:4673-4712`) places a live market
+sell directly. Unlike `closePosition` (`bot.ts:3304-3314`), it doesn't call
+`pmSharesForPosition` first. Its live callers are the dashboard's per-position
+sell and Sell All (`server.ts:572-587`, via `rapidSell`/`rapidSellAll`,
+`bot.ts:4760-4770`).
+
+At 14:48 on 2026-09-20 two sells against the redeemed tokens returned
+`invalid token id`. No stop or shutdown hook calls `executeSell`, so these were
+most likely a dashboard Sell All against item 103's ghost positions. *Operator
+to confirm.* (The incident doc first attributed them to a shutdown path. There
+isn't one.)
+
+Harmless in money, since the venue refuses. But on failure the position is left
+open (`:4707-4709`), so Sell All can't clear a ghost either.
+
+**Not fixed.** Low priority once item 103 lands. Checking inventory first would
+also let Sell All reconcile ghosts instead of failing on them.
+
+---
+
+### 109. Wide gaps may be stale quotes — measure book age before gating on width
+
+**Found 2026-09-21.** Both opens on 2026-09-20 were wide, and neither executed
+at its quoted prices:
+
+| time (UTC) | up | down | gap | required | outcome |
+|---|---|---|---|---|---|
+| 05:11:25 | 0.52 | 0.42 | 6.0% | 5.45% | FOK abort, 0 filled |
+| 05:51:39 | 0.34 | 0.58 | 8.0% | 5.28% | DOWN moved 9 ticks before leg 2 |
+
+The proposed mechanism: one side reprices on a spot move, the other still shows
+an old resting ask, and a sequential taker is always last. If that's right, a
+wider gap signals a staler quote, and the drift runs against the taker.
+
+**A gap ceiling is the wrong instrument.** The gate's floor is break-even +
+0.5% + one tick: 5.0% on a 50/50 book, 5.28% on this one. A 4–5% ceiling (the
+figure proposed externally) sits at or below that on any near-even book, which
+switches arbitrage off. The external claim that 1.5–3.5% gaps "represent real
+liquidity" is unsourced, and those gaps are below break-even anyway.
+
+**Measure book age instead.** `executeArbLeg` stamps `bookAgeMs` and
+`bookSource` on each leg (`arbEngine.ts:844-845`). Leg 1's value is how old the
+scan book was when money went in. If wide gaps turn out to arrive on old books,
+the fitting change is to confirm the DOWN side *before* leg 1 as well as after.
+That's the item-97 re-read moved one step earlier, where walking away is still
+free.
+
+For scale: over 05:00–14:59 the gate rejected about 370,000 evaluations as below
+break-even, and 12 got past it. Qualifying gaps are rare.
+
+**Not fixed. Two data points.** Settle from package records, not from these two
+opens.
+
+---
+
+### 110. A refusal that passed every gate leaves no row
+
+**Found 2026-09-21.** `package_capacity_full` is in `COUNTED_CODES`
+(`decisionSink.ts:68-74`), so it records only an hourly count, with no asks,
+gap, slug or book age. The skip at `arbEngine.ts:213-216` writes no log line
+either. The 7 refusals in item 103 can't be checked against item 109's
+stale-quote question, or told apart from one gap seen seven times.
+
+The file's reasoning is that counted codes "describe standing state, not a
+decision about a particular book." True of `gap_below_breakeven`. Not true of a
+capacity refusal: that book passed every gate and was a trade in all but slot.
+
+**Not fixed.** Moving the code to `PERSISTED_CODES` gets it the existing
+per-slug throttle (`THROTTLE_MS`, `decisionSink.ts:89`). It's a telemetry
+policy change, so it's the operator's call.
+
+---
+
+### 111. WebSocket disconnects and errors are reported nowhere
+
+**Found 2026-09-21.** `clobWs.ts` has a single reporting call: the item-96
+silent-feed warning at `:278`, which is `console.warn`, so under tmux it goes to
+the pane and is never persisted. A real disconnect (`ws.on('close')`,
+`:284-289`) and an error (`ws.on('error')`, `:290-292`) close and reconnect
+without a word. The dashboard snapshot (`bot.ts:2157-2163`: `connected`,
+`lastMsgAgeMs`, `msgCount`) is live state with no history.
+
+The consequence costs money. When the socket is down, book reads fall back to
+REST through the metered proxy (items 92, 96), and nothing records when that
+started.
+
+**Not fixed.** Send reconnects (with cause and time since last message) to the
+persisted action log via `log()`, not only the console.
+
+---
+
+### 112. Scan throughput fell to a third mid-run, cause unknown
+
+**Found 2026-09-21.** Hourly `gap_below_breakeven` counts roughly measure scan
+throughput (one per market per pass):
+
+| hour (UTC) | 05 | 06 | 07 | 08 | 09 | 10 | 11 | 12 | 13 | 14* |
+|---|---|---|---|---|---|---|---|---|---|---|
+| count (k) | 53.6 | 53.0 | 45.8 | 46.8 | 33.6 | 17.8 | 17.5 | 17.7 | 17.8 | 13.5 |
+
+*to 14:48. That's about 14/s falling to about 4.9/s, with the transition
+partway through 09:00, and it held until the stop. So either fewer markets were
+scanned, or passes took about three times as long. The table can't say which.
+
+One candidate is a socket drop forcing REST reads, which are slower and
+proxied. By item 111 that would leave no trace in the bot. The Webshare usage
+graph for 09:00–10:00 on 2026-09-20 is the only independent record.
+
+**Not fixed. Open investigation.** Relevant to item 92's quota concern if it's
+the proxy.
+
+---
+
+### 113. The positions feed turns "no answer" into "holds nothing", and exits act on it
+
+**Found 2026-09-21** (while designing 103; `docs/live-settlement-design.md` §7).
+`readiness.fetchDepositPositions` returns `[]` on any non-200 or exception
+(`readiness.ts:47-52`), and the result is truncated to 10 rows
+(`readiness.ts:460`). `closePosition` (`bot.ts:3304-3314`), the fast stop loss
+(`bot.ts:2595/2600`) and the early stop loss (`bot.ts:2897/2902`) treat a
+missing row as "never held" and call `reconcileLiveGhostPosition`. That closes
+the local position with no trade and no sell, and zeroes `shares`. The tokens
+stay in the wallet. `findUnrecordedHoldings` treats every known token id as
+recorded, closed or not (`arbReconcile.ts:247-251`), so the sweep won't
+recover it either. One data API blip at stop-loss time makes a managed live
+position unmanaged and unrecorded. `arbReconcile.ts:62-65` already warns
+against this feed for exactly this reason. Resolved losing tokens stay in the
+wallet at `size > 0` (item 68), so the 10-row cap fills up over time.
+
+**Fixed 2026-09-22 (uncommitted).** All three exit paths go through
+`resolveExitShares` (`bot.ts`), which decides with `positions/inventory.ts`. A
+present snapshot row is trusted. A missing one is re-asked of the wallet via
+`fetchWalletShares`, which is fresh, untruncated and returns null on no answer.
+Ghost is only a fresh 0 on a position ≥120s old (`ZINGER_GHOST_MIN_AGE_MS`).
+No answer, or a too-new 0, sells the bot's count and lets the venue refuse,
+rate-limited to one attempt per position per 30s. Pinned by
+`tests/unit/invariants.exitInventory.test.ts`. The readiness feed itself still
+returns `[]` on failure and 10 rows. That is left for step 5 (equity), its
+remaining consumer.
+
+---
+
+### 114. The window-end settle branch runs before the hold-to-settle exemption
+
+**Found 2026-09-21.** The settle condition at `bot.ts:3541`
+(`remainingFromMarket <= 0 || (remainingFromMarket <= 8 && (price <= 0.02 || price >= 0.98))`)
+is checked before `holdsToSettlement` at `bot.ts:3556`. So a live arb leg in the
+last 8s of a scanned window, with a bid at an extreme, goes to
+`closePosition('settle')`, which market-sells (`bot.ts:3421`). An intact pair
+sold at about 0.98 + 0.01, minus taker fees, is worth strictly less than the
+fee-free $1.00 redemption (domain facts §2, §3). If the readiness snapshot
+predates the buy, the same branch takes item 113's path instead. It did not
+fire on `pkg-eth-mu9ef745`, and why is unknown.
+
+**Not fixed. Reachable, not observed.** VPS check: search the action log for
+`LIVE SETTLE SELL SUBMIT` on a slug that has a package.
+
+**Interaction with 113's fix (2026-09-22).** Before 113, a leg whose snapshot row
+was missing was ghost-reconciled on this branch: no sell, but wrong books.
+After 113, the wallet is re-asked and the leg is **sold**. So 113 widens this
+branch's reach, from "snapshot has the row" to "wallet holds it". V6 found no
+historical hits, but that search covered only the capped log. Fix 114 before
+deploying 113, or together with it.
+
+**Fixed 2026-09-22 (uncommitted), together with 113.** `skipsWindowEndSale`
+(`positions/policy.ts`) is true for a live position that holds to settlement,
+meaning an intact hedge leg by `hedgeIsIntact`. `bot.ts` checks it and continues
+*before* the window-end sale. Paper is unchanged, and naked legs and
+directional positions stay exit-managed. Until step 2's resolution closer
+lands, a live hedged leg stays open past window end, which is today's behaviour
+for any slug that has left the scan set. Pinned by
+`tests/unit/invariants.windowEndSale.test.ts`, which also checks the source
+order, and checks that the checker fails on three broken sources.
+
+---
+
+### 115. `resolveMarketWinner` settles an exact tie as DOWN; the market rules say UP
+
+**Found 2026-09-21.** `positions/settle.ts` returns `'down'` when close equals
+open, with the comment "Polymarket resolves tie as Down/No". Domain facts
+(`:641`, `:1003`) quote the rules: Up "if the close price is greater than or
+equal to the open". It's paper only (`bot.ts:4680`), and exact ties are rare.
+The problem is an unverified domain claim sitting in source.
+
+**Not fixed. Low priority.**
+
+---
+
 ## Handoff — state as of 2026-08-20
 
 Written so a fresh session can continue without re-deriving any of the above.

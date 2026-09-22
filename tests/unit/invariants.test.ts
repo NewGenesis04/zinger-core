@@ -852,7 +852,10 @@ describe('INVARIANT: an accepted arb package is profitable after fees', () => {
 
   it('never accepts a package whose own recorded numbers show a loss', async () => {
     // The invariant behind all of the above, stated over what the package
-    // itself records: if it opened, its net must be positive.
+    // itself records: if it opened, its *planned* net must be positive. That is
+    // the gate's promise. The fills can still lose (item 105:
+    // `pkg-eth-mu9ef745` planned +$0.16 and locked -$0.23), which is why
+    // `lockedProfitUsd` is not the field this invariant reads.
     for (const [up, down] of [[0.34, 0.62], [0.10, 0.85], [0.45, 0.48], [0.71, 0.24], [0.83, 0.15]]) {
       saveAllPackages([]);
       const pkg = await runArb({
@@ -861,7 +864,7 @@ describe('INVARIANT: an accepted arb package is profitable after fees', () => {
         cfg: cfg({ minArbGap: 0.005 }),
       });
       if (!pkg) continue;   // refused is always an acceptable answer
-      expect(pkg.lockedProfitUsd, `${up}/${down}`).toBeGreaterThan(0);
+      expect(pkg.plannedProfitUsd, `${up}/${down}`).toBeGreaterThan(0);
       expect(pkg.gap, `${up}/${down}`).toBeGreaterThan(pkg.breakEvenGap);
     }
   });

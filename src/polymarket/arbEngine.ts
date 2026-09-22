@@ -463,6 +463,8 @@ export async function detectAndExecuteArbPackage({
     expectedPayout,
     lockedProfitUsd,
     lockedProfitPct,
+    plannedProfitUsd: lockedProfitUsd,
+    profitSource: 'plan',
     feesEstUsd,
     breakEvenGap,
     gap: Math.round(gap * 100000) / 100000,
@@ -677,13 +679,30 @@ export async function detectAndExecuteArbPackage({
       pkg.shares = matched;
       pkg.expectedPayout = Math.round(matched * 1.00 * 100) / 100;
       pkg.status = 'LOCKED';
+      lockFromFills(pkg, matched);
       savePackage(pkg);
 
       if (log) {
+        const up = pkg.legs.up.fill;
+        const dn = pkg.legs.down.fill;
+        const legTxt = (f, name, fallback) => (f
+          ? `${name} ${f.shares}sh@$${f.avgPrice.toFixed(3)}`
+          : `${name}@$${fallback.toFixed(3)}`);
+        const net = pkg.lockedProfitUsd;
         log(
-          `📦 ATOMIC ARB PACKAGE LOCKED ${market.symbol} UP@$${upAsk.toFixed(3)} + DN@$${downAsk.toFixed(3)} = $${sum.toFixed(3)} · Net +$${lockedProfitUsd.toFixed(2)} (+${lockedProfitPct.toFixed(1)}%) · ${shares} sh/leg`,
+          `📦 ATOMIC ARB PACKAGE LOCKED ${market.symbol} ${legTxt(up, 'UP', upAsk)} + ${legTxt(dn, 'DN', Number(pkg.legs.down.signedPrice ?? downAsk))}`
+            + ` (DN quoted $${downAsk.toFixed(3)}, signed ≤$${Number(pkg.legs.down.signedPrice ?? downAsk).toFixed(3)})`
+            + ` · ${pkg.profitSource === 'fills' ? 'guaranteed' : 'planned'} ${net >= 0 ? '+' : '-'}$${Math.abs(net).toFixed(2)}`
+            + (pkg.profitSource === 'fills' ? ` (plan ${pkg.plannedProfitUsd >= 0 ? '+' : '-'}$${Math.abs(pkg.plannedProfitUsd).toFixed(2)})` : '')
+            + (pkg.residualShares ? ` · residual ${pkg.residualShares}sh ${String(pkg.residualOutcome).toUpperCase()}` : ''),
           'buy',
-          { packageId, slug: market.slug, totalCost, expectedPayout, lockedProfitUsd, lockedProfitPct },
+          {
+            packageId, slug: market.slug, totalCost, expectedPayout: pkg.expectedPayout,
+            lockedProfitUsd: pkg.lockedProfitUsd, lockedProfitPct: pkg.lockedProfitPct,
+            plannedProfitUsd: pkg.plannedProfitUsd, slippageUsd: pkg.slippageUsd ?? null,
+            entryCostUsd: pkg.entryCostUsd ?? null, entryFeesUsd: pkg.entryFeesUsd ?? null,
+            profitSource: pkg.profitSource,
+          },
         );
       }
 
@@ -841,6 +860,9 @@ async function executeArbLeg({ outcome, price, cost, shares, pkg, market, execut
   if (leg) {
     leg.submittedAt = submittedAt;
     leg.requestedShares = Number(shares) || null;
+    // The bound this leg was signed at. For leg 2 that is the re-read ask plus
+    // the buffer (item 97), which `entryPrice` (the scan quote) does not show.
+    leg.signedPrice = Number(price) || null;
     leg.bookSource = depth?.[outcome]?.source || null;
     leg.bookAgeMs = bookTs ? Math.max(0, submittedAt - bookTs) : null;
   }
@@ -855,6 +877,8 @@ async function executeArbLeg({ outcome, price, cost, shares, pkg, market, execut
     leg.error = res?.ok === true ? null : (res?.rawError || res?.error || 'unknown');
     leg.reconcile = res?.reconcile || null;
     leg.orderId = res?.position?.orderId ?? res?.orderId ?? leg.orderId ?? null;
+    // Item 105: what this leg actually cost, as the fill path recorded it.
+    leg.fill = res?.ok === true ? (res?.position?.fill ?? null) : null;
   }
   if (res?.ok !== true) return 0;
 
@@ -893,6 +917,46 @@ async function executeArbLeg({ outcome, price, cost, shares, pkg, market, execut
  * have to change together, and the invariant that catches it is
  * "cash reconciles to trades + fees + open cost".
  */
+
+/**
+ * Replace the plan's profit with the fills' profit, once both legs are in (item 105).
+ *
+ * `lockedProfitUsd` is first computed from scan quotes before either leg is
+ * sent, and it is what the lock line, the dashboard and the metrics fallback
+ * report. A leg that fills worse than its quote makes that figure a profit on a
+ * package that loses. After this, it is the **guaranteed** outcome of the
+ * fills: `matched` full sets
+ * redeem to exactly $1.00 each whatever the resolution (domain facts §2), less
+ * what both legs cost and the taker fee charged on top of each (§10e).
+ *
+ * A residual on one side is upside that depends on the outcome, so it is left
+ * out of the guaranteed figure and paid out at settlement. The plan figure is
+ * kept as `plannedProfitUsd`, and the difference is the execution slippage D11
+ * asks to measure.
+ *
+ * Without a fill on both legs (a test double, or a pre-105 record), the plan
+ * figure stands, and `profitSource: 'plan'` says so.
+ */
+export function lockFromFills(pkg: ArbPackage, matched: number): ArbPackage {
+  const planned = pkg.plannedProfitUsd ?? pkg.lockedProfitUsd;
+  pkg.plannedProfitUsd = planned;
+  const up = pkg.legs?.up?.fill;
+  const down = pkg.legs?.down?.fill;
+  if (!up || !down) {
+    pkg.profitSource = 'plan';
+    return pkg;
+  }
+  const entryCostUsd = Math.round((up.costUsd + down.costUsd) * 1e6) / 1e6;
+  const entryFeesUsd = Math.round((up.feeUsd + down.feeUsd) * 1e6) / 1e6;
+  const guaranteed = Math.round((matched * 1.00 - entryCostUsd - entryFeesUsd) * 100) / 100;
+  pkg.entryCostUsd = entryCostUsd;
+  pkg.entryFeesUsd = entryFeesUsd;
+  pkg.lockedProfitUsd = guaranteed;
+  pkg.lockedProfitPct = entryCostUsd > 0 ? Math.round((guaranteed / entryCostUsd) * 10000) / 100 : 0;
+  pkg.slippageUsd = Math.round((planned - guaranteed) * 100) / 100;
+  pkg.profitSource = 'fills';
+  return pkg;
+}
 
 /**
  * Is this refusal the venue not having credited the shares yet (item 101)?

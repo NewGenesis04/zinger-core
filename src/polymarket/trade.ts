@@ -703,13 +703,34 @@ export async function placeMarketBuy({
   return {
     id,
     order: result,
+    // The signed limit, not the fill price. The fill is `costUsd / size`.
     price: px,
     size: shares,
     expectedShares,
-    costUsd: amount,
+    signedUsd: amount,
+    ...readBuyCost(result, amount),
     side: Side.BUY,
     status: result?.status || null,
   };
+}
+
+/**
+ * What a matched fixed-dollar buy actually spent (item 105).
+ *
+ * `makingAmount` is the dollars paid, as a decimal string in human units
+ * (domain facts §9a). A fixed-dollar buy cannot spend more than it signed, so a
+ * reading above the signed amount is a wire format this code does not know,
+ * not a fill. In that case, and when the field is absent, the signed amount is
+ * used and `costSource` says so. The taker fee is charged on top of this figure
+ * (§10e), not inside it.
+ */
+export function readBuyCost(result, signedUsd) {
+  const making = Number(result?.makingAmount);
+  const signed = Number(signedUsd);
+  if (Number.isFinite(making) && making > 0 && making <= signed + 1e-6) {
+    return { costUsd: making, costSource: 'venue_making' };
+  }
+  return { costUsd: signed, costSource: 'signed_amount' };
 }
 
 /**

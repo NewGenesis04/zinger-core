@@ -211,6 +211,25 @@ export function holdsToSettlement(posOrPlan, context = null) {
   return policyFor(posOrPlan).holdsToSettlement === true;
 }
 
+/**
+ * Does the window-end sale skip this position? (item 114)
+ *
+ * The per-market loop sells a position at, or in the last seconds before,
+ * window end. For a live position that holds to settlement, the venue's exit is
+ * redemption: fee-free, at the payout, exactly $1.00 for a full set (domain
+ * facts §2, §3). A market sell there gets a bid below the payout and pays a
+ * taker fee, so it is strictly worse, and it can only lose.
+ *
+ * Live only. Paper has no redemption, and its window-end close *is* its
+ * settlement model.
+ *
+ * `context` is required for the same reason `hedgeIsIntact` wants it: a naked
+ * leg is directional exposure and stays exit-managed.
+ */
+export function skipsWindowEndSale(pos, context) {
+  return pos?.mode === 'live' && holdsToSettlement(pos, context);
+}
+
 /** The inverse, spelled out because it reads better at call sites that manage exits. */
 export function isExitManaged(posOrPlan) {
   return !holdsToSettlement(posOrPlan);

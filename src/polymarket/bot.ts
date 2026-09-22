@@ -3,6 +3,7 @@ import { findMarkets, fetchPriceToBeat } from './markets.js';
 import {
   takerFeeUsdc,
   takerFeeUsdcForToken,
+  peekClobFeeParams,
   openCostWithFee,
   closeProceedsWithFee,
   closeProceedsWithFeeForToken,
@@ -53,7 +54,7 @@ import { placeOrder, placeMarketBuy, placeMarketSell, sellFloor, cancelOrder, sy
 import { lossCapStatus, resetLossCap } from './lossCap.js';
 import {
   reconcileArbLeg, haltArb, isArbHalted, arbHaltState, clearArbHalt,
-  fetchWalletPositions, findUnrecordedHoldings, markOrderInFlight, clearInFlight,
+  fetchWalletPositions, fetchWalletShares, findUnrecordedHoldings, markOrderInFlight, clearInFlight,
 } from './arbReconcile.js';
 import { checkReadiness, invalidateBalanceCache, applyBalanceDelta } from './readiness.js';
 import { resolveDynamicLimits, setKellyTradeHistory, getKellyStats, buildDynamicPlan, checkTrailingStop, checkPartialProfit, resolveAdaptiveSl } from './kelly.js';
@@ -77,9 +78,10 @@ import {
   exitManagedPositions,
   portfolioView as buildPortfolioView,
 } from './positions/manager.js';
-import { holdsToSettlement, capacityFor } from './positions/policy.js';
+import { holdsToSettlement, capacityFor, skipsWindowEndSale } from './positions/policy.js';
 import { settleLogKind, formatSignedUsd } from './positions/settleLog.js';
 import { resolveSettlementPrice, positionWindowEndMs } from './positions/settle.js';
+import { decideExitShares, exitSharesFromSnapshot, GHOST_MIN_AGE_MS as DEFAULT_GHOST_MIN_AGE_MS } from './positions/inventory.js';
 import { evaluateEdgeGate, passesEdgeFilter } from './edge.js';
 import { buildDecision, resolveOrderSize, sideBalanceBonus } from './engines/directional.js';
 import { recordTradeSample } from './heuristics/tradeCollector.js';
@@ -1213,6 +1215,11 @@ async function executePendingTrade(pending) {
         });
       }
       markPosition(pos, orderResult.price);
+      // A FOK buy reports what it spent. A GTC limit does not, so its cost is
+      // bounded at the limit, which is an overstatement if it filled better.
+      recordEntryFill(pos, orderResult.costUsd != null
+        ? { shares: pos.shares, costUsd: orderResult.costUsd, priceSource: orderResult.costSource }
+        : { shares: pos.shares, costUsd: pos.shares * orderResult.price, priceSource: 'limit_bound' });
       // Synchronous first: the next sizing read must not see money already
       // spent. `costBasis` is shares × entryPrice as of markPosition (:1360).
       applyLiveCashDelta(-Number(pos.costBasis || 0), `BUY ${pending.symbol} ${pending.outcome?.toUpperCase()}`);
@@ -1301,6 +1308,9 @@ async function executePendingTrade(pending) {
         pos.unverifiedFill = true;
         pos.reconciledFill = { door: recon.door, probes: recon.probes.length, at: Date.now() };
         markPosition(pos, entryPx);
+        // Reconciliation returns the share count, not the spend. A fixed-dollar
+        // buy spends its signed amount (§9b, §10e), so that is the cost.
+        recordEntryFill(pos, { shares: recon.shares, costUsd: quote.amountUsd, priceSource: 'reconciled_signed' });
         // Entry price is the worst-case bound rather than the achieved price,
         // which reconciliation does not return. Any price improvement therefore
         // reads as a slightly overstated cost until `syncLiveAccount` trues it
@@ -1397,6 +1407,7 @@ async function executePendingTrade(pending) {
     pos.entryFee = entryFee;
     pos.feesPaid = entryFee;
     pos.costBasis = premium;
+    recordEntryFill(pos, { shares: pos.shares, costUsd: premium, priceSource: 'paper_model', feeUsd: entryFee });
     const debit = Math.round((premium + entryFee) * 100) / 100;
     adjustPaperCash(-debit, `BUY ${pending.symbol} ${pending.outcome?.toUpperCase()} @ ${entryPx.toFixed(3)}`);
     log(`✅ PAPER BUY ${pending.symbol} ${pending.outcome.toUpperCase()} @ $${entryPx.toFixed(3)} · $${premium.toFixed(2)} + fee $${entryFee.toFixed(4)} · TP +${plan.targetTp}% · SL -${plan.slPct}%`, 'buy', {
@@ -1669,6 +1680,42 @@ function pmSharesForPosition(position, readinessPositions = []) {
   return Number(row?.size || 0);
 }
 
+/**
+ * The I/O half of item 113's exit decision. The decision itself, and why a
+ * missing snapshot row is not evidence, live in `positions/inventory.ts`.
+ * The wallet is only asked when the snapshot has no row, so the common path
+ * costs nothing extra.
+ */
+const GHOST_MIN_AGE_MS = Number(process.env.ZINGER_GHOST_MIN_AGE_MS) || DEFAULT_GHOST_MIN_AGE_MS;
+const _unconfirmedExitAt = new Map();
+
+async function resolveExitShares(pos, sellShares, readinessPositions = []) {
+  const snapshotShares = pmSharesForPosition(pos, readinessPositions);
+  const fromSnapshot = exitSharesFromSnapshot(sellShares, snapshotShares);
+  if (fromSnapshot) return fromSnapshot;
+
+  const walletShares = await fetchWalletShares(botState.readiness?.depositWallet || null, pos.tokenId);
+  const now = Date.now();
+  const ageMs = now - Number(pos.entryTime || 0);
+  const decision = decideExitShares({
+    sellShares,
+    snapshotShares,
+    walletShares,
+    ageMs,
+    msSinceUnconfirmed: now - (_unconfirmedExitAt.get(pos.id) ?? -Infinity),
+    ghostMinAgeMs: GHOST_MIN_AGE_MS,
+  });
+  if (decision.source === 'unconfirmed') {
+    _unconfirmedExitAt.set(pos.id, now);
+    log(
+      `❔ LIVE EXIT UNCONFIRMED ${pos.symbol} ${String(pos.outcome || '').toUpperCase()} · wallet ${walletShares == null ? 'did not answer' : `shows 0sh on a ${Math.round(ageMs / 1000)}s-old position`} — selling ${sellShares}sh and letting the venue decide`,
+      'system',
+      { symbol: pos.symbol, slug: pos.slug, tokenId: pos.tokenId, walletShares, ageMs, sellShares },
+    );
+  }
+  return decision;
+}
+
 function reconcileLiveGhostPosition(position, readinessPositions = [], reason = 'missing_pm_inventory') {
   if (!position || position.closed || position.mode !== 'live') return false;
   const pmShares = pmSharesForPosition(position, readinessPositions);
@@ -1695,6 +1742,35 @@ function reconcileLiveGhostPosition(position, readinessPositions = [], reason = 
     },
   );
   return true;
+}
+
+/**
+ * What an entry actually cost (item 105). The only writer of `pos.fill`.
+ *
+ * `pos.entryPrice` is the price the position is *marked* against, and on a live
+ * fill it is the signed limit, not the price paid. `fill` is the other record:
+ * shares, dollars and fee as the venue executed them, which is what realized
+ * P/L is computed from. `priceSource` says how much of it the venue reported
+ * and how much was assumed, so a figure is never more trusted than its origin.
+ *
+ * The fee is computed, never fetched: this runs between an arb's two legs, and
+ * `takerFeeUsdcForToken` can spend two CLOB round trips resolving parameters.
+ * Cached live parameters are used when present; otherwise the category schedule,
+ * which equals the live one on these markets (domain facts §3).
+ */
+function recordEntryFill(pos, { shares, costUsd, priceSource, feeUsd = null }) {
+  const s = Number(shares) || 0;
+  const cost = Number(costUsd) || 0;
+  const avgPrice = s > 0 && cost > 0 ? cost / s : Number(pos.entryPrice) || 0;
+  const feeParams = peekClobFeeParams(pos.tokenId) || botState.config.feeCategory || 'crypto';
+  pos.fill = {
+    shares: s,
+    costUsd: Math.round(cost * 1e6) / 1e6,
+    avgPrice: Math.round(avgPrice * 1e6) / 1e6,
+    feeUsd: feeUsd != null ? Number(feeUsd) : takerFeeUsdc(s, avgPrice, feeParams),
+    priceSource,
+  };
+  return pos.fill;
 }
 
 function markPosition(pos, price) {
@@ -2590,16 +2666,14 @@ async function scanOpenExitsFast() {
       const fillPrice = resolveSlFillPrice(pos, mark, effectiveSl, cfg);
       let sellShares = positionShares(pos);
       if (pos.mode === 'live' && pos.tokenId && sellShares > 0) {
-        const pmShares = pmSharesForPosition(pos, readinessPositions);
-        if (!(pmShares > 0)) {
+        const held = await resolveExitShares(pos, sellShares, readinessPositions);
+        if (held.action === 'ghost') {
           reconcileLiveGhostPosition(pos, readinessPositions, 'fast_sl_no_pm_inventory');
           continue;
         }
-        const adjustedShares = Math.min(sellShares, pmShares);
-        if (adjustedShares <= 0) {
-          reconcileLiveGhostPosition(pos, readinessPositions, 'fast_sl_zero_adjusted_shares');
-          continue;
-        }
+        if (held.action === 'wait') continue;
+        const { pmShares } = held;
+        const adjustedShares = held.shares;
         if (Math.abs(adjustedShares - sellShares) > 0.01) {
           log(
             `🧮 LIVE FAST-SL share clamp ${pos.symbol} ${pos.outcome.toUpperCase()} · ${sellShares.toFixed(3)}→${adjustedShares.toFixed(3)}sh`,
@@ -2892,16 +2966,14 @@ export async function scan() {
           const fillPrice = resolveSlFillPrice(openPos, mark, effectiveSl, cfg);
           let sellShares = positionShares(openPos);
           if (openPos.mode === 'live' && openPos.tokenId && sellShares > 0) {
-            const pmShares = pmSharesForPosition(openPos, readiness?.positions || []);
-            if (!(pmShares > 0)) {
+            const held = await resolveExitShares(openPos, sellShares, readiness?.positions || []);
+            if (held.action === 'ghost') {
               reconcileLiveGhostPosition(openPos, readiness?.positions || [], 'early_sl_no_pm_inventory');
               continue;
             }
-            const adjustedShares = Math.min(sellShares, pmShares);
-            if (adjustedShares <= 0) {
-              reconcileLiveGhostPosition(openPos, readiness?.positions || [], 'early_sl_zero_adjusted_shares');
-              continue;
-            }
+            if (held.action === 'wait') continue;
+            const { pmShares } = held;
+            const adjustedShares = held.shares;
             if (Math.abs(adjustedShares - sellShares) > 0.01) {
               log(
                 `🧮 LIVE EARLY-SL share clamp ${openPos.symbol} ${openPos.outcome.toUpperCase()} · ${sellShares.toFixed(3)}→${adjustedShares.toFixed(3)}sh`,
@@ -3302,16 +3374,14 @@ export async function scan() {
           }
           let sellShares = exitReason === 'partial' ? positionShares(pos) * (pos.partialPct || 0.5) : positionShares(pos);
           if (pos.mode === 'live' && pos.tokenId && sellShares > 0) {
-            const pmShares = pmSharesForPosition(pos, readiness?.positions || []);
-            if (!(pmShares > 0)) {
+            const held = await resolveExitShares(pos, sellShares, readiness?.positions || []);
+            if (held.action === 'ghost') {
               reconcileLiveGhostPosition(pos, readiness?.positions || [], `${exitReason}_no_pm_inventory`);
               return false;
             }
-            const adjustedShares = Math.min(sellShares, pmShares);
-            if (adjustedShares <= 0) {
-              reconcileLiveGhostPosition(pos, readiness?.positions || [], `${exitReason}_zero_adjusted_shares`);
-              return false;
-            }
+            if (held.action === 'wait') return false;
+            const { pmShares } = held;
+            const adjustedShares = held.shares;
             if (Math.abs(adjustedShares - sellShares) > 0.01) {
               log(
                 `🧮 LIVE ${exitReason.toUpperCase()} share clamp ${pos.symbol} ${pos.outcome.toUpperCase()} · ${sellShares.toFixed(3)}→${adjustedShares.toFixed(3)}sh`,
@@ -3536,6 +3606,12 @@ export async function scan() {
 
         const win = marketWindow(market);
         const remainingFromMarket = Math.ceil((win.remainingMs ?? remaining * 1000) / 1000);
+
+        // Before the window-end sale, not after it: a live hedged leg exits by
+        // redemption, and the sale below would sell it for less (item 114).
+        if (skipsWindowEndSale(pos, { packages: loadPackages(), positions: botState.positions })) {
+          continue;
+        }
 
         // Force settle only when THIS market window is done (slug open→end)
         if (remainingFromMarket <= 0 || (remainingFromMarket <= 8 && (price <= 0.02 || price >= 0.98))) {
