@@ -6267,6 +6267,57 @@ opens.
 package records. Run it on the VPS (`node scripts/arb-book-age.mjs
 data/zinger.db`). Item 110 now also records book ages for capacity refusals.
 
+**2026-09-22: first run on the VPS** (`--archive`, 59 live packages):
+
+- Nearly every package aborts **at every gap width**. Only 2 of the visible
+  packages locked (2026-08-28). 4–5% gaps abort as often as 14–37% gaps, so the
+  data can't show a gap-width effect.
+- Book ages exist from 2026-09-15 on (item 79). Of 19 failures there, 17 are
+  **leg-1 (UP) FOK kills on books 19–60 ms old**. Only two were older than
+  250 ms (623, 1076 ms), and they failed the same way.
+- Two lost leg 2 after leg 1 filled (2026-09-18 07:34 and 08:15), which is what
+  item 97's re-read addresses.
+
+**Consequence.** The bot's snapshot is not stale at dispatch. The ask vanishes
+in **transit** (dispatch to venue, ~750 ms through the proxy, item 97), which
+`bookAgeMs` doesn't measure. The proposed fix (re-read DOWN before leg 1) would
+not address the failures seen: leg 1 fails, on a fresh book. Leg-1 kills cost
+nothing (nothing fills). They are missed trades, not losses.
+
+**Next measurement (proposed, not implemented):** on each FOK kill, record the
+dispatch-to-response time and the book immediately after the kill (free from
+the WS cache). That separates three causes, each with its own fix: the ask
+moved up (price moves within transit), the size thinned (queue competition),
+or neither changed (the ask was not executable liquidity).
+
+**Full tables (operator, 2026-09-22).** Both legs filled on 3 of 59 (5%). By gap:
+<4% 0/4, 4–5% 0/9, 5–6% 1/23, 6–8% 1/8, ≥8% 1/15. By leg-1 book age: <250 ms
+1/20, 250 ms–1 s 0/1, 1–5 s 0/1. The only two one-leg failures (both 5–6%,
+2026-09-18) predate item 97. On 2026-09-20, the 05:11 package was killed on a
+**17 ms** book, and 05:51 locked on a 23 ms one.
+
+**Verdict: the stale-quote hypothesis is not supported, and neither gap width
+nor book age predicts failure.** The pre-leg-1 re-read is withdrawn as a fix.
+Leg 1 fails ~95% of the time after dispatch. Open between two causes with
+different remedies: **transit** (infrastructure: VPS/proxy placement), or **the
+ask is not takeable** (strategy: whether a taker can reach this edge at all).
+The kill-time telemetry above is what separates them.
+
+**Kill-time telemetry added 2026-09-22 (uncommitted), operator go-ahead.**
+`executeArbLeg` stamps `transitMs` (dispatch to response) on every leg. On a
+refused live leg it also records `kill = { before, after, cause }`: the scan's
+best ask and size, and the socket's book just after the refusal (cache only,
+never a network call). `classifyKill` (pure) names the cause:
+`ask_moved_up`, `size_thinned`, `unchanged`, `no_book_update` (the socket has
+not updated since dispatch, so there is nothing to judge), or `unknown`.
+`scripts/arb-book-age.mjs` adds a kill-cause table and median transit for
+killed vs filled legs. Caveats: `transitMs` includes the engine's own
+reconciliation on non-FOK failures (FOK kills take item 84's fast path), and
+the socket lags the venue, so a single classification is weak. The
+distribution is the measurement. Pinned by
+`tests/unit/invariants.killTelemetry.test.ts`, including the script against a
+scratch store.
+
 ---
 
 ### 110. A refusal that passed every gate leaves no row

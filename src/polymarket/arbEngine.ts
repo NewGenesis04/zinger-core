@@ -7,6 +7,7 @@ import {
 } from './fees.js';
 import { buyCeiling } from './trade.js';
 import { getDepthForMarket } from './clob.js';
+import { getClobWsBook } from './clobWs.js';
 import { emitEvent } from './telemetry/events.js';
 import { isArbHalted } from './arbReconcile.js';
 import type { ArbPackage } from './arbPersistence.js';
@@ -51,6 +52,9 @@ export async function detectAndExecuteArbPackage({
   // Item 97. Injected so the leg-2 re-read is deterministic under test; in
   // production this is the same book reader the scan used.
   refetchDepth = getDepthForMarket,
+  // Item 109. The book as the socket last saw it, read after a kill. Cache
+  // only, never a network call. Injected for the same reason as above.
+  peekBook = getClobWsBook,
 }) {
   if (cfg.clobArbEnabled === false) return null;
   /**
@@ -498,7 +502,7 @@ export async function detectAndExecuteArbPackage({
   let downShares = 0;
 
   try {
-    upShares = await executeArbLeg({ outcome: 'up', price: upAsk, cost: costUp, shares, pkg, market, executeTrade, mode, depth });
+    upShares = await executeArbLeg({ outcome: 'up', price: upAsk, cost: costUp, shares, pkg, market, executeTrade, mode, depth, peekBook });
 
     if (upShares > 0) {
       // 40ms interval ensures distinct millisecond timestamps and strictly increasing nonces on CLOB
@@ -625,7 +629,7 @@ export async function detectAndExecuteArbPackage({
         );
       }
       downShares = await executeArbLeg({
-        outcome: 'down', price: signedDownAsk, cost: downCostActual, shares: upShares, pkg, market, executeTrade, mode, depth: leg2Depth,
+        outcome: 'down', price: signedDownAsk, cost: downCostActual, shares: upShares, pkg, market, executeTrade, mode, depth: leg2Depth, peekBook,
       });
       }
     }
@@ -779,7 +783,7 @@ export async function detectAndExecuteArbPackage({
   }
 }
 
-async function executeArbLeg({ outcome, price, cost, shares, pkg, market, executeTrade, mode = 'paper', depth = null }) {
+async function executeArbLeg({ outcome, price, cost, shares, pkg, market, executeTrade, mode = 'paper', depth = null, peekBook = null }) {
   const plan = {
     symbol: market.symbol,
     slug: market.slug,
@@ -849,6 +853,32 @@ async function executeArbLeg({ outcome, price, cost, shares, pkg, market, execut
     leg.error = res?.ok === true ? null : (res?.rawError || res?.error || 'unknown');
     leg.reconcile = res?.reconcile || null;
     leg.orderId = res?.position?.orderId ?? res?.orderId ?? leg.orderId ?? null;
+    // Item 109: how long the venue took to answer, and, when it refused, what
+    // the book looked like just after. Live only: this is about the venue.
+    const respondedAt = Date.now();
+    leg.transitMs = respondedAt - submittedAt;
+    if (mode === 'live' && res?.ok !== true) {
+      let after = null;
+      try { after = peekBook ? peekBook(leg.tokenId) : null; } catch { after = null; }
+      const snap = after && Number(after.bestAsk) > 0
+        ? {
+          bestAsk: Number(after.bestAsk),
+          bestAskSize: Number(after.bestAskSize) || 0,
+          bestBid: Number(after.bestBid) || null,
+          bookTs: Number(after.ts) || null,
+          ageMs: after.ts ? respondedAt - Number(after.ts) : null,
+          stale: !!after.stale,
+        }
+        : null;
+      const before = depth?.[outcome]
+        ? { bestAsk: Number(depth[outcome].bestAsk) || null, bestAskSize: Number(depth[outcome].bestAskSize) || null }
+        : null;
+      leg.kill = {
+        before,
+        after: snap,
+        cause: classifyKill({ after: snap, signedPrice: price, requestedShares: shares, submittedAt }),
+      };
+    }
     // Item 105: what this leg actually cost, as the fill path recorded it.
     leg.fill = res?.ok === true ? (res?.position?.fill ?? null) : null;
   }
@@ -889,6 +919,37 @@ async function executeArbLeg({ outcome, price, cost, shares, pkg, market, execut
  * have to change together, and the invariant that catches it is
  * "cash reconciles to trades + fees + open cost".
  */
+
+/**
+ * Why a refused leg was refused, as far as the book the bot can see says
+ * (item 109).
+ *
+ * 2026-09-22's package records rule out a stale snapshot: leg 1 is killed on
+ * books a few tens of milliseconds old. The ask goes somewhere between dispatch
+ * and the venue. This names where, from the socket's book just after the kill:
+ *
+ *   ask_moved_up    best ask now above the bound: the price moved in transit
+ *   size_thinned    best ask still within the bound, but less size than asked
+ *                   for: someone else took it first
+ *   unchanged       the book shows enough size at a price within the bound:
+ *                   the ask was not executable, or the book is not what the
+ *                   venue matched against
+ *   no_book_update  the socket has delivered nothing since dispatch, so the
+ *                   "after" book is the "before" book and says nothing
+ *   unknown         no socket book at all
+ *
+ * Leg 1 is signed at the ask with no buffer, so only the best level can fill
+ * it, which is why best-level size is the test. The socket lags the venue, so
+ * a single classification is weak evidence. The distribution over many kills
+ * is the measurement.
+ */
+export function classifyKill({ after, signedPrice, requestedShares, submittedAt = null }) {
+  if (!after || !(Number(after.bestAsk) > 0)) return 'unknown';
+  if (submittedAt != null && after.bookTs != null && after.bookTs <= submittedAt) return 'no_book_update';
+  if (Number(after.bestAsk) > Number(signedPrice) + 1e-9) return 'ask_moved_up';
+  if (Number(after.bestAskSize) < Number(requestedShares)) return 'size_thinned';
+  return 'unchanged';
+}
 
 /**
  * After leg 1 fills, the cheaper of the two ways out (item 106).

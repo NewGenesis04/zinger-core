@@ -44,7 +44,7 @@ const ms = (v) => (v == null ? '    —' : String(Math.round(v)).padStart(5));
 const usd = (v) => (v == null ? '     —' : `${v >= 0 ? '+' : '-'}$${Math.abs(v).toFixed(2)}`.padStart(6));
 
 console.log(`${packages.length} ${mode} package(s) in ${dbPath}\n`);
-console.log('created (UTC)        status   gap     up age  dn age  dn src   slip   realized  slug / venue');
+console.log('created (UTC)        status   gap     up age  dn age  dn src   slip   realized  transit  kill cause      slug / venue');
 for (const p of packages.sort((a, b) => a.createdAt - b.createdAt)) {
   const up = p.legs?.up || {};
   const dn = p.legs?.down || {};
@@ -57,8 +57,19 @@ for (const p of packages.sort((a, b) => a.createdAt - b.createdAt)) {
     String(dn.bookSource || '—').padEnd(8),
     usd(p.slippageUsd),
     usd(p.realizedPnlUsd).padStart(8),
-    ` ${p.slug}${err ? `  ${err.slice(0, 90)}` : ''}`,
+    ms(killedLeg(p)?.transitMs ?? up.transitMs).padStart(8),
+    String(killedLeg(p)?.kill?.cause || '—').padEnd(15),
+    `${p.slug}${err ? `  ${err.slice(0, 90)}` : ''}`,
   ].join(' '));
+}
+
+/** The leg the venue refused, if one was: leg 1 when it died, else leg 2. */
+function killedLeg(p) {
+  const up = p.legs?.up;
+  const dn = p.legs?.down;
+  if (up?.kill) return up;
+  if (dn?.kill) return dn;
+  return null;
 }
 
 /** Outcome counts per bucket: did both legs fill at the prices we signed? */
@@ -93,6 +104,29 @@ table('By leg-1 book age at dispatch', (p) => {
   if (a == null) return null;
   return a < 250 ? '<250ms' : a < 1000 ? '250ms–1s' : a < 5000 ? '1–5s' : '≥5s';
 });
+
+// Item 109, second measurement: recorded from 2026-09-22 on.
+const kills = packages.map(killedLeg).filter(Boolean);
+if (kills.length) {
+  const causes = new Map();
+  for (const leg of kills) causes.set(leg.kill.cause, (causes.get(leg.kill.cause) || 0) + 1);
+  console.log('\nKill cause (from the socket book just after each refusal)');
+  for (const [cause, n] of [...causes].sort((a, b) => b[1] - a[1])) {
+    console.log(`${cause.padEnd(16)} ${String(n).padStart(3)}  ${((n / kills.length) * 100).toFixed(0)}%`);
+  }
+  const median = (xs) => {
+    const v = xs.filter((x) => Number.isFinite(x)).sort((a, b) => a - b);
+    return v.length ? v[Math.floor(v.length / 2)] : null;
+  };
+  const filledTransit = packages.flatMap((p) => [p.legs?.up, p.legs?.down])
+    .filter((l) => l?.filled && Number.isFinite(l.transitMs)).map((l) => l.transitMs);
+  console.log(`\nMedian transit (dispatch → response): killed ${median(kills.map((l) => l.transitMs)) ?? '—'} ms`
+    + ` over ${kills.length}, filled ${median(filledTransit) ?? '—'} ms over ${filledTransit.length}`);
+  console.log('Read: mostly ask_moved_up → prices move within transit (placement / latency).');
+  console.log('      mostly size_thinned → another taker gets there first (queue).');
+  console.log('      mostly unchanged → the ask was not executable liquidity (strategy).');
+  console.log('      mostly no_book_update → the socket is too slow to judge; widen the sample or read REST.');
+}
 
 console.log('\nRead: if wide gaps and old leg-1 books both concentrate in the aborted and');
 console.log('one-leg columns, the stale-quote mechanism in item 109 holds, and the fix is');

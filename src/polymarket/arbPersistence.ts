@@ -38,6 +38,14 @@ export interface ArbLegInfo {
     feeUsd: number;
     priceSource: string;
   } | null;
+  /** Item 109: dispatch to response, in ms, as seen by the engine. */
+  transitMs?: number | null;
+  /** Item 109: the book before dispatch and just after a refusal, and what that implies. */
+  kill?: {
+    before: { bestAsk: number | null; bestAskSize: number | null } | null;
+    after: { bestAsk: number; bestAskSize: number; bestBid: number | null; bookTs: number | null; ageMs: number | null; stale: boolean } | null;
+    cause: string;
+  } | null;
   /** Item 80: how an unconfirmed leg was resolved, if it had to be. */
   reconcile?: { outcome: string; door: string | null; probes: number } | null;
 }
