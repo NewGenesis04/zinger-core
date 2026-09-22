@@ -6142,6 +6142,18 @@ An outside review (Gemini) recommended "never buy leg 2 above $1.00; unwind leg
 
 **Not fixed.** Changes money-path behaviour.
 
+**Proposal 2026-09-22, awaiting operator approval (not implemented).** After leg 1
+fills, re-read **both** books (the DOWN ask *and* the UP bid). Take the hedge
+when `signedDownAsk ≤ (1 − upBid) + k` ticks, else unwind. Here `k` is the
+premium charged to the unwind for its naked settlement-credit window (§9d,
+~2–3s, with no measured variance). Fees drop out of the comparison: both
+branches pay `rate·p(1−p)` at the same `p` when `p = 1 − bid`. The fixed 3% cap
+stops being the decision. Keeping it as an outer bound would force an exit
+anyway, so the proposal is to keep it only as an alert threshold. Open for
+the operator: the value of `k` (1 tick proposed), and whether to keep the cap as
+a hard bound. Cost: the re-read covers two tokens instead of one (free from the
+WS cache, one extra REST call through the proxy when the cache is cold).
+
 ---
 
 ### 107. The instant CTF merge is dead code that fails silently
@@ -6165,6 +6177,14 @@ auto-redeem (item 103).
 **Not fixed.** Remove it, or make it say it's inactive. Wiring it up would be a
 new on-chain signing path, which is an architectural decision.
 
+**Fixed 2026-09-22 (uncommitted): removed.** The call site in `arbEngine.ts` and
+the `instantCtfMerge` config key are gone. `ctf/merge.ts` and its unit tests
+remain as a module with no caller. The old integration test drove the dead
+branch by injecting a `walletClient` that production never sets. It is replaced
+by the opposite invariant: a live package locks without calling the merge,
+even when handed a wallet client (`tests/unit/ctfMerge.test.ts`). Persisted
+configs may still carry the key, which is now read by nothing.
+
 ---
 
 ### 108. Sell-all sells tokens without checking Polymarket still holds them
@@ -6186,6 +6206,14 @@ open (`:4707-4709`), so Sell All can't clear a ghost either.
 
 **Not fixed.** Low priority once item 103 lands. Checking inventory first would
 also let Sell All reconcile ghosts instead of failing on them.
+
+**Fixed 2026-09-22 (uncommitted).** `executeSell` refuses a live position past
+its window end, because that position closes at resolution (item 103), and a
+redeemed winner written off as a ghost would lose its payout. Otherwise it
+makes the item-113 inventory check (`resolveExitShares`): a ghost is reconciled
+(`{ ok: true, reconciled: true }`), and a sell is clamped to what the wallet
+holds, with the booked shares matching what was sold. Pinned by a source check
+in `tests/unit/invariants.exitInventory.test.ts`.
 
 ---
 
@@ -6222,6 +6250,11 @@ break-even, and 12 got past it. Qualifying gaps are rare.
 **Not fixed. Two data points.** Settle from package records, not from these two
 opens.
 
+**2026-09-22: measurement tool added, not decided.** `scripts/arb-book-age.mjs`
+(read-only) tabulates package outcome against gap and leg-1 book age, from the
+package records. Run it on the VPS (`node scripts/arb-book-age.mjs
+data/zinger.db`). Item 110 now also records book ages for capacity refusals.
+
 ---
 
 ### 110. A refusal that passed every gate leaves no row
@@ -6240,6 +6273,11 @@ capacity refusal: that book passed every gate and was a trade in all but slot.
 per-slug throttle (`THROTTLE_MS`, `decisionSink.ts:89`). It's a telemetry
 policy change, so it's the operator's call.
 
+**Fixed 2026-09-22 (uncommitted), operator go-ahead.** `package_capacity_full`
+moved to `PERSISTED_CODES` (one row per slug per window). The refusal now
+records both books' ages (`operands.bookAgeMs`) for item 109. Pinned by
+`arbDecisionSink.test.ts`, which produces the row through the real engine.
+
 ---
 
 ### 111. WebSocket disconnects and errors are reported nowhere
@@ -6257,6 +6295,12 @@ started.
 
 **Not fixed.** Send reconnects (with cause and time since last message) to the
 persisted action log via `log()`, not only the console.
+
+**Fixed 2026-09-22 (uncommitted).** `clobWs.ts` reports transitions, not
+attempts, through `onClobWsStatus`: a drop (cause, code, time since last
+message) and a recovery (downtime, attempts). The pure `wsTransition` decides
+what to report. `bot.ts` writes both to the persisted action log
+(`📡 CLOB WS DOWN` / `RECONNECTED`). Pinned by `tests/unit/clobWsStatus.test.ts`.
 
 ---
 
@@ -6279,6 +6323,13 @@ graph for 09:00–10:00 on 2026-09-20 is the only independent record.
 
 **Not fixed. Open investigation.** Relevant to item 92's quota concern if it's
 the proxy.
+
+**2026-09-22.** Nothing can be recovered from the bot for 2026-09-20, because
+item 111 had not landed. From the next deploy, `📡 CLOB WS DOWN` lines in the
+action log date any socket outage, and a slowdown that coincides with one
+points at REST fallback. The Webshare usage graph for 09:00–10:00 on
+2026-09-20 remains the only independent record for the original event
+(operator).
 
 ---
 
@@ -6355,6 +6406,10 @@ The problem is an unverified domain claim sitting in source.
 
 **Not fixed. Low priority.**
 
+**Fixed 2026-09-22 (uncommitted).** A flat window resolves Up. `settle.test.ts`
+had pinned the old answer ('down'). That was a snapshot of the defect, and it is
+corrected to cite the rule.
+
 ---
 
 ### 116. Package net profit leaves out every aborted package's unwind loss
@@ -6372,6 +6427,15 @@ dashboard shows only the win rate. `netProfitUsd` reaches `/api/poly/packages`
 The direction is to include ABORTED packages' closed trades in net profit,
 reported separately as `abortCostUsd` so the arb edge and the execution cost
 stay distinguishable.
+
+**Fixed 2026-09-22 (uncommitted), operator go-ahead.** `netProfitUsd` =
+`settledProfitUsd` + `abortCostUsd`, both exposed. `unwindLeg` books its P/L on
+the package (`realizedPnlUsd`) and saves it, since not every caller saves the
+package after an unwind. For live, the unwind P/L now comes from the entry fill
+(cost and fee, item 105), where it used to use the signed limit and no entry
+fee. Paper is unchanged. `realizedPnlFor` gives an abort with no filled leg a
+known 0, and a filled leg with no closed trade `null`. Pinned by
+`tests/unit/invariants.abortCost.test.ts`.
 
 ---
 

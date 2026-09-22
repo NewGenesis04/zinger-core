@@ -74,3 +74,48 @@ describe('INVARIANT: a sell is clamped to what the wallet is known to hold', () 
     }
   });
 });
+
+import { readFileSync } from 'fs';
+import { fileURLToPath } from 'url';
+
+/**
+ * Item 108. `executeSell` (dashboard sell, Sell All) placed a live sell with no
+ * inventory check, and against a redeemed token the venue answered
+ * `invalid token id` and the position stayed open for good. It now makes the
+ * same check as every other exit, and leaves anything past its window end to
+ * the resolution closer.
+ */
+function checkManualSell(src) {
+  const start = src.indexOf('async function executeSell(pos, reason');
+  if (start < 0) throw new Error('executeSell not found');
+  const body = src.slice(start, src.indexOf('\n}\n', start));
+  const sellAt = body.indexOf('placeMarketSell(');
+  if (sellAt < 0) throw new Error('executeSell no longer sells');
+  const guardAt = body.indexOf('Date.now() >= windowEndMs');
+  const checkAt = body.indexOf('await resolveExitShares(');
+  if (guardAt < 0 || guardAt > sellAt) throw new Error('no window-end guard before the sell');
+  if (checkAt < 0 || checkAt > sellAt) throw new Error('no inventory check before the sell');
+  if (!/shares: held\.shares,/.test(body.slice(sellAt, sellAt + 200))) throw new Error('the sell is not clamped to what is held');
+}
+
+describe('INVARIANT: a manual sell checks the wallet first (item 108)', () => {
+  const src = readFileSync(fileURLToPath(new URL('../../src/polymarket/bot.ts', import.meta.url)), 'utf8');
+
+  it('holds for the real source', () => {
+    expect(() => checkManualSell(src)).not.toThrow();
+  });
+
+  it('fails without the inventory check, the guard, or the clamp', () => {
+    const noCheck = src.replace(
+      "const held = await resolveExitShares(pos, positionShares(pos), botState.readiness?.positions || []);",
+      "const held = { action: 'sell', shares: positionShares(pos) };",
+    );
+    expect(noCheck).not.toBe(src);
+    expect(() => checkManualSell(noCheck)).toThrow(/inventory check/);
+    const noGuard = src.replace('if (windowEndMs != null && Date.now() >= windowEndMs) {', 'if (false) {');
+    expect(() => checkManualSell(noGuard)).toThrow(/window-end guard/);
+    const noClamp = src.replace(/(placeMarketSell\(\{\s*tokenId: pos\.tokenId,\s*)shares: held\.shares,/, '$1shares: positionShares(pos),');
+    expect(noClamp).not.toBe(src);
+    expect(() => checkManualSell(noClamp)).toThrow(/clamped/);
+  });
+});

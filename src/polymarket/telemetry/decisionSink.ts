@@ -58,6 +58,11 @@ export const PERSISTED_CODES = new Set([
   'leg_below_min_notional',
   'insufficient_live_cash',
   'insufficient_paper_cash',
+  // A book that cleared every gate and was refused only for a slot: a trade in
+  // all but capacity, so it is a decision about this book, not standing state
+  // (item 110). Its asks, gap and book age are what tell a real opportunity
+  // from a stale quote (item 109).
+  'package_capacity_full',
 ]);
 
 /**
@@ -68,7 +73,6 @@ export const PERSISTED_CODES = new Set([
 export const COUNTED_CODES = new Set([
   'gap_below_breakeven',
   'gap_below_operator_floor',
-  'package_capacity_full',
   'package_already_on_slug',
   'live_not_ready',
 ]);

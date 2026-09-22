@@ -7,7 +7,6 @@ import {
 } from './fees.js';
 import { buyCeiling } from './trade.js';
 import { getDepthForMarket } from './clob.js';
-import { executeCtfMerge } from './ctf/merge.js';
 import { emitEvent } from './telemetry/events.js';
 import { isArbHalted } from './arbReconcile.js';
 import type { ArbPackage } from './arbPersistence.js';
@@ -216,7 +215,13 @@ export async function detectAndExecuteArbPackage({
   const maxPkgs = Number(cfg.maxArbPackages ?? 4);
   if (slotPkgs.length >= maxPkgs) {
     arbDecision('skip', 'package_capacity_full',
-      { active: slotPkgs.length, max: maxPkgs, awaitingSettlement: activePkgs.length - slotPkgs.length },
+      {
+        active: slotPkgs.length, max: maxPkgs, awaitingSettlement: activePkgs.length - slotPkgs.length,
+        bookAgeMs: {
+          up: depth?.up?.bookTs ? Date.now() - Number(depth.up.bookTs) : null,
+          down: depth?.down?.bookTs ? Date.now() - Number(depth.down.bookTs) : null,
+        },
+      },
       { breakEvenGap, requiredGap });
     return null;
   }
@@ -710,45 +715,9 @@ export async function detectAndExecuteArbPackage({
         );
       }
 
-      // Instant On-Chain CTF Merge / Burn Trigger (Live Mode)
-      if (cfg?.instantCtfMerge !== false && mode === 'live' && (botState?.walletClient || botState?.signer)) {
-        const mergeRes = await executeCtfMerge({
-          conditionId: market.conditionId,
-          // Only the matched pair can be merged back to collateral; any residual
-          // on one side has no complement to burn against.
-          shares: matched,
-          collateralToken: market.collateralToken,
-          walletClient: botState.walletClient || botState.signer,
-          publicClient: botState.publicClient,
-        });
-
-        if (mergeRes?.ok) {
-          pkg.status = 'MERGED';
-          pkg.mergedAt = Date.now();
-          pkg.mergeTxHash = mergeRes.txHash;
-          savePackage(pkg);
-
-          emitEvent('package.settlement', {
-            packageId,
-            symbol: market.symbol,
-            slug: market.slug,
-            action: 'instant_ctf_merge',
-            shares,
-            lockedProfitUsd,
-            txHash: mergeRes.txHash,
-            mode: 'live',
-          });
-
-          if (log) {
-            log(
-              `📦 INSTANT CTF MERGE: ${shares} sh burned on-chain → $${shares.toFixed(2)} USDC returned (tx: ${mergeRes.txHash})`,
-              'system',
-              { packageId, txHash: mergeRes.txHash, shares },
-            );
-          }
-        }
-      }
-
+      // A locked package exits through the account's auto-redeem once the
+      // market resolves, and `closeResolvedPositions` closes its books. The bot
+      // performs no on-chain merge (item 107): that would be a new signing path.
       return pkg;
     }
 
@@ -1116,7 +1085,13 @@ async function unwindLeg({ outcome, pkg, market, mode, cfg, botState, log, adjus
   const exitPx = realisedExit != null ? realisedExit : price;
   const pack = closeProceedsWithFee(shares, exitPx, cfg?.feeCategory || 'crypto', 'arb_rollback');
   const exitFee = feeOn ? pack.fee : 0;
-  const entryFee = Number(pos.entryFee || 0);
+  // Live entries carry what they actually cost (item 105): the signed limit is
+  // not the price paid, and live positions record no `entryFee`. Paper keeps
+  // its model, where the two agree by construction.
+  const fill = mode === 'live' && Number(pos.fill?.shares) > 0 ? pos.fill : null;
+  const fillShare = fill ? shares / Number(fill.shares) : null;
+  const entryCost = fill ? Number(fill.costUsd) * fillShare : price * shares;
+  const entryFee = fill ? Number(fill.feeUsd || 0) * fillShare : Number(pos.entryFee || 0);
 
   pos.closed = true;
   pos.exitPrice = exitPx;
@@ -1125,7 +1100,7 @@ async function unwindLeg({ outcome, pkg, market, mode, cfg, botState, log, adjus
   pos.feesPaid = Math.round((entryFee + exitFee) * 1e5) / 1e5;
   // The spread between entry and exit is a real loss, not a rounding artefact:
   // 26 shares bought at $0.33 and sold at $0.32 is -$0.26 before either fee.
-  pos.pnl = Math.round(((exitPx - price) * shares - entryFee - exitFee) * 100) / 100;
+  pos.pnl = Math.round((exitPx * shares - entryCost - entryFee - exitFee) * 100) / 100;
 
   if (mode === 'paper' && typeof adjustPaperCash === 'function') {
     const refund = Math.round((pack.premium - exitFee) * 100) / 100;
@@ -1135,6 +1110,12 @@ async function unwindLeg({ outcome, pkg, market, mode, cfg, botState, log, adjus
   if (saveTrade) {
     saveTrade({ ...pos, timestamp: Date.now() });
   }
+
+  // The unwind's loss belongs to the package (item 116), on the record that
+  // outlives the capped trade log. Saved here because not every caller saves
+  // the package after an unwind.
+  pkg.realizedPnlUsd = Math.round((Number(pkg.realizedPnlUsd || 0) + pos.pnl) * 100) / 100;
+  savePackage(pkg);
 
   if (log) {
     log(
@@ -1353,6 +1334,14 @@ function finishingTrades(pkg, trades = []) {
 export function realizedPnlFor(pkg, trades = []): number | null {
   const recorded = Number(pkg?.realizedPnlUsd);
   if (pkg?.realizedPnlUsd != null && Number.isFinite(recorded)) return recorded;
+  if (pkg?.status === 'ABORTED') {
+    // An abort's cost is whatever its unwinds realized. With no leg filled
+    // there was nothing to unwind: zero, and known. A filled leg with no
+    // closed trade is still held, or its trade has left the log: unknown.
+    const closed = trades.filter((t) => t.packageId === pkg.packageId && t.closed);
+    if (closed.length) return Math.round(closed.reduce((s, t) => s + tradePnl(t), 0) * 100) / 100;
+    return pkg.legs?.up?.filled || pkg.legs?.down?.filled ? null : 0;
+  }
   const legs = finishingTrades(pkg, trades);
   if (!legs) return null;
   return Math.round(legs.reduce((s, t) => s + tradePnl(t), 0) * 100) / 100;
@@ -1416,11 +1405,17 @@ export function getArbPackageMetrics(mode = 'paper', trades = []) {
 
   const realized = settled.map((p) => realizedPnlFor(p, trades));
   const known = realized.filter((v): v is number => v != null);
+  // Item 116: an aborted package that unwound a leg lost real money. It used to
+  // count as a non-win in the win rate while its loss never reached net profit.
+  const abortRealized = aborted.map((p) => realizedPnlFor(p, trades));
+  const abortKnown = abortRealized.filter((v): v is number => v != null);
 
   const concludedCount = settled.length + aborted.length;
   // An unknown result is not a loss, so it stays out of the win-rate denominator.
   const judgedCount = known.length + aborted.length;
-  const netProfitUsd = Math.round(known.reduce((sum, v) => sum + v, 0) * 100) / 100;
+  const settledProfitUsd = Math.round(known.reduce((sum, v) => sum + v, 0) * 100) / 100;
+  const abortCostUsd = Math.round(abortKnown.reduce((sum, v) => sum + v, 0) * 100) / 100;
+  const netProfitUsd = Math.round((settledProfitUsd + abortCostUsd) * 100) / 100;
   const winCount = known.filter((v) => v > 0).length;
   const winRatePct = judgedCount > 0 ? Math.round((winCount / judgedCount) * 1000) / 10 : 0;
 
@@ -1432,9 +1427,13 @@ export function getArbPackageMetrics(mode = 'paper', trades = []) {
     concludedCount,
     winCount,
     winRatePct,
-    netProfitUsd: Math.round(netProfitUsd * 100) / 100,
-    // Settled packages with no realized figure on record: left out of net
-    // profit and win count rather than counted at their planned profit.
-    unknownRealizedCount: realized.length - known.length,
+    // Net = what settled packages made + what aborted packages cost to unwind.
+    // Kept apart so the arb edge and the execution cost stay distinguishable.
+    netProfitUsd,
+    settledProfitUsd,
+    abortCostUsd,
+    // Packages with no realized figure on record: left out of the sums rather
+    // than counted at their planned profit (settled) or at zero (aborted).
+    unknownRealizedCount: (realized.length - known.length) + (abortRealized.length - abortKnown.length),
   };
 }

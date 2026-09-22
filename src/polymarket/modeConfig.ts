@@ -60,7 +60,6 @@ export const STRATEGY_KEYS = [
   'feeCategory',
   'minTpUsd',
   'requireDataAssurance',
-  'instantCtfMerge',
 ];
 
 export function defaultPaperStrategy() {
@@ -189,7 +188,6 @@ export function defaultPaperStrategy() {
     underdogMaxPrice: 0.42,
     holdToSettleDisasterSlPct: 42,
     allowScaleIn: false,
-    instantCtfMerge: true,
   };
 }
 
@@ -236,7 +234,6 @@ export function defaultLiveStrategy() {
     requireTightSpread: true,
     useAggressiveScaling: false,
     maxOpenDrawdownPct: 0.05,
-    instantCtfMerge: true,
   };
 }
 

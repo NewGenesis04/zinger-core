@@ -109,6 +109,65 @@ let connectCount = 0;
 let msgCount = 0;
 let staleReconnects = 0;
 
+/**
+ * Feed status, reported as transitions rather than attempts (item 111).
+ *
+ * While the socket is down, book reads fall back to REST through the metered
+ * proxy (items 92, 96), so when an outage began, why, and how long it lasted
+ * are what cost money. A reconnect loop retries every `RECONNECT_MS`, and
+ * logging each attempt would bury that. So this reports two things: the drop,
+ * with its cause and how long the feed had been silent, and the recovery, with
+ * the downtime and the number of attempts.
+ *
+ * Pure, so the transitions are testable without a socket.
+ */
+export function wsTransition(state, ev, now = Date.now()) {
+  const st = { downSince: null, attempts: 0, pendingCause: null, ...state };
+  switch (ev.type) {
+    case 'stale':
+      return { state: { ...st, pendingCause: `feed silent ${Math.round((ev.silentMs || 0) / 1000)}s while connected` }, report: null };
+    case 'error':
+      // The library closes after an error; the close carries the report.
+      return { state: { ...st, pendingCause: st.pendingCause || `error: ${String(ev.message || 'unknown').slice(0, 120)}` }, report: null };
+    case 'close': {
+      const cause = st.pendingCause || `closed (code ${ev.code ?? '?'}${ev.reason ? `, ${ev.reason}` : ''})`;
+      if (st.downSince == null) {
+        return {
+          state: { downSince: now, attempts: 1, pendingCause: null },
+          report: { kind: 'down', cause, code: ev.code ?? null, sinceLastMsgMs: ev.lastMsgAt ? now - ev.lastMsgAt : null },
+        };
+      }
+      return { state: { ...st, attempts: st.attempts + 1, pendingCause: null }, report: null };
+    }
+    case 'open':
+      if (st.downSince == null) return { state: st, report: null };
+      return {
+        state: { downSince: null, attempts: 0, pendingCause: null },
+        report: { kind: 'up', downMs: now - st.downSince, attempts: st.attempts },
+      };
+    default:
+      return { state: st, report: null };
+  }
+}
+
+const statusListeners = new Set();
+let wsStatus = { downSince: null, attempts: 0, pendingCause: null };
+
+function noteWs(ev) {
+  const { state, report } = wsTransition(wsStatus, ev);
+  wsStatus = state;
+  if (!report) return;
+  for (const fn of statusListeners) {
+    try { fn(report); } catch {}
+  }
+}
+
+/** Subscribe to feed drops and recoveries. Returns an unsubscribe function. */
+export function onClobWsStatus(fn) {
+  statusListeners.add(fn);
+  return () => statusListeners.delete(fn);
+}
+
 function emit(tokenId, snap) {
   for (const fn of listeners) {
     try { fn(tokenId, snap); } catch {}
@@ -265,6 +324,7 @@ function connect() {
     // A fresh socket has delivered nothing yet; without this the staleness check
     // would judge it on the previous connection's last message.
     lastMsgAt = Date.now();
+    noteWs({ type: 'open' });
     sendSubscribe([...desired]);
     if (pingTimer) clearInterval(pingTimer);
     pingTimer = setInterval(() => {
@@ -276,18 +336,21 @@ function connect() {
       if (isStreamStale({ connected: true, subscribed: desired.size, lastMsgAt })) {
         staleReconnects += 1;
         console.warn(`[clob-ws] feed silent ${Math.round((Date.now() - lastMsgAt) / 1000)}s while connected — reconnecting (${staleReconnects})`);
+        noteWs({ type: 'stale', silentMs: Date.now() - lastMsgAt });
         try { ws.close(); } catch {}
       }
     }, PING_MS);
   });
   ws.on('message', handleMessage);
-  ws.on('close', () => {
+  ws.on('close', (code, reason) => {
     ws = null;
+    if (running) noteWs({ type: 'close', code, reason: reason ? String(reason) : '', lastMsgAt });
     if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
     if (!running) return;
     reconnectTimer = setTimeout(connect, RECONNECT_MS);
   });
-  ws.on('error', () => {
+  ws.on('error', (err) => {
+    noteWs({ type: 'error', message: err?.message });
     try { ws?.close(); } catch {}
   });
 }

@@ -50,8 +50,8 @@ describe('Feature: Instant On-Chain CTF Merge (mergePositions)', () => {
     });
   });
 
-  describe('arbEngine instant merge integration & telemetry', () => {
-    it('executes instant CTF merge and emits package.settlement event upon fill', async () => {
+  describe('item 107: the engine performs no on-chain merge', () => {
+    it('locks a live package without calling the merge, even when handed a wallet client', async () => {
       const market = {
         symbol: 'BTC',
         slug: 'btc-updown-5m-1787000000',
@@ -60,58 +60,31 @@ describe('Feature: Instant On-Chain CTF Merge (mergePositions)', () => {
         tokenIds: { up: 'token-up', down: 'token-down' },
         acceptingOrders: true,
       };
-
-      // Models a full live fill: executePendingTrade always returns a position
-      // carrying the matched share count, because the arb path proves that count
-      // against the order receipt before building one. Echoing the requested
-      // size is what "both legs filled completely" looks like.
       const executeTrade = vi.fn().mockImplementation(
         async (pending) => ({ ok: true, position: { shares: pending.plan.shares } }),
       );
-      const adjustPaperCash = vi.fn();
-      const saveTrade = vi.fn();
       const mockWalletClient = {
         account: { address: '0x1111111111111111111111111111111111111111' },
         writeContract: vi.fn().mockResolvedValue('0xtxhash456'),
       };
-      const botState = { positions: [], walletClient: mockWalletClient };
-
       const pkg = await detectAndExecuteArbPackage({
         market,
         depth: { up: { bestAsk: 0.35, bestAskSize: 5000 }, down: { bestAsk: 0.55, bestAskSize: 5000 } },
         prices: { up: 0.35, down: 0.55 },
-        cfg: {
-          clobArbEnabled: true,
-          minArbGap: 0.01,
-          simulateClobFees: true,
-          instantCtfMerge: true,
-          paperBankroll: 100,
-          arbBankrollFrac: 0.1,
-          arbMaxUsd: 10,
-        },
+        cfg: { clobArbEnabled: true, minArbGap: 0.01, simulateClobFees: true, paperBankroll: 100, arbBankrollFrac: 0.1, arbMaxUsd: 10 },
         mode: 'live',
-        // A funded live account. Required since the affordability gate covers
-        // live as well as paper: without it `arbBank` is 0 and the package is
-        // correctly refused before it can reach the merge path under test.
         readiness: { spendableBalance: 500, liveReady: true },
         log: () => {},
         executeTrade,
-        adjustPaperCash,
-        saveTrade,
-        botState,
+        adjustPaperCash: vi.fn(),
+        saveTrade: vi.fn(),
+        botState: { positions: [], walletClient: mockWalletClient, signer: mockWalletClient },
       });
-
-      expect(pkg).not.toBeNull();
-      expect(pkg?.status).toBe('MERGED');
-      expect(pkg?.mergedAt).toBeDefined();
-      expect(pkg?.mergeTxHash).toBe('0xtxhash456');
-
-      // Check telemetry event bus
-      const settlementEvents = queryEvents({ type: 'package.settlement', limit: 5 });
-      expect(settlementEvents.length).toBeGreaterThan(0);
-      const latest = settlementEvents[settlementEvents.length - 1];
-      expect(latest.data.action).toBe('instant_ctf_merge');
-      expect(latest.data.packageId).toBe(pkg.packageId);
+      expect(pkg?.status).toBe('LOCKED');
+      expect(mockWalletClient.writeContract).not.toHaveBeenCalled();
+      const merges = queryEvents({ type: 'package.settlement', limit: 50 })
+        .filter((e) => e.data?.packageId === pkg?.packageId && e.data?.action === 'instant_ctf_merge');
+      expect(merges).toHaveLength(0);
     });
   });
 });

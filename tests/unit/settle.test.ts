@@ -71,10 +71,11 @@ describe('resolveMarketWinner', () => {
     expect(
       resolveMarketWinner({ ptb: { openPrice: 65000, closePrice: 64900 } }),
     ).toBe('down');
-    // Exact tie resolves to down
+    // A flat window resolves Up: the rules say "greater than or equal to"
+    // (domain facts §4). This asserted 'down' until item 115.
     expect(
       resolveMarketWinner({ ptb: { openPrice: 65000, closePrice: 65000 } }),
-    ).toBe('down');
+    ).toBe('up');
   });
 
   it('resolves from finalPrice vs market priceToBeat', () => {

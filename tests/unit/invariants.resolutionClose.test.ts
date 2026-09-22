@@ -242,3 +242,12 @@ describe('INVARIANT: the closer runs every pass, walks positions, and never trad
     expect(resolutionSrc()).not.toMatch(/isArbLeg|packageId|clobArb/);
   });
 });
+
+describe('INVARIANT: paper settles a flat window the way the market rules do (item 115)', () => {
+  it('resolves close == open as Up (domain facts §4: "greater than or equal to")', async () => {
+    const { resolveMarketWinner } = await import('../../src/polymarket/positions/settle.js');
+    expect(resolveMarketWinner({ ptb: { openPrice: 100, closePrice: 100 } })).toBe('up');
+    expect(resolveMarketWinner({ ptb: { openPrice: 100, closePrice: 99.99 } })).toBe('down');
+    expect(resolveMarketWinner({ ptb: { openPrice: 100, closePrice: 100.01 } })).toBe('up');
+  });
+});

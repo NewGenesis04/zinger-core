@@ -151,6 +151,49 @@ describe('INVARIANT: depth_unknown survives any filtering', () => {
   });
 });
 
+describe('INVARIANT: a book refused only for capacity leaves a row (item 110)', () => {
+  it('persists package_capacity_full, with the book age the engine attaches', async () => {
+    expect(PERSISTED_CODES.has('package_capacity_full')).toBe(true);
+    expect(COUNTED_CODES.has('package_capacity_full')).toBe(false);
+
+    // Produced by the real engine, so the payload is the producer's, not a
+    // hand-built one: one package already holding the only slot.
+    const { detectAndExecuteArbPackage } = await import('../../src/polymarket/arbEngine.js');
+    const { saveAllPackages } = await import('../../src/polymarket/arbPersistence.js');
+    const openWindow = `btc-updown-5m-${Math.floor(Date.now() / 1000)}`;
+    saveAllPackages([{ packageId: 'holder', mode: 'live', status: 'LOCKED', slug: openWindow, legs: {} }]);
+    const bookTs = Date.now() - 1_500;
+    const pkg = await detectAndExecuteArbPackage({
+      market: {
+        symbol: 'ETH', slug: 'eth-cap-e2e', conditionId: '0xcap', outcomes: ['Up', 'Down'],
+        tokenIds: { up: 'u', down: 'd' }, acceptingOrders: true,
+      },
+      depth: { up: { bestAsk: 0.46, bestAskSize: 500, bookTs }, down: { bestAsk: 0.46, bestAskSize: 500, bookTs } },
+      prices: { up: 0.46, down: 0.46 },
+      cfg: {
+        clobArbEnabled: true, minArbGap: 0.01, maxArbPackages: 1, arbLeg2BufferTicks: 0,
+        arbLeg2RereadBook: false, arbBankrollFrac: 1.0, arbMaxUsd: 50, minPositionSize: 0.5,
+      },
+      mode: 'live',
+      readiness: { spendableBalance: 10_000, liveReady: true },
+      log: () => {},
+      executeTrade: async () => ({ ok: true }),
+      adjustPaperCash: () => {},
+      saveTrade: () => {},
+      botState: { config: {}, positions: [] },
+    });
+    expect(pkg).toBeNull();
+
+    const rows = rowsFor('package_capacity_full');
+    expect(rows).toHaveLength(1);
+    expect(rows[0].slug).toBe('eth-cap-e2e');
+    expect(rows[0].up_ask).toBeCloseTo(0.46, 6);
+    const operands = JSON.parse(rows[0].payload).output.skipReason.operands;
+    expect(operands.bookAgeMs.up).toBeGreaterThanOrEqual(1_500);
+    expect(operands).toMatchObject({ active: 1, max: 1 });
+  });
+});
+
 describe('INVARIANT: the throttle bounds volume without hiding the rate', () => {
   it('writes one row per code per slug per window, and counts the rest', () => {
     // A broke account emits `insufficient_live_cash` on every qualifying book

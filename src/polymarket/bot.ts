@@ -13,6 +13,7 @@ import { buildDataAssurance } from './dataAssurance.js';
 import { getPricesForMarket, getDepthForMarket } from './clob.js';
 import {
   startClobMarketStream,
+  onClobWsStatus,
   setClobMarketTokens,
   getClobWsSnapshot,
 } from './clobWs.js';
@@ -1963,6 +1964,9 @@ function summarizeBook(depth) {
       : null,
   };
 }
+
+/** One subscription to feed status for the life of the process (item 111). */
+let _wsStatusLogged = false;
 
 /** The last live equity computed from a wallet answer; the fallback when there is none. */
 let _lastGoodLiveEquity = null;
@@ -4334,6 +4338,19 @@ export function startBackgroundFeeds() {
   repairPaperOverdraft('feeds start');
 
   // Live CLOB UP/DOWN books via WebSocket (direct — not order-write proxy)
+  // Drops and recoveries go to the persisted action log (item 111): while the
+  // socket is down, book reads fall back to REST through the metered proxy.
+  if (!_wsStatusLogged) {
+    _wsStatusLogged = true;
+    onClobWsStatus((r) => {
+      if (r.kind === 'down') {
+        const quiet = r.sinceLastMsgMs != null ? ` · last message ${Math.round(r.sinceLastMsgMs / 1000)}s before` : '';
+        log(`📡 CLOB WS DOWN — ${r.cause}${quiet} · book reads fall back to REST via the proxy until it reconnects`, 'error', r);
+      } else if (r.kind === 'up') {
+        log(`📡 CLOB WS RECONNECTED after ${Math.round(r.downMs / 1000)}s, ${r.attempts} attempt(s)`, 'system', r);
+      }
+    });
+  }
   startClobMarketStream([]);
 
   // Immediate kick
@@ -4912,6 +4929,23 @@ async function executeSell(pos, reason = 'manual') {
   markPosition(pos, price);
 
   if (pos.mode === 'live' && pos.tokenId && positionShares(pos) > 0) {
+    // Item 108. After its window a position is not sold and not written off: it
+    // closes at its payout through `closeResolvedPositions`. A redeemed winner
+    // is gone from the wallet, and writing it off as a ghost would book no PnL
+    // for money that was paid.
+    const windowEndMs = positionWindowEndMs(pos);
+    if (windowEndMs != null && Date.now() >= windowEndMs) {
+      return { ok: false, error: 'window ended: this position closes at resolution, not by sale' };
+    }
+    // The same inventory check every other live exit makes (item 113), so a
+    // manual sell of a ghost clears it instead of failing on it forever.
+    const held = await resolveExitShares(pos, positionShares(pos), botState.readiness?.positions || []);
+    if (held.action === 'ghost') {
+      reconcileLiveGhostPosition(pos, botState.readiness?.positions || [], `${reason}_no_pm_inventory`);
+      saveState();
+      return { ok: true, reconciled: true };
+    }
+    if (held.action === 'wait') return { ok: false, error: 'wallet holding unconfirmed; retry shortly' };
     // Item 84 part 4. Same claim as the fast stop-loss: since that path now runs
     // on its own timer, this one can be entered concurrently with it.
     if (!claimPositionExit(pos)) {
@@ -4920,7 +4954,7 @@ async function executeSell(pos, reason = 'manual') {
     try {
       const result = await placeMarketSell({
         tokenId: pos.tokenId,
-        shares: positionShares(pos),
+        shares: held.shares,
         minPrice: sellFloor(price, { tickSize: pos.tickSize }),
         negRisk: pos.negRisk,
         tickSize: pos.tickSize,
@@ -4931,6 +4965,11 @@ async function executeSell(pos, reason = 'manual') {
       return { ok: false, error: err.message };
     }
     releasePositionExit(pos);
+    // Book what was sold, not what was recorded.
+    if (held.shares < positionShares(pos) - 1e-9) {
+      pos.shares = held.shares;
+      markPosition(pos, price);
+    }
   }
 
   pos.exitPrice = price;

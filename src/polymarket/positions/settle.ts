@@ -69,8 +69,9 @@ export function resolveMarketWinner({ market = null, ptb = null, finalPrice = nu
   if (Number.isFinite(openPrice) && openPrice > 0 && Number.isFinite(closePrice) && closePrice > 0) {
     if (closePrice > openPrice) return 'up';
     if (closePrice < openPrice) return 'down';
-    // Exact tie: Polymarket resolves tie as Down/No in standard binaries
-    return 'down';
+    // A flat window resolves Up: the market rules say Up when the close is
+    // "greater than or equal to" the open (domain facts §4).
+    return 'up';
   }
 
   return null;
