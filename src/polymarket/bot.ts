@@ -77,11 +77,13 @@ import {
   isSlugOccupied,
   exitManagedPositions,
   portfolioView as buildPortfolioView,
+  capacityHoldingCount,
 } from './positions/manager.js';
 import { holdsToSettlement, capacityFor, skipsWindowEndSale } from './positions/policy.js';
 import { settleLogKind, formatSignedUsd } from './positions/settleLog.js';
 import { resolveSettlementPrice, positionWindowEndMs } from './positions/settle.js';
 import { payoutVectorFromGamma, resolutionPollDue, resolutionOverdue, resolvedExit } from './positions/resolution.js';
+import { liveEquity } from './ledger/equity.js';
 import { decideExitShares, exitSharesFromSnapshot, GHOST_MIN_AGE_MS as DEFAULT_GHOST_MIN_AGE_MS } from './positions/inventory.js';
 import { evaluateEdgeGate, passesEdgeFilter } from './edge.js';
 import { buildDecision, resolveOrderSize, sideBalanceBonus } from './engines/directional.js';
@@ -1172,7 +1174,9 @@ async function executePendingTrade(pending) {
 
   const budget = capacityFor(plan, cfg);
   const engine = budget.engine;
-  if (countOpenPositions(cfg.mode, engine) >= budget.max) {
+  // Positions holding exposure, not positions awaiting settlement (D-B): must
+  // agree with the package gate, or a freed package slot is refused at leg 1.
+  if (capacityHoldingCount(botState.positions, { mode: cfg.mode, engine }) >= budget.max) {
     pending.status = 'skipped';
     botState._buyLocks.delete(pending.slug);
     log(`⛔ SKIP ${pending.symbol} — ${budget.label}`, 'signal');
@@ -1960,6 +1964,9 @@ function summarizeBook(depth) {
   };
 }
 
+/** The last live equity computed from a wallet answer; the fallback when there is none. */
+let _lastGoodLiveEquity = null;
+
 function buildPortfolio(readiness, mode) {
   const cfg = botState.config;
   const isPaper = mode === 'paper' || cfg.mode === 'paper';
@@ -2019,17 +2026,20 @@ function buildPortfolio(readiness, mode) {
   const cash = Number(
     readiness?.clobBalance ?? readiness?.spendableBalance ?? botState.telemetry.usdcBalance ?? 0,
   );
-  const pmPositions = readiness?.positions || [];
   const liveBotOpen = botState.positions.filter((p) => !p.closed && p.mode === 'live');
   const botTokenIds = new Set(liveBotOpen.map((p) => String(p.tokenId || '')).filter(Boolean));
-  // Only count PM inventory that matches bot opens — ignore redeemable junk / orphans in equity.
-  const pmTracked = botTokenIds.size
-    ? pmPositions.filter((p) => botTokenIds.has(String(p.asset || '')))
-    : [];
-  const pmUnrealized = pmTracked.reduce((sum, p) => sum + Number(p.cashPnl || 0), 0);
-  const openMarkValue = pmTracked.length
-    ? pmTracked.reduce((sum, p) => sum + Number(p.currentValue || 0), 0)
-    : liveBotOpen.reduce((sum, p) => sum + Number(p.markValue || 0), 0);
+  // The wallet owns "held", and the bot's marks never stand in for it (item
+  // 104). See `ledger/equity.ts`, including why a stale answer reports a whole
+  // earlier snapshot rather than today's cash plus yesterday's holdings.
+  const eq = liveEquity({
+    cash,
+    walletRows: readiness?.walletPositions ?? null,
+    trackedTokenIds: botTokenIds,
+    lastGood: _lastGoodLiveEquity,
+  });
+  if (!eq.stale) _lastGoodLiveEquity = eq;
+  const pmUnrealized = eq.pmUnrealized;
+  const openMarkValue = eq.openMarkValue;
   const openCostBasis = liveBotOpen.reduce((sum, p) => {
     const basis = Number(p.costBasis);
     if (Number.isFinite(basis) && basis > 0) return sum + basis;
@@ -2043,7 +2053,7 @@ function buildPortfolio(readiness, mode) {
   // ReferenceError. Restoring it does not reintroduce that commit's
   // double-count: `netPnl` stays equity - baselineUsd.
   const cashPnl = baselineUsd != null ? Math.round((cash - baselineUsd) * 100) / 100 : null;
-  const equity = Math.round((cash + openMarkValue) * 100) / 100;
+  const equity = eq.equity;
   const netPnl = baselineUsd != null
     ? Math.round((equity - baselineUsd) * 100) / 100
     : Math.round((liveStats.verifiedPnl + pmUnrealized) * 100) / 100;
@@ -2065,7 +2075,13 @@ function buildPortfolio(readiness, mode) {
     openCostBasis: Math.round(openCostBasis * 100) / 100,
     unrealizedPnl: Math.round(pmUnrealized * 100) / 100,
     pmUnrealized: Math.round(pmUnrealized * 100) / 100,
-    pmOpenRaw: pmPositions.length,
+    pmOpenRaw: eq.walletRows,
+    // Value in the wallet with no open bot position behind it: unredeemed
+    // winners, orphans the sweep has not reached, anything opened by hand.
+    untrackedValue: eq.untrackedValue,
+    equityStale: eq.stale,
+    equityAsOf: eq.asOf,
+    holdingsKnown: eq.holdingsKnown,
     baselineUsd,
     lifetimeBaseline,
     lifetimePnl,
@@ -2080,7 +2096,7 @@ function buildPortfolio(readiness, mode) {
     limits,
     live: liveStats,
     paper: paperStats,
-    pnlSource: 'clob+pm_tracked',
+    pnlSource: 'clob+wallet',
   };
 }
 

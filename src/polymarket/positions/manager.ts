@@ -23,6 +23,7 @@
 
 import { dedupeTrades } from '../audit.js';
 import { holdsToSettlement, policyFor } from './policy.js';
+import { positionWindowEndMs } from './settle.js';
 
 /**
  * Open positions, optionally narrowed to one mode and/or one engine.
@@ -56,6 +57,27 @@ export function openPositions(positions = [], { mode = null, engine = null } = {
  */
 export function countOpen(positions = [], { mode = null, engine = null } = {}) {
   return openPositions(positions, { mode, engine }).length;
+}
+
+/**
+ * How many positions hold a capacity slot right now (decision D-B).
+ *
+ * A slot is a unit of exposure (D5). A position that holds to settlement stops
+ * being exposure when its window ends: no price move can change what it pays,
+ * and it is only waiting for resolution and redemption, which it does not need
+ * a slot for. Counting it until it is closed would tie trading capacity to
+ * settlement bookkeeping, so that a slow or failed close blocks new trades.
+ *
+ * Exit-managed positions count for as long as they are open, as before. A
+ * position with no parseable window end keeps its slot: when in doubt, the
+ * gate stays shut.
+ */
+export function capacityHoldingCount(positions = [], { mode = null, engine = null, now = Date.now() } = {}) {
+  return openPositions(positions, { mode, engine }).filter((p) => {
+    if (!holdsToSettlement(p)) return true;
+    const end = positionWindowEndMs(p);
+    return end == null || now < end;
+  }).length;
 }
 
 /**

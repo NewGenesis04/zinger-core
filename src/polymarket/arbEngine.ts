@@ -1,4 +1,4 @@
-import { savePackage, loadPackages, getActivePackages, resetPackages } from './arbPersistence.js';
+import { savePackage, loadPackages, getActivePackages, getSlotHoldingPackages, resetPackages } from './arbPersistence.js';
 import {
   closeProceedsWithFee,
   takerFeeUsdc,
@@ -208,11 +208,15 @@ export async function detectAndExecuteArbPackage({
     return null;
   }
 
-  // Capacity check against dedicated maxArbPackages setting
+  // Capacity: packages still holding exposure, not packages still awaiting
+  // settlement (decision D-B). A LOCKED package past its window end has a fixed
+  // payout, so it stops holding a slot there.
   const activePkgs = getActivePackages(mode);
+  const slotPkgs = getSlotHoldingPackages(mode);
   const maxPkgs = Number(cfg.maxArbPackages ?? 4);
-  if (activePkgs.length >= maxPkgs) {
-    arbDecision('skip', 'package_capacity_full', { active: activePkgs.length, max: maxPkgs },
+  if (slotPkgs.length >= maxPkgs) {
+    arbDecision('skip', 'package_capacity_full',
+      { active: slotPkgs.length, max: maxPkgs, awaitingSettlement: activePkgs.length - slotPkgs.length },
       { breakEvenGap, requiredGap });
     return null;
   }
@@ -421,10 +425,10 @@ export async function detectAndExecuteArbPackage({
   const packageId = `pkg-${market.symbol.toLowerCase()}-${Date.now().toString(36)}`;
   const expectedPayout = Math.round(shares * 1.00 * 100) / 100;
 
-  // Locked profit is reported NET (backlog item 7, second half). A gross figure
-  // overstates every package, and it cannot be corrected later:
-  // `getArbPackageMetrics` falls back to `lockedProfitUsd` for any package whose
-  // leg trades are gone (item 24), so whatever is written here is permanent.
+  // The plan's profit, NET of both entry fees (backlog item 7, second half). It
+  // stands only until the fills arrive: `lockFromFills` replaces it with the
+  // guaranteed figure and keeps this one as `plannedProfitUsd`. It is never
+  // reported as realized (`realizedPnlFor`).
   //
   // Only the two entry fees apply. Holding to settlement redeems the set
   // fee-free (FEE_FREE_EXIT_REASONS), which is exactly why the strategy works.
@@ -1318,21 +1322,84 @@ export async function reconcilePendingPackages({
   return result;
 }
 
+/** A trade's P/L to the micro-dollar where the close recorded it, else to the cent. */
+function tradePnl(t): number {
+  const exact = Number(t?.pnlExactUsd);
+  return Number.isFinite(exact) ? exact : Number(t?.pnl || 0);
+}
+
 /**
- * Scans active packages and transitions settled ones on market window completion.
+ * The closed trades that finish each leg, or null if either leg is still open.
+ *
+ * Both outcomes have to be present. Two closed trades on one leg (a partial and
+ * its remainder) are not a settled package while the other leg is still held.
+ */
+function finishingTrades(pkg, trades = []) {
+  const mine = trades.filter((t) => t.packageId === pkg.packageId && t.closed);
+  const done = (o) => mine.some((t) => String(t.outcome).toLowerCase() === o && t.exitReason !== 'partial');
+  return done('up') && done('down') ? mine : null;
+}
+
+/**
+ * A package's realized P/L, or null when nothing on record says what it was
+ * (item 105).
+ *
+ * Order: the figure written at settlement, then the sum of its closed leg
+ * trades (packages settled before that field existed, while the trades are
+ * still in the capped trade log). Never the plan: `lockedProfitUsd` was once
+ * computed from quotes before execution, and reporting it as a result is how a
+ * losing package showed as a win. Unknown is shown as unknown.
+ */
+export function realizedPnlFor(pkg, trades = []): number | null {
+  const recorded = Number(pkg?.realizedPnlUsd);
+  if (pkg?.realizedPnlUsd != null && Number.isFinite(recorded)) return recorded;
+  const legs = finishingTrades(pkg, trades);
+  if (!legs) return null;
+  return Math.round(legs.reduce((s, t) => s + tradePnl(t), 0) * 100) / 100;
+}
+
+/**
+ * LOCKED → SETTLED once both legs have closed, recording what the package
+ * realized (item 105).
+ *
+ * `realizedPnlUsd` is written here, on the package, because the trade log is
+ * capped (`bot.ts:saveTrade`), so a package that outlives its leg trades would
+ * otherwise have no realized figure at all. `payout` is recorded when both legs
+ * closed by resolution, so the result can be audited against Gamma.
  */
 export function syncPackageSettlements(trades = [], mode = 'paper') {
   const packages = loadPackages().filter((p) => p.mode === mode && p.status === 'LOCKED');
   let updated = false;
 
   for (const pkg of packages) {
-    const pkgTrades = trades.filter((t) => t.packageId === pkg.packageId && t.closed);
-    if (pkgTrades.length >= 2) {
-      pkg.status = 'SETTLED';
-      pkg.settledAt = Date.now();
-      savePackage(pkg);
-      updated = true;
-    }
+    const legs = finishingTrades(pkg, trades);
+    if (!legs) continue;
+    const exact = legs.reduce((s, t) => s + tradePnl(t), 0);
+    pkg.status = 'SETTLED';
+    pkg.settledAt = Date.now();
+    pkg.realizedPnlUsd = Math.round(exact * 100) / 100;
+    const redeemed = (o) => legs.find((t) => String(t.outcome).toLowerCase() === o && t.exitReason === 'redeem');
+    const up = redeemed('up');
+    const down = redeemed('down');
+    if (up && down) pkg.payout = { up: Number(up.exitPrice), down: Number(down.exitPrice) };
+    savePackage(pkg);
+    updated = true;
+
+    emitEvent('package.settlement', {
+      packageId: pkg.packageId,
+      symbol: pkg.symbol,
+      slug: pkg.slug,
+      action: up && down ? 'resolved' : 'settled',
+      mode,
+      shares: pkg.shares,
+      netPnl: pkg.realizedPnlUsd,
+      netPnlExactUsd: Math.round(exact * 1e6) / 1e6,
+      lockedProfitUsd: pkg.lockedProfitUsd,
+      plannedProfitUsd: pkg.plannedProfitUsd ?? null,
+      slippageUsd: pkg.slippageUsd ?? null,
+      profitSource: pkg.profitSource ?? null,
+      payout: pkg.payout ?? null,
+    });
   }
 
   return updated;
@@ -1347,20 +1414,15 @@ export function getArbPackageMetrics(mode = 'paper', trades = []) {
   const locked = all.filter((p) => p.status === 'LOCKED');
   const aborted = all.filter((p) => p.status === 'ABORTED');
 
-  // Realized PnL is truth: sum the closed leg trades when available (covers
-  // force-closed / rolled-back legs), falling back to the nominal entry edge.
-  const realizedFor = (pkg) => {
-    const legTrades = trades.filter((t) => t.packageId === pkg.packageId && t.closed && t.pnl != null);
-    if (legTrades.length >= 2) {
-      return Math.round(legTrades.reduce((s, t) => s + Number(t.pnl || 0), 0) * 100) / 100;
-    }
-    return Number(pkg.lockedProfitUsd || 0);
-  };
+  const realized = settled.map((p) => realizedPnlFor(p, trades));
+  const known = realized.filter((v): v is number => v != null);
 
   const concludedCount = settled.length + aborted.length;
-  const netProfitUsd = Math.round(settled.reduce((sum, p) => sum + realizedFor(p), 0) * 100) / 100;
-  const winCount = settled.filter((p) => realizedFor(p) > 0).length;
-  const winRatePct = concludedCount > 0 ? Math.round((winCount / concludedCount) * 1000) / 10 : 0;
+  // An unknown result is not a loss, so it stays out of the win-rate denominator.
+  const judgedCount = known.length + aborted.length;
+  const netProfitUsd = Math.round(known.reduce((sum, v) => sum + v, 0) * 100) / 100;
+  const winCount = known.filter((v) => v > 0).length;
+  const winRatePct = judgedCount > 0 ? Math.round((winCount / judgedCount) * 1000) / 10 : 0;
 
   return {
     totalPackages: all.length,
@@ -1371,5 +1433,8 @@ export function getArbPackageMetrics(mode = 'paper', trades = []) {
     winCount,
     winRatePct,
     netProfitUsd: Math.round(netProfitUsd * 100) / 100,
+    // Settled packages with no realized figure on record: left out of net
+    // profit and win count rather than counted at their planned profit.
+    unknownRealizedCount: realized.length - known.length,
   };
 }

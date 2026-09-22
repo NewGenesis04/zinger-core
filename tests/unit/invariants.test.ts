@@ -262,12 +262,23 @@ describe('INVARIANT: every package reaches a terminal state', () => {
     };
     savePackage(pkg);
 
+    // Two closed trades on ONE leg are not a finished package: the other leg
+    // is still held.
+    const oneLeg = [
+      { packageId: 'pkg-test-1', outcome: 'up', closed: true, exitReason: 'partial', pnl: 1.0 },
+      { packageId: 'pkg-test-1', outcome: 'up', closed: true, exitReason: 'settle', pnl: 1.0 },
+    ];
+    expect(syncPackageSettlements(oneLeg, 'paper')).toBe(false);
+    expect(loadPackages()[0].status).toBe('LOCKED');
+
     const trades = [
-      { packageId: 'pkg-test-1', closed: true, pnl: 2.0 },
-      { packageId: 'pkg-test-1', closed: true, pnl: -1.5 },
+      { packageId: 'pkg-test-1', outcome: 'up', closed: true, exitReason: 'settle', pnl: 2.0 },
+      { packageId: 'pkg-test-1', outcome: 'down', closed: true, exitReason: 'settle', pnl: -1.5 },
     ];
     expect(syncPackageSettlements(trades, 'paper')).toBe(true);
     expect(loadPackages()[0].status).toBe('SETTLED');
+    // What it realized is recorded on the package, which outlives the capped trade log.
+    expect(loadPackages()[0].realizedPnlUsd).toBe(0.5);
     // and a terminal package must stop consuming capacity
     expect(getActivePackages('paper')).toHaveLength(0);
   });

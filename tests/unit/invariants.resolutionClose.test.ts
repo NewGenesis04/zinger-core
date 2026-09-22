@@ -27,6 +27,7 @@ import {
 import { fetchResolvedMarket } from '../../src/polymarket/markets.js';
 import { syncPackageSettlements, getArbPackageMetrics } from '../../src/polymarket/arbEngine.js';
 import { saveAllPackages, loadPackages } from '../../src/polymarket/arbPersistence.js';
+import { queryEvents } from '../../src/polymarket/telemetry/events.js';
 
 const UP = '4358423192852515013701738197390464484651307449418190740448803850674061229771';
 const DOWN = '96154369864317434635402224600454667570692140241787438521444451063067899726389';
@@ -159,12 +160,21 @@ describe('INVARIANT: two resolved legs settle the package, at the realized figur
       const v = resolvedExit({ shares: fill.shares, payout, fill });
       return {
         id: `pos-${outcome}-resolved`, packageId: 'pkg-eth-mu9ef745', mode: 'live', outcome,
-        closed: true, exitReason: 'redeem', pnl: v.pnl,
+        closed: true, exitReason: 'redeem', exitPrice: payout, pnl: v.pnl, pnlExactUsd: v.pnlExactUsd,
       };
     };
     const trades = [trade('up', fills.up, 0), trade('down', fills.down, 1)];
     expect(syncPackageSettlements(trades, 'live')).toBe(true);
-    expect(loadPackages()[0].status).toBe('SETTLED');
+    const settled = loadPackages()[0];
+    expect(settled.status).toBe('SETTLED');
+    // Summed from the exact leg figures, then rounded once: −0.164197 → −0.16.
+    expect(settled.realizedPnlUsd).toBe(-0.16);
+    expect(settled.payout).toEqual({ up: 0, down: 1 });
+    const ev = queryEvents({ type: 'package.settlement' }).filter((e) => e.data?.packageId === 'pkg-eth-mu9ef745').pop();
+    expect(ev?.data).toMatchObject({ action: 'resolved', netPnl: -0.16, plannedProfitUsd: 0.16 });
+    expect(ev?.data.netPnlExactUsd).toBeCloseTo(-0.164197, 6);
+    // The figure is on the package, so it survives the trades leaving the capped log.
+    expect(getArbPackageMetrics('live', []).netProfitUsd).toBe(-0.16);
     const m = getArbPackageMetrics('live', trades);
     // −1.60 + 1.44: per-leg cent rounding, within a cent of −0.164197.
     expect(m.netProfitUsd).toBe(-0.16);

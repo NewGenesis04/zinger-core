@@ -346,3 +346,38 @@ describe('INVARIANT: an unsettled leg is retried, not cached forever', () => {
     }
   });
 });
+
+/**
+ * INVARIANT: "the wallet feed did not answer" is never reported as "the wallet
+ * holds nothing" (items 104, 113).
+ *
+ * `fetchDepositPositions` returned `[]` on failure, so equity fell back to the
+ * bot's own marks and the exit paths reconciled real positions away.
+ * `walletPositions` is the whole list, fetched in the same pass as
+ * `clobBalance`, or null.
+ */
+describe('INVARIANT: readiness separates no answer from an empty wallet', () => {
+  const row = (i) => ({ asset: `token-${i}`, size: 1, currentValue: 0.5, cashPnl: 0 });
+
+  it('reports null, not [], when the feed fails', async () => {
+    fetchSpy.mockResolvedValue({ ok: false, status: 503, json: async () => ({}) });
+    const readiness = await checkReadiness({});
+    expect(readiness.walletPositions).toBeNull();
+    expect(readiness.positionsOk).toBe(false);
+  });
+
+  it('reports an empty wallet as [], and says it answered', async () => {
+    fetchSpy.mockResolvedValue({ ok: true, json: async () => [] });
+    const readiness = await checkReadiness({});
+    expect(readiness.walletPositions).toEqual([]);
+    expect(readiness.positionsOk).toBe(true);
+  });
+
+  it('keeps every row in walletPositions; only the display list is cut to ten', async () => {
+    const rows = Array.from({ length: 14 }, (_, i) => row(i));
+    fetchSpy.mockResolvedValue({ ok: true, json: async () => rows });
+    const readiness = await checkReadiness({});
+    expect(readiness.walletPositions).toHaveLength(14);
+    expect(readiness.positions).toHaveLength(10);
+  });
+});

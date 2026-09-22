@@ -361,8 +361,11 @@ export async function runGovernor({
       _state.breakerActive = Boolean(_state.breakerActiveByMode?.[mode]);
       _state.peakEquity = _state.peakEquityByMode?.[mode] ?? null;
     }
+    // A stale equity is an old snapshot the wallet could not confirm (item 104).
+    // It neither raises the peak nor moves the breaker either way.
+    const equityTrusted = portfolio.equityStale !== true;
     const peakByMode = { paper: null, live: null, ...(_state.peakEquityByMode || {}) };
-    if (equity > 0 && (peakByMode[mode] == null || equity > peakByMode[mode])) {
+    if (equityTrusted && equity > 0 && (peakByMode[mode] == null || equity > peakByMode[mode])) {
       peakByMode[mode] = equity;
     }
     _state.peakEquityByMode = peakByMode;
@@ -386,7 +389,7 @@ export async function runGovernor({
     // --- Drawdown circuit-breaker (overrides everything) ---
     const breakerPct = Number(config.governorDrawdownPct ?? DEFAULTS.drawdownBreakerPct);
     const modePeak = Number(_state.peakEquityByMode?.[mode] ?? 0);
-    const dd = modePeak > 0 ? (modePeak - equity) / modePeak : 0;
+    const dd = !equityTrusted ? null : modePeak > 0 ? (modePeak - equity) / modePeak : 0;
     /**
      * Item 74b. The breaker's response to a drawdown is to force `arb-only`.
      * If arb is what produced the drawdown, that aims the bot harder at the
@@ -403,7 +406,7 @@ export async function runGovernor({
       mode,
       capUsd: Number(config.maxDailyLossUsd ?? 0),
     });
-    if (dd >= breakerPct && brake.tripped) {
+    if (dd != null && dd >= breakerPct && brake.tripped) {
       const res = record({
         action: 'breaker_suppressed',
         regime: _state.profile,
@@ -419,7 +422,7 @@ export async function runGovernor({
       if (log) log(`⛔ GOVERNOR breaker held — loss cap already tripped; not switching to arb-only (${round(dd * 100, 1)}% off peak)`, 'system', res);
       return res;
     }
-    if (dd >= breakerPct) {
+    if (dd != null && dd >= breakerPct) {
       const changed = applyProfile('arb-only', { saveConfig, config });
       if (changed || _state.profile !== 'arb-only') {
         _state.prevProfile = _state.profile;
@@ -438,7 +441,7 @@ export async function runGovernor({
       if (changed && log) log(`⛔ GOVERNOR drawdown breaker → arb-only (${round(dd * 100, 1)}% off peak)`, 'system', res);
       return res;
     }
-    if (_state.breakerActiveByMode?.[mode] && dd < breakerPct * 0.5) {
+    if (dd != null && _state.breakerActiveByMode?.[mode] && dd < breakerPct * 0.5) {
       _state.breakerActiveByMode = {
         paper: false,
         live: false,

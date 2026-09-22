@@ -160,19 +160,24 @@ describe('Atomic Arb Engine', () => {
     expect(pkg2).toBeNull();
   });
 
-  it('computes package metrics correctly', () => {
+  it('computes package metrics from realized results, never from the plan', () => {
     saveAllPackages([
-      { packageId: 'p1', mode: 'paper', status: 'SETTLED', lockedProfitUsd: 0.83 },
-      { packageId: 'p2', mode: 'paper', status: 'SETTLED', lockedProfitUsd: 1.20 },
+      { packageId: 'p1', mode: 'paper', status: 'SETTLED', lockedProfitUsd: 0.83, realizedPnlUsd: 0.83 },
+      { packageId: 'p2', mode: 'paper', status: 'SETTLED', lockedProfitUsd: 1.20, realizedPnlUsd: -0.16 },
+      // Settled before realized P/L was recorded, and its trades are gone: unknown.
+      // Item 105: this used to count at its planned +$5.00.
+      { packageId: 'p4', mode: 'paper', status: 'SETTLED', lockedProfitUsd: 5.00 },
       { packageId: 'p3', mode: 'paper', status: 'LOCKED', lockedProfitUsd: 0.50 },
     ] as any);
 
     const metrics = getArbPackageMetrics('paper');
-    expect(metrics.totalPackages).toBe(3);
-    expect(metrics.settledCount).toBe(2);
+    expect(metrics.totalPackages).toBe(4);
+    expect(metrics.settledCount).toBe(3);
     expect(metrics.activeLocked).toBe(1);
-    expect(metrics.winRatePct).toBe(100);
-    expect(metrics.netProfitUsd).toBe(2.03);
+    expect(metrics.netProfitUsd).toBe(0.67);
+    expect(metrics.unknownRealizedCount).toBe(1);
+    // One win in two known results. The unknown is neither.
+    expect(metrics.winRatePct).toBe(50);
   });
 
   it('passes valid numeric entryPrice in order plans to trade execution', async () => {

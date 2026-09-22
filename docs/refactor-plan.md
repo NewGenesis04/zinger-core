@@ -5993,6 +5993,19 @@ a source check that the closer walks positions and never trades. It was also
 run against live Gamma for this slug. Not yet done: corroborating unverified
 fill sizes (closed with `quantityUnconfirmed`), and step 3's metrics change.
 
+**Slot half fixed 2026-09-22 (uncommitted): design step 4, decision D-B.** A slot
+is released at window end, not at SETTLED, and in **both** capacity gates. The
+package gate uses `getSlotHoldingPackages` (`arbPersistence.ts`): PENDING_FILL,
+or LOCKED before its slug's window end. The leg gate uses `capacityHoldingCount`
+(`positions/manager.ts`): hold-to-settle positions stop counting at window end,
+and exit-managed ones count while open, as before. The leg gate
+(`bot.ts:executePendingTrade`, `maxArbPackages × 2`) was not in the design.
+Freeing only the package gate would have let a package open and then refused
+its first leg. Unparseable slugs keep their slot. The one-package-per-slug check
+still uses `getActivePackages`. Pinned by
+`tests/unit/invariants.slotRelease.test.ts`, including a check that the two
+gates agree across window offsets.
+
 ---
 
 ### 104. Live equity trusts the bot's own marks exactly when Polymarket says nothing is held
@@ -6025,6 +6038,26 @@ anything else reads live `equity` for a decision is unchecked.
 **Not fixed.** Item 103 removes the trigger for arb legs. This line is still
 wrong for any position that goes stale while the bot believes it's open.
 
+**Fixed 2026-09-22 (uncommitted): design step 5, decision D-C.** Live equity is
+`ledger/equity.ts:liveEquity`: cash plus the wallet's own `currentValue` over
+**every** row of `readiness.walletPositions`. That list is untruncated, fetched
+in the same pass as `clobBalance`, and null when the feed did not answer. There
+is no fallback to bot marks. With no answer, it reports the last good
+*snapshot*, cash and holdings from one moment, flagged `equityStale`, because
+current cash plus old holdings double-counts any redemption in between. With no
+snapshot, it reports cash alone with `holdingsKnown: false`.
+`fetchDepositPositions` returns null on failure and retries after 15s, not 60s.
+`positions` stays at 10 rows for display. New portfolio fields:
+`untrackedValue`, `equityStale`, `equityAsOf`, `holdingsKnown`.
+
+**Answer to the open question above:** yes. The governor's drawdown breaker
+reads live equity and ratchets a persisted peak from it
+(`ai/governor.ts:358-369`, saved at `:531`). A stale figure now neither raises
+the peak nor trips or releases the breaker. **The VPS peak may already include
+the incident's $4.64 phantom.** Resetting `peakEquityByMode.live` is the
+operator's call. Pinned by `tests/unit/invariants.liveEquity.test.ts` and three
+new cases in `readinessCache.test.ts`.
+
 ---
 
 ### 105. Package profit is computed before execution and reported as realized
@@ -6054,6 +6087,18 @@ prices. Pinned by `tests/unit/invariants.fillCapture.test.ts`, which reproduces
 this package's −$0.164197 from its ledger. Part 2 (settlement records
 `realizedPnlUsd`, metrics stop falling back to the plan) is step 3 of
 `docs/live-settlement-design.md`.
+
+**Part 2 done 2026-09-22 (uncommitted): design step 3.** `syncPackageSettlements`
+now settles only when **both** outcomes have a finishing (non-partial) closed
+trade, where before it accepted any two closed trades. It writes
+`realizedPnlUsd` (the exact leg figures summed, then rounded once) and, for
+resolved packages, `payout`. It emits `package.settlement` with the realized,
+planned and slippage figures. `realizedPnlFor` reads the recorded figure, then
+the sum of the leg trades, then **null**. It never falls back to
+`lockedProfitUsd`. Metrics leave unknowns out of net profit and out of the
+win-rate denominator, and expose `unknownRealizedCount`. Two tests that pinned
+the old behaviour were restated (`arbEngine.test.ts` metrics,
+`invariants.test.ts` settlement).
 
 **Original note:** recompute from actual fills at lock, and print the signed price,
 not the scan quote. The comment at `:426-429` says whatever is written here is
@@ -6262,7 +6307,7 @@ No answer, or a too-new 0, sells the bot's count and lets the venue refuse,
 rate-limited to one attempt per position per 30s. Pinned by
 `tests/unit/invariants.exitInventory.test.ts`. The readiness feed itself still
 returns `[]` on failure and 10 rows. That is left for step 5 (equity), its
-remaining consumer.
+remaining consumer. *Done in step 5: `walletPositions` is null on failure and untruncated.*
 
 ---
 
@@ -6309,6 +6354,24 @@ equal to the open". It's paper only (`bot.ts:4680`), and exact ties are rare.
 The problem is an unverified domain claim sitting in source.
 
 **Not fixed. Low priority.**
+
+---
+
+### 116. Package net profit leaves out every aborted package's unwind loss
+
+**Found 2026-09-22.** `getArbPackageMetrics` sums realized P/L over SETTLED and
+MERGED packages only (`arbEngine.ts`, `netProfitUsd`). An ABORTED package whose
+filled leg was unwound carries a real loss: the unwind trade is saved with the
+`packageId` (`unwindLeg`). That loss is counted as a non-win in the win-rate
+denominator, but it never reaches `netProfitUsd`. So the figure reports arb as
+more profitable than the account, by exactly the naked-leg losses. The
+dashboard shows only the win rate. `netProfitUsd` reaches `/api/poly/packages`
+(`server.ts:420`).
+
+**Not fixed.** It changes what the metric means, so it's the operator's call.
+The direction is to include ABORTED packages' closed trades in net profit,
+reported separately as `abortCostUsd` so the arb edge and the execution cost
+stay distinguishable.
 
 ---
 

@@ -46,13 +46,18 @@ async function fetchDepositPositions(depositWallet) {
     const res = await fetch(`https://data-api.polymarket.com/positions?user=${depositWallet}`, {
       signal: AbortSignal.timeout(8000),
     });
-    if (!res.ok) return [];
+    // null is "no answer", never "holds nothing" (items 104, 113). Equity and
+    // the exit paths act on that difference, so it is kept here, at the source.
+    if (!res.ok) return null;
     const data = await res.json();
-    return Array.isArray(data) ? data : [];
+    return Array.isArray(data) ? data : null;
   } catch {
-    return [];
+    return null;
   }
 }
+
+/** A missing wallet answer is retried sooner than a good one is refreshed. Not proxied. */
+const POSITIONS_RETRY_MS = 15_000;
 
 /**
  * Capture a promise's outcome instead of letting it reject.
@@ -222,6 +227,7 @@ export async function checkReadiness(config = {}) {
   let ownerMatches = false;
   let clobError = null;
   let positions = [];
+  let positionsOk = false;
   /*
    * Backlog item 55 — these eight calls share no input data; only the assembly
    * of `checks` below is ordered. Run sequentially the worst case was the SUM of
@@ -253,8 +259,8 @@ export async function checkReadiness(config = {}) {
     }), () => TTL.balances))
     : null;
   const positionsP = depositWallet
-    ? leased('positions', () => fetchDepositPositions(depositWallet), () => TTL.balances)
-    : null; // never rejects — :50
+    ? leased('positions', () => fetchDepositPositions(depositWallet), (v) => (v == null ? POSITIONS_RETRY_MS : TTL.balances))
+    : null; // never rejects; null means no answer
   const clobP = capture(leased('clobBalance', getClobBalance, () => TTL.balances));
   const usdcP = capture(leased('onchainUsdc', () => getClient().readContract({
     address: POLY.usdc,
@@ -319,7 +325,8 @@ export async function checkReadiness(config = {}) {
     // out here would make a real loss indistinguishable from a phantom and write
     // the wrong PnL, silently. Item 68. Filter for the summary line only.
     const rawPositions = await positionsP;
-    positions = Array.isArray(rawPositions) ? rawPositions : [];
+    positionsOk = Array.isArray(rawPositions);
+    positions = positionsOk ? rawPositions : [];
     const unresolved = positions.filter(
       (p) => !(p.redeemable && Number(p.currentValue ?? 0) < 0.01),
     );
@@ -457,7 +464,12 @@ export async function checkReadiness(config = {}) {
     proxy: redactProxy(getClobProxyUrl()),
     proxyHealth,
     openPositions: positions.length,
+    // Ten rows, for display. Nothing that decides anything should read it.
     positions: positions.slice(0, 10),
+    // Every row, fetched in the same pass as `clobBalance`, so the two describe
+    // the account at one moment. null when the wallet feed did not answer.
+    walletPositions: positionsOk ? positions : null,
+    positionsOk,
     apiReady,
     liveReady,
     walletFunded,

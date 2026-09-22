@@ -1,6 +1,7 @@
 // @ts-nocheck
 import fs from 'fs';
 import { load, persistSync, FILES } from './persistence.js';
+import { parseSlugWindow } from './windows.js';
 
 export interface ArbLegInfo {
   outcome: 'up' | 'down';
@@ -64,6 +65,10 @@ export interface ArbPackage {
   entryFeesUsd?: number;
   /** `plannedProfitUsd − lockedProfitUsd`: what execution cost against the quote. */
   slippageUsd?: number;
+  /** What the package realized, written when it settles (item 105). */
+  realizedPnlUsd?: number;
+  /** Per-leg payout when both legs closed by resolution. */
+  payout?: { up: number; down: number };
   /** The two entry fees this package expects to pay. */
   feesEstUsd?: number;
   /** Gap at which this book would exactly break even — rate x [u(1-u)^e + d(1-d)^e]. */
@@ -137,6 +142,27 @@ export function saveAllPackages(packages: ArbPackage[]): void {
 
 export function getActivePackages(mode: string = 'paper'): ArbPackage[] {
   return loadPackages().filter((p) => p.mode === mode && (p.status === 'LOCKED' || p.status === 'PENDING_FILL'));
+}
+
+/**
+ * The packages that hold an arb slot at `now` (decision D-B).
+ *
+ * PENDING_FILL always does, because its legs are in flight. LOCKED does until
+ * its window ends. After that its payout can no longer move, so it is waiting
+ * on bookkeeping rather than holding exposure. SETTLED is bookkeeping only.
+ *
+ * Only the capacity gate uses this. `getActivePackages` keeps its meaning for
+ * everything else, including the one-package-per-slug check. A slug that does
+ * not parse keeps its slot.
+ */
+export function getSlotHoldingPackages(mode: string = 'paper', now: number = Date.now()): ArbPackage[] {
+  return loadPackages().filter((p) => {
+    if (p.mode !== mode) return false;
+    if (p.status === 'PENDING_FILL') return true;
+    if (p.status !== 'LOCKED') return false;
+    const end = parseSlugWindow(p.slug)?.endAtMs;
+    return end == null || now < end;
+  });
 }
 
 export function resetPackages(mode?: string): { removed: number } {
