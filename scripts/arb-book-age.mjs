@@ -7,25 +7,37 @@
  * venue said, and how the package ended. Then it tabulates outcome by gap and by
  * leg-1 book age.
  *
- *   node scripts/arb-book-age.mjs [path/to/zinger.db] [--mode live|paper]
+ *   node scripts/arb-book-age.mjs [path/to/zinger.db] [--mode live|paper] [--archive]
  *
  * Defaults: data/zinger.db, live. Opens the database read-only; safe to run
  * beside a running bot.
+ *
+ * `--archive` also reads the packages a live reset set aside
+ * (`poly_live_archive.json`, written by `resetLiveData` before it clears them),
+ * so a reset does not erase the evidence. The last 21 resets are kept.
  */
 import { DatabaseSync } from 'node:sqlite';
 
 const args = process.argv.slice(2);
 const modeAt = args.indexOf('--mode');
 const mode = modeAt >= 0 ? args[modeAt + 1] : 'live';
+const withArchive = args.includes('--archive');
 const dbPath = args.find((a, i) => !a.startsWith('--') && args[i - 1] !== '--mode') || 'data/zinger.db';
 
 const db = new DatabaseSync(dbPath, { readOnly: true });
-const row = db.prepare("SELECT value FROM docs WHERE key = 'poly_packages.json'").get();
-if (!row) {
-  console.error(`no poly_packages.json document in ${dbPath}`);
-  process.exit(1);
-}
-const packages = JSON.parse(row.value).filter((p) => p.mode === mode);
+const doc = (key) => {
+  const r = db.prepare('SELECT value FROM docs WHERE key = ?').get(key);
+  return r ? JSON.parse(r.value) : null;
+};
+const current = doc('poly_packages.json') || [];
+const archived = withArchive
+  ? (doc('poly_live_archive.json') || []).flatMap((entry) => entry?.packages || [])
+  : [];
+// A package can appear in more than one archive entry; count it once.
+const byId = new Map();
+for (const p of [...archived, ...current]) if (p?.packageId) byId.set(p.packageId, p);
+const packages = [...byId.values()].filter((p) => p.mode === mode);
+if (withArchive) console.log(`${archived.length} archived + ${current.length} current package record(s) read`);
 
 const pct = (v) => (v == null ? '   —  ' : `${(v * 100).toFixed(2)}%`.padStart(6));
 const ms = (v) => (v == null ? '    —' : String(Math.round(v)).padStart(5));
