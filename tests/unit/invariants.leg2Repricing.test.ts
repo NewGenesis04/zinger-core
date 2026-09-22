@@ -26,7 +26,7 @@
  * test asserting a latency would freeze a guess about it.
  */
 import { describe, it, expect, beforeEach } from 'vitest';
-import { detectAndExecuteArbPackage } from '../../src/polymarket/arbEngine.js';
+import { detectAndExecuteArbPackage, chooseLeg2Exit } from '../../src/polymarket/arbEngine.js';
 import { saveAllPackages, loadPackages } from '../../src/polymarket/arbPersistence.js';
 import { buyCeiling } from '../../src/polymarket/trade.js';
 import { arbBreakEvenGap } from '../../src/polymarket/fees.js';
@@ -67,7 +67,7 @@ const baseCfg = {
  * Drives one package and records every leg plan. `refetchDepth` is injected, so
  * "the book moved between leg 1 and leg 2" is expressible without a clock.
  */
-const run = ({ cfg = {}, downAsk = DOWN_ASK, rereadDownAsk = null, fillPlan = true, slug = market.slug } = {}) => {
+const run = ({ cfg = {}, downAsk = DOWN_ASK, rereadDownAsk = null, rereadUpBid = UP_ASK - 0.01, fillPlan = true, slug = market.slug } = {}) => {
   const seen = [];
   const executeTrade = async (pending) => {
     seen.push({
@@ -82,12 +82,15 @@ const run = ({ cfg = {}, downAsk = DOWN_ASK, rereadDownAsk = null, fillPlan = tr
   };
 
   const refetchDepth = async (m) => {
-    // Only the DOWN token should ever be asked for — the whole point is to
-    // reprice one leg, not to re-fetch a book already paid for.
-    expect(Object.keys(m.tokenIds || {})).toEqual(['down']);
+    // Both books (item 106): DOWN's ask prices the hedge, UP's bid prices the
+    // unwind it is compared with.
+    expect(Object.keys(m.tokenIds || {}).sort()).toEqual(['down', 'up']);
     if (rereadDownAsk === 'throw') throw new Error('book unavailable');
     if (rereadDownAsk == null) return {};
-    return { down: { bestAsk: rereadDownAsk, bestAskSize: 5000, bookTs: Date.now() } };
+    return {
+      up: { bestBid: rereadUpBid, bestAsk: UP_ASK, bestAskSize: 5000, bookTs: Date.now() },
+      down: { bestAsk: rereadDownAsk, bestAskSize: 5000, bookTs: Date.now() },
+    };
   };
 
   return detectAndExecuteArbPackage({
@@ -244,62 +247,76 @@ describe('INVARIANT: leg 2 is priced from the book as it is when leg 2 is sent',
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-describe('INVARIANT: a filled leg 1 is hedged unless hedging costs more than the risk', () => {
-  it('hedges into a small certain loss rather than hold a naked leg', async () => {
-    // Once leg 1 is filled the alternative is not "no trade" — it is a fair bet
-    // at market odds: zero expected edge, full variance. A few cents of certain
-    // loss is the better side of that, and this must not refuse it.
-    const { pkg, seen } = await run({ rereadDownAsk: 0.55 });
-
+describe('INVARIANT: a filled leg 1 leaves by the cheaper exit (item 106)', () => {
+  /*
+   * Buying DOWN at p and selling UP at 1 − p are the same trade: a full set
+   * redeems to exactly $1.00, and the taker fee is rate·p(1−p) on both. So the
+   * decision is a comparison of two books, with one tick charged to the unwind
+   * for the seconds its leg is naked before it can be sold (§9d). The fixed cap
+   * that used to decide is now only an alert.
+   */
+  it('hedges into a small certain loss when the unwind is no cheaper', async () => {
+    // DOWN 0.55 → signed 0.56. Selling UP at 0.45 ≡ DOWN 0.55, plus a tick = 0.56.
+    const { pkg, seen } = await run({ rereadDownAsk: 0.55, rereadUpBid: 0.45 });
     const down = seen.find((l) => l.outcome === 'down');
-    expect(down, 'refused to complete a hedge over a few cents').toBeTruthy();
-    // Deliberately buying above break-even: UP 0.46 + DOWN 0.56 > $1.00.
+    expect(down, 'refused a hedge no dearer than the unwind').toBeTruthy();
+    // Deliberately above break-even: UP 0.46 + DOWN 0.56 > $1.00.
     expect(UP_ASK + down.price).toBeGreaterThan(1.0);
     expect(pkg?.status).toBe('LOCKED');
   });
 
-  it('refuses the hedge and leaves leg 1 to the unwind path past the cap', async () => {
-    // "Better than a coin flip" stops being true once the book has moved far
-    // enough. The bound is what makes the previous test safe.
-    const { pkg, seen } = await run({ rereadDownAsk: 0.90, cfg: { arbMaxHedgeLossPct: 0.002 } });
-
-    expect(seen.map((l) => l.outcome), 'sent leg 2 at any price').toEqual(['up']);
+  it('unwinds when selling UP is cheaper than buying DOWN, by more than a tick', async () => {
+    // DOWN jumped to 0.90 while UP still bids 0.45: the hedge locks 0.46 + 0.91,
+    // the unwind gives up one tick of spread.
+    const { pkg, seen } = await run({ rereadDownAsk: 0.90, rereadUpBid: 0.45 });
+    expect(seen.map((l) => l.outcome), 'sent leg 2 when the unwind was cheaper').toEqual(['up']);
     expect(pkg?.status).toBe('ABORTED');
-    expect(pkg.legs.down.error).toMatch(/hedge refused/);
-    expect(pkg.legs.down.error).toMatch(/over cap/);
+    expect(pkg.legs.down.error).toMatch(/unwind chosen/);
   });
 
-  it('judges the move, not the dollar total, at both ends of the size range', async () => {
-    /*
-     * Why the cap is a fraction and not a dollar figure. This move puts the pair
-     * one tick past par, so it locks the same *relative* loss either way — but
-     * $0.54 on a 53-share package and $0.03 on a 3-share one. A fixed ceiling
-     * has to be wrong about one of them: set it for the small package and the
-     * large one can never hedge; set it for the large one and the small package
-     * may lose a quarter of its value.
-     */
+  it('hedges a large move when both books moved together, however far', async () => {
+    // The old rule refused this at any size. But with UP bid at 0.09, selling UP
+    // realizes the same loss as buying DOWN at 0.91 does, and takes on the naked
+    // window as well. The loss happened when the book moved, not here.
+    for (const [arbMaxUsd, slug] of [[3, 'btc-updown-5m-small'], [50, 'btc-updown-5m-large']]) {
+      const { pkg, seen } = await run({ rereadDownAsk: 0.90, rereadUpBid: 0.09, cfg: { arbMaxUsd }, slug });
+      expect(seen.map((l) => l.outcome), `$${arbMaxUsd}`).toEqual(['up', 'down']);
+      expect(pkg?.status).toBe('LOCKED');
+    }
+  });
+
+  it('decides the same way at every size: it is a price comparison, not a dollar cap', async () => {
     const small = await run({ rereadDownAsk: 0.54, cfg: { arbMaxUsd: 3 }, slug: 'btc-updown-5m-small' });
     const large = await run({ rereadDownAsk: 0.54, cfg: { arbMaxUsd: 50 }, slug: 'btc-updown-5m-large' });
-
     expect(small.seen.map((l) => l.outcome)).toContain('down');
     expect(large.seen.map((l) => l.outcome)).toContain('down');
-    // Same move, order-of-magnitude different dollar loss — which is the point.
-    const sharesSmall = small.seen[0].shares;
-    const sharesLarge = large.seen[0].shares;
-    expect(sharesLarge / sharesSmall).toBeGreaterThan(10);
+    expect(large.seen[0].shares / small.seen[0].shares).toBeGreaterThan(10);
   });
 
-  it('refuses a catastrophic move at every size', async () => {
-    // The floor on the cap must not become a loophole for tiny packages: a book
-    // at $0.90 against a $0.46 leg is a 37% certain loss, and no size makes that
-    // the better side of a coin flip.
-    const small = await run({ rereadDownAsk: 0.90, cfg: { arbMaxUsd: 3 }, slug: 'btc-updown-5m-small' });
-    const large = await run({ rereadDownAsk: 0.90, cfg: { arbMaxUsd: 50 }, slug: 'btc-updown-5m-large' });
+  it('does not let the cap refuse an exit: over the cap it alerts and still takes the cheaper one', async () => {
+    const { pkg, seen } = await run({ rereadDownAsk: 0.90, rereadUpBid: 0.09, cfg: { arbMaxHedgeLossPct: 0.002 } });
+    expect(seen.map((l) => l.outcome)).toEqual(['up', 'down']);
+    expect(pkg?.status).toBe('LOCKED');
+  });
+});
 
-    expect(small.pkg?.status).toBe('ABORTED');
-    expect(large.pkg?.status).toBe('ABORTED');
-    expect(small.seen.map((l) => l.outcome)).toEqual(['up']);
-    expect(large.seen.map((l) => l.outcome)).toEqual(['up']);
+describe('chooseLeg2Exit', () => {
+  it('ties go to the hedge; a tick beyond goes to the unwind', () => {
+    expect(chooseLeg2Exit({ signedDownAsk: 0.56, upBid: 0.45 }).action).toBe('hedge');
+    expect(chooseLeg2Exit({ signedDownAsk: 0.57, upBid: 0.45 }).action).toBe('unwind');
+    expect(chooseLeg2Exit({ signedDownAsk: 0.55, upBid: 0.45, premiumTicks: 0 }).action).toBe('hedge');
+    expect(chooseLeg2Exit({ signedDownAsk: 0.56, upBid: 0.45, premiumTicks: 0 }).action).toBe('unwind');
+  });
+
+  it('hedges when there is no UP bid to price the unwind', () => {
+    for (const upBid of [null, undefined, 0, 1, NaN]) {
+      expect(chooseLeg2Exit({ signedDownAsk: 0.95, upBid }).action).toBe('hedge');
+    }
+  });
+
+  it('is exact on the grid, where 1 − bid is not', () => {
+    // 1 − 0.45 is 0.5499999999999999 in binary; the comparison must not flip on it.
+    expect(chooseLeg2Exit({ signedDownAsk: 0.56, upBid: 0.45, tickSize: 0.01 }).threshold).toBe(0.56);
   });
 });
 

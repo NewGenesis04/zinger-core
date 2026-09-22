@@ -528,17 +528,20 @@ export async function detectAndExecuteArbPackage({
       let freshDownAsk = downAsk;
       let leg2Depth = depth;
       let bookRefreshed = false;
+      // The unwind's price: what leg 1 would sell for right now (item 106).
+      let upBid = Number(depth?.up?.bestBid) || null;
       if (cfg.arbLeg2RereadBook !== false) {
         try {
-          // Only the DOWN token. `getDepthForMarket` walks `tokenIds`, so handing
-          // it the one leg being priced keeps this to a single book — free from
-          // the WS cache, and one REST call rather than two when that cache is
-          // cold.
+          // Both books: DOWN to price the hedge, UP's bid to price the unwind it
+          // is compared against. Free from the WS cache; one REST call when cold.
           //
           // Typed `any` locally because `getDepthForMarket` builds its result
           // from an empty literal and so has no inferred keys. Giving it a real
           // return type is backlog work, not this change.
-          const reread: any = await refetchDepth({ ...market, tokenIds: { down: market.tokenIds?.down } });
+          const reread: any = await refetchDepth({
+            ...market,
+            tokenIds: { up: market.tokenIds?.up, down: market.tokenIds?.down },
+          });
           const a = Number(reread?.down?.bestAsk);
           if (a > 0.01 && a < 0.99) {
             freshDownAsk = a;
@@ -549,55 +552,51 @@ export async function detectAndExecuteArbPackage({
             leg2Depth = { ...(depth || {}), down: reread.down };
             bookRefreshed = true;
           }
-        } catch { /* stale quote is the documented fallback */ }
+          const b = Number(reread?.up?.bestBid);
+          if (b > 0.01 && b < 0.99) upBid = b;
+        } catch { /* stale quotes are the documented fallback */ }
       }
 
       const signedDownAsk = bufferTicks > 0
         ? buyCeiling(freshDownAsk, { tickSize, bufferTicks })
         : freshDownAsk;
 
-      /*
-       * The hedge-or-orphan decision, and the reason it leans toward hedging.
-       *
-       * Leg 1 is already filled. The alternative to completing the hedge is not
-       * "no trade" — it is holding a naked directional leg, which is a fair bet
-       * at market odds: zero expected edge and the full variance of the
-       * position. So a small *certain* loss is the better side of that trade,
-       * and this deliberately buys above break-even to get it.
-       *
-       * Bounded, because "better than a coin flip" stops being true once the
-       * book has moved far enough. Past `arbMaxHedgeLossPct` the leg goes to the
-       * orphan path instead, which since items 100/101 unwinds in seconds
-       * rather than minutes.
-       *
-       * `upAsk` stands in for leg 1's fill price, which is not returned here. It
-       * is the *bound* leg 1 was signed at and a FOK can only fill at or below
-       * it (§9b), so this overstates the cost — the safe direction.
-       */
+      const exit = chooseLeg2Exit({
+        signedDownAsk,
+        upBid,
+        tickSize,
+        premiumTicks: Number(cfg.arbUnwindPremiumTicks ?? 1),
+      });
+
+      // `upAsk` stands in for leg 1's fill: it is the bound leg 1 was signed at,
+      // and a FOK fills at or below it (§9b), so this overstates the loss.
       const lockedLossUsd = Math.round(upShares * ((upAsk + signedDownAsk) - 1.00) * 100) / 100;
-      /*
-       * The cap scales with the package, because so does what it is being traded
-       * against. Orphaning leg 1 leaves a naked position whose variance is
-       * proportional to its size, so a *fixed dollar* ceiling is wrong in both
-       * directions — it forbids a 2c hedge on a $50 package while permitting one
-       * that is half the value of a $2 package.
-       *
-       * The floor keeps a very small package from being refused over grid
-       * rounding, where a single tick can exceed any sane fraction.
-       */
+      // Item 106: an alert threshold, not a decision. Once leg 1 has filled,
+      // one of the two exits has to be taken, and `chooseLeg2Exit` picks the
+      // cheaper one. The cap only says when the price of doing so is worth a
+      // human's attention.
       const hedgeLossPct = Math.max(0, Number(cfg.arbMaxHedgeLossPct ?? 0.03));
       const hedgeLossCapUsd = Math.max(0.05, Math.round(totalCost * hedgeLossPct * 100) / 100);
+      const exitDetail = {
+        packageId, slug: market.slug, quotedDownAsk: downAsk, freshDownAsk, signedDownAsk,
+        upBid, unwindEquivalent: exit.unwindEquivalent, threshold: exit.threshold,
+        lockedLossUsd, hedgeLossCapUsd, upShares, bookRefreshed,
+      };
+      if (lockedLossUsd > hedgeLossCapUsd && log) {
+        log(
+          `⚠️ ARB EXIT OVER CAP ${market.symbol} — DOWN moved $${downAsk.toFixed(3)} → $${freshDownAsk.toFixed(3)}; the cheaper exit (${exit.action}) still costs about -$${lockedLossUsd.toFixed(2)}, over the $${hedgeLossCapUsd.toFixed(2)} alert`,
+          'error',
+          exitDetail,
+        );
+      }
 
-      if (lockedLossUsd > hedgeLossCapUsd) {
-        pkg.legs.down.error = `hedge refused: would lock -$${lockedLossUsd.toFixed(2)} (up $${upAsk.toFixed(3)} + down $${signedDownAsk.toFixed(3)} = $${(upAsk + signedDownAsk).toFixed(3)}) over cap $${hedgeLossCapUsd.toFixed(2)}`;
+      if (exit.action === 'unwind') {
+        pkg.legs.down.error = `unwind chosen: hedge at $${signedDownAsk.toFixed(3)} > sell UP at bid $${Number(upBid).toFixed(3)} (≡ DOWN $${exit.unwindEquivalent.toFixed(3)}) + ${exit.premiumTicks} tick`;
         if (log) {
           log(
-            `⛔ ARB HEDGE REFUSED ${market.symbol} — DOWN moved $${downAsk.toFixed(3)} → $${freshDownAsk.toFixed(3)}; hedging would lock -$${lockedLossUsd.toFixed(2)} over cap $${hedgeLossCapUsd.toFixed(2)}. Leg 1 goes to the unwind path.`,
+            `↩️ ARB UNWIND CHOSEN ${market.symbol} — hedging at $${signedDownAsk.toFixed(3)} costs more than selling UP at $${Number(upBid).toFixed(3)} (≡ $${exit.unwindEquivalent.toFixed(3)}) plus ${exit.premiumTicks} tick for the naked window. Leg 1 goes to the unwind path.`,
             'error',
-            {
-              packageId, slug: market.slug, quotedDownAsk: downAsk, freshDownAsk,
-              signedDownAsk, lockedLossUsd, hedgeLossCapUsd, upShares, bookRefreshed,
-            },
+            exitDetail,
           );
         }
       } else {
@@ -890,6 +889,41 @@ async function executeArbLeg({ outcome, price, cost, shares, pkg, market, execut
  * have to change together, and the invariant that catches it is
  * "cash reconciles to trades + fees + open cost".
  */
+
+/**
+ * After leg 1 fills, the cheaper of the two ways out (item 106).
+ *
+ * Buying DOWN at `p` and selling UP at `1 − p` are the same trade: a full set
+ * redeems to exactly $1.00 (domain facts §2), so a held UP share plus a DOWN
+ * share bought at `p` is worth `1 − p` at resolution, which is what selling UP
+ * at a bid of `1 − p` pays now. The taker fee is `rate·p(1−p)` on both, so fees
+ * drop out of the comparison. What is left is two books quoting the same exit.
+ *
+ * The unwind is charged `premiumTicks` for the one risk the hedge does not
+ * carry: a bought token cannot be sold until it settles on-chain (§9d, ~2–3s,
+ * variance unmeasured), so leg 1 is naked for that long. Ties go to the hedge.
+ *
+ * No UP bid means the unwind cannot be priced. The hedge is then the only exit
+ * with a price on it.
+ */
+export function chooseLeg2Exit({ signedDownAsk, upBid, tickSize = 0.01, premiumTicks = 1 }) {
+  const tick = Number(tickSize) || 0.01;
+  const premium = Math.max(0, Number(premiumTicks) || 0);
+  const bid = Number(upBid);
+  if (!(bid > 0 && bid < 1)) {
+    return { action: 'hedge', reason: 'no_up_bid', unwindEquivalent: null, threshold: null, premiumTicks: premium };
+  }
+  const unwindEquivalent = Math.round((1 - bid) * 1e6) / 1e6;
+  const threshold = Math.round((unwindEquivalent + premium * tick) * 1e6) / 1e6;
+  const hedge = Number(signedDownAsk) <= threshold + 1e-9;
+  return {
+    action: hedge ? 'hedge' : 'unwind',
+    reason: hedge ? 'hedge_not_dearer' : 'unwind_cheaper',
+    unwindEquivalent,
+    threshold,
+    premiumTicks: premium,
+  };
+}
 
 /**
  * Replace the plan's profit with the fills' profit, once both legs are in (item 105).

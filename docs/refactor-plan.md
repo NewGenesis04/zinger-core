@@ -6154,6 +6154,18 @@ the operator: the value of `k` (1 tick proposed), and whether to keep the cap as
 a hard bound. Cost: the re-read covers two tokens instead of one (free from the
 WS cache, one extra REST call through the proxy when the cache is cold).
 
+**Fixed 2026-09-22 (uncommitted). Approved with k = 1 tick, cap as alert.** After
+leg 1 fills, the re-read covers both tokens. `chooseLeg2Exit` (`arbEngine.ts`,
+pure) hedges when `signedDownAsk ≤ (1 − upBid) + arbUnwindPremiumTicks · tick`
+(config, default 1). Ties hedge. With no UP bid the unwind can't be priced, so
+it hedges. Otherwise it unwinds (`↩️ ARB UNWIND CHOSEN`, leg error
+`unwind chosen: …`). `arbMaxHedgeLossPct` now only raises `⚠️ ARB EXIT OVER CAP`
+and never refuses an exit. With the re-read disabled, the UP bid comes from the
+scan book. Paper takes the same decision, so paper arb behaviour changes here.
+Pinned by `tests/unit/invariants.leg2Repricing.test.ts`: the old cap-refusal
+tests were restated. A move where both books moved together now hedges at any
+size, which is the point of the item.
+
 ---
 
 ### 107. The instant CTF merge is dead code that fails silently
@@ -6330,6 +6342,14 @@ action log date any socket outage, and a slowdown that coincides with one
 points at REST fallback. The Webshare usage graph for 09:00–10:00 on
 2026-09-20 remains the only independent record for the original event
 (operator).
+
+**2026-09-22: proxy ruled out (operator).** The Webshare graph shows no spike
+around 09:00–10:00 on 2026-09-20. REST fallback after a socket drop goes
+through that proxy, so a drop severe enough to cut throughput by two thirds
+would have shown up. Remaining candidates: fewer markets scanned, or passes
+slowed for a reason that doesn't touch the proxy. The record from that day
+can't distinguish them. Left open. The next occurrence will carry the
+item-111 socket lines and the hourly counts.
 
 ---
 

@@ -46,7 +46,7 @@ export const STRATEGY_KEYS = [
   'evalBothSides', 'sideBalanceEnabled', 'sideBalanceWeight',
   'preferShortTf', 'shortTfWeight',
   'clobArbEnabled', 'minArbGap', 'arbMinMarginPct', 'arbExploreRate', 'maxArbPackages',
-  'arbLeg2BufferTicks', 'arbLeg2RereadBook', 'arbMaxHedgeLossPct',
+  'arbLeg2BufferTicks', 'arbLeg2RereadBook', 'arbMaxHedgeLossPct', 'arbUnwindPremiumTicks',
   'maxDailyLossUsd',
   'arbOnlyUntilEdge', 'forceArbOnly', 'requireEdgeForLive',
   'edgeLookback', 'edgeMinTrades', 'edgeMinExpectancy',
@@ -177,6 +177,8 @@ export function defaultPaperStrategy() {
      * a fixed dollar ceiling would be wrong at both ends of the size range.
      */
     arbMaxHedgeLossPct: 0.03,
+    // Item 106: ticks charged to the unwind for its naked settlement window.
+    arbUnwindPremiumTicks: 1,
     arbExploreRate: 0.08,
     arbOnlyUntilEdge: false,
     forceArbOnly: false,
