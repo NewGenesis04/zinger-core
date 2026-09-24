@@ -1968,6 +1968,23 @@ function summarizeBook(depth) {
 /** One subscription to feed status for the life of the process (item 111). */
 let _wsStatusLogged = false;
 
+/**
+ * Is item 111's socket logging on? (item 117 experiment)
+ *
+ * Every `log()` ends with a synchronous `saveState()`, which serialises the
+ * whole action log — ~40ms measured locally at the 5,000-entry cap. Item 111
+ * writes such a line from the socket's `open` handler, i.e. exactly while the
+ * server is pushing its reconnect snapshot burst. If that write is what stops
+ * the bot reading fast enough, it is also what produces the next
+ * `1013 slow consumer` close, and the drops feed themselves.
+ *
+ * That is a hypothesis, not a finding. With logging off, `clobWs.connectCount`
+ * still counts every reconnect, so the drop rate can be compared with and
+ * without it. Off by default for the duration of the experiment; set
+ * `ZINGER_WS_STATUS_LOG=1` to restore the lines.
+ */
+const WS_STATUS_LOG = process.env.ZINGER_WS_STATUS_LOG === '1';
+
 /** The last live equity computed from a wallet answer; the fallback when there is none. */
 let _lastGoodLiveEquity = null;
 
@@ -2384,6 +2401,10 @@ export function getState(opts = {}) {
       books: clobWs.books,
       msgCount: clobWs.msgCount,
       lastMsgAgeMs: clobWs.lastMsgAgeMs,
+      // Item 117: reconnects since boot, counted by the socket itself rather
+      // than by the log lines under test.
+      connectCount: clobWs.connectCount,
+      staleReconnects: clobWs.staleReconnects,
     },
     dataAssurance: botState._dataAssurance || null,
     mlTraces: {
@@ -2502,6 +2523,10 @@ export function getState(opts = {}) {
       books: clobWs.books,
       msgCount: clobWs.msgCount,
       lastMsgAgeMs: clobWs.lastMsgAgeMs,
+      // Item 117: reconnects since boot, counted by the socket itself rather
+      // than by the log lines under test.
+      connectCount: clobWs.connectCount,
+      staleReconnects: clobWs.staleReconnects,
     },
     liveAccount: lean
       ? {
@@ -4340,7 +4365,7 @@ export function startBackgroundFeeds() {
   // Live CLOB UP/DOWN books via WebSocket (direct — not order-write proxy)
   // Drops and recoveries go to the persisted action log (item 111): while the
   // socket is down, book reads fall back to REST through the metered proxy.
-  if (!_wsStatusLogged) {
+  if (WS_STATUS_LOG && !_wsStatusLogged) {
     _wsStatusLogged = true;
     onClobWsStatus((r) => {
       if (r.kind === 'down') {
