@@ -21,6 +21,14 @@ import { detectAndExecuteArbPackage, lockFromFills } from '../../src/polymarket/
 import { saveAllPackages } from '../../src/polymarket/arbPersistence.js';
 import { readBuyCost } from '../../src/polymarket/trade.js';
 
+/**
+ * Item 99: a package only opens with at least `arbMinWindowSecondsLeft` (60s)
+ * of window left, so the dispatch fixtures below carry a window that is still
+ * open. Nothing here is about entry timing — that rule is pinned in
+ * `invariants.windowTiming.test.ts`.
+ */
+const OPEN_WINDOW = (asset) => `${asset}-updown-5m-${Math.floor(Date.now() / 1000 / 300) * 300 + 300}`;
+
 const incidentLegs = () => ({
   up: { outcome: 'up', fill: { shares: 4.5, costUsd: 1.53, avgPrice: 0.34, feeUsd: 0.07068, priceSource: 'venue_making' } },
   down: { outcome: 'down', fill: { shares: 4.567163, costUsd: 3.06, avgPrice: 0.67, feeUsd: 0.07068, priceSource: 'venue_making' } },
@@ -102,7 +110,7 @@ describe('INVARIANT: the engine records each leg\'s fill and locks on it', () =>
 
   const market = {
     symbol: 'ETH',
-    slug: 'eth-updown-5m-1789883400',
+    slug: OPEN_WINDOW('eth'),
     conditionId: '0xfills',
     outcomes: ['Up', 'Down'],
     tokenIds: { up: 'token-up', down: 'token-down' },

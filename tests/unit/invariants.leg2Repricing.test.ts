@@ -31,9 +31,17 @@ import { saveAllPackages, loadPackages } from '../../src/polymarket/arbPersisten
 import { buyCeiling } from '../../src/polymarket/trade.js';
 import { arbBreakEvenGap } from '../../src/polymarket/fees.js';
 
+/**
+ * Item 99: a package only opens with at least `arbMinWindowSecondsLeft` (60s)
+ * of window left, so the dispatch fixtures below carry a window that is still
+ * open. Nothing here is about entry timing — that rule is pinned in
+ * `invariants.windowTiming.test.ts`.
+ */
+const OPEN_WINDOW = (asset) => `${asset}-updown-5m-${Math.floor(Date.now() / 1000 / 300) * 300 + 300}`;
+
 const market = {
   symbol: 'BTC',
-  slug: 'btc-updown-5m-1789716600',
+  slug: OPEN_WINDOW('btc'),
   conditionId: '0xleg2',
   outcomes: ['Up', 'Down'],
   tokenIds: { up: 'token-up', down: 'token-down' },

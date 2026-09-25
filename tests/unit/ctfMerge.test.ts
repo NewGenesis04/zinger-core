@@ -8,6 +8,14 @@ import { detectAndExecuteArbPackage } from '../../src/polymarket/arbEngine.js';
 import { saveAllPackages } from '../../src/polymarket/arbPersistence.js';
 import { queryEvents } from '../../src/polymarket/telemetry/events.js';
 
+/**
+ * Item 99: a package only opens with at least `arbMinWindowSecondsLeft` (60s)
+ * of window left, so the dispatch fixtures below carry a window that is still
+ * open. Nothing here is about entry timing — that rule is pinned in
+ * `invariants.windowTiming.test.ts`.
+ */
+const OPEN_WINDOW = (asset) => `${asset}-updown-5m-${Math.floor(Date.now() / 1000 / 300) * 300 + 300}`;
+
 describe('Feature: Instant On-Chain CTF Merge (mergePositions)', () => {
   beforeEach(() => {
     saveAllPackages([]);
@@ -54,7 +62,7 @@ describe('Feature: Instant On-Chain CTF Merge (mergePositions)', () => {
     it('locks a live package without calling the merge, even when handed a wallet client', async () => {
       const market = {
         symbol: 'BTC',
-        slug: 'btc-updown-5m-1787000000',
+        slug: OPEN_WINDOW('btc'),
         conditionId: '0xcondition123',
         outcomes: ['Up', 'Down'],
         tokenIds: { up: 'token-up', down: 'token-down' },

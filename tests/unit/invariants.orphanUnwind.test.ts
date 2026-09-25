@@ -28,6 +28,16 @@
  */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 
+/**
+ * Fixture note (item 98). The incident's own slug — `btc-updown-5m-1789716600`,
+ * window 2026-09-18 07:30-07:35 UTC — is long past its close, and a live orphan
+ * past close is now held for redemption instead of sold. Every property here is
+ * about a *mid-window* orphan, where the unwind is still the right action, so
+ * the fixtures carry a window that has not closed yet. The item 98 rule is
+ * pinned separately in `invariants.windowTiming.test.ts`.
+ */
+const OPEN_SLUG = `btc-updown-5m-${Math.floor(Date.now() / 1000 / 300) * 300 + 300}`;
+
 const sell = vi.hoisted(() => ({
   /** 'credited' | 'not-credited' | 'no-bid' */
   mode: 'not-credited',
@@ -54,8 +64,8 @@ const { saveAllPackages, savePackage } = await import('../../src/polymarket/arbP
 const orphaned = (over = {}) => ({
   packageId: 'pkg-orphan',
   symbol: 'BTC',
-  slug: 'btc-updown-5m-1789716600',
-  windowKey: 'slug-btc-updown-5m-1789716600',
+  slug: OPEN_SLUG,
+  windowKey: `slug-${OPEN_SLUG}`,
   shares: 9.3472,
   upCost: 6.54, downCost: 0, totalCost: 6.54, expectedPayout: 9.35,
   status: 'ABORTED',
@@ -71,7 +81,7 @@ const orphaned = (over = {}) => ({
 
 const nakedUpLeg = (over = {}) => ({
   id: 'pos-up', packageId: 'pkg-orphan', outcome: 'up', symbol: 'BTC',
-  slug: 'btc-updown-5m-1789716600', shares: 9.3472,
+  slug: OPEN_SLUG, shares: 9.3472,
   entryPrice: 0.70, currentPrice: 0.70, costBasis: 6.54,
   entryFee: 0.1374, feesPaid: 0.1374,
   tokenId: 'token-up-live', tickSize: '0.01', negRisk: false,

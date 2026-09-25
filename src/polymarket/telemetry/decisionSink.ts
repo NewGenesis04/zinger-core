@@ -72,6 +72,9 @@ export const PERSISTED_CODES = new Set([
  */
 export const COUNTED_CODES = new Set([
   'gap_below_breakeven',
+  // Item 99. Fires on every scan tick for every market in the last minute of
+  // its window — standing state, not a decision about a particular book.
+  'window_closing',
   'gap_below_operator_floor',
   'package_already_on_slug',
   'live_not_ready',

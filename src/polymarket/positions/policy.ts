@@ -48,6 +48,7 @@
  */
 
 import { tradeEngine } from '../audit.js';
+import { positionWindowEndMs } from './settle.js';
 
 export const POLICIES = Object.freeze({
   directional: Object.freeze({
@@ -228,6 +229,36 @@ export function holdsToSettlement(posOrPlan, context = null) {
  */
 export function skipsWindowEndSale(pos, context) {
   return pos?.mode === 'live' && holdsToSettlement(pos, context);
+}
+
+/**
+ * Is redemption the right exit for this leg, rather than an unwind sell? (item 98)
+ *
+ * The same argument as `skipsWindowEndSale`, one step later in the position's
+ * life. Once the window has closed the market is no longer trading an opinion,
+ * it is converging on a payout that is already determined, and the orphan is
+ * one of exactly two things:
+ *
+ *   winning ->  $1.00 at redemption, fee-free. Selling takes the bid (observed
+ *               $0.99) and pays a taker fee, because `arb_rollback` is
+ *               deliberately outside `FEE_FREE_EXIT_REASONS`.
+ *   losing  ->  $0.00 either way, and the sell is futile.
+ *
+ * So the unwind cannot win after close and can only lose. Holding is not a
+ * decision to keep risk: after close there is no risk left to manage, only a
+ * payout to collect. `closeResolvedPositions` (item 103) owns the collection
+ * and raises an alert if resolution never lands.
+ *
+ * Live only, for the same reason as `skipsWindowEndSale`: paper has no
+ * redemption, and its window-end close *is* its settlement model. An unknown
+ * window means the old behaviour — this withdraws an action, and it may only do
+ * so on positive evidence that the window has ended.
+ */
+export function redeemRatherThanUnwind(pos, { now = Date.now() } = {}) {
+  if (pos?.mode !== 'live') return false;
+  const endMs = positionWindowEndMs(pos);
+  if (endMs == null) return false;
+  return now >= endMs;
 }
 
 /** The inverse, spelled out because it reads better at call sites that manage exits. */

@@ -2,6 +2,14 @@ import { describe, expect, it, beforeEach } from 'vitest';
 import { detectAndExecuteArbPackage, getArbPackageMetrics } from '../../src/polymarket/arbEngine.js';
 import { saveAllPackages, resetPackages } from '../../src/polymarket/arbPersistence.js';
 
+/**
+ * Item 99: a package only opens with at least `arbMinWindowSecondsLeft` (60s)
+ * of window left, so the dispatch fixtures below carry a window that is still
+ * open. Nothing here is about entry timing — that rule is pinned in
+ * `invariants.windowTiming.test.ts`.
+ */
+const OPEN_WINDOW = (asset) => `${asset}-updown-5m-${Math.floor(Date.now() / 1000 / 300) * 300 + 300}`;
+
 describe('Atomic Arb Engine', () => {
   beforeEach(() => {
     saveAllPackages([]);
@@ -99,7 +107,7 @@ describe('Atomic Arb Engine', () => {
   it('locks arb on a complementary binary even when negRisk is false', async () => {
     const market = {
       symbol: 'ETH',
-      slug: 'eth-updown-5m-1787012400',
+      slug: OPEN_WINDOW('eth'),
       conditionId: '0x6e68da643a31',
       outcomes: ['Up', 'Down'],
       tokenIds: { up: 'token-up-1', down: 'token-down-1' },

@@ -47,6 +47,7 @@ export const STRATEGY_KEYS = [
   'preferShortTf', 'shortTfWeight',
   'clobArbEnabled', 'minArbGap', 'arbMinMarginPct', 'arbExploreRate', 'maxArbPackages',
   'arbLeg2BufferTicks', 'arbLeg2RereadBook', 'arbMaxHedgeLossPct', 'arbUnwindPremiumTicks',
+  'arbMinWindowSecondsLeft',
   'maxDailyLossUsd',
   'arbOnlyUntilEdge', 'forceArbOnly', 'requireEdgeForLive',
   'edgeLookback', 'edgeMinTrades', 'edgeMinExpectancy',
@@ -179,6 +180,19 @@ export function defaultPaperStrategy() {
     arbMaxHedgeLossPct: 0.03,
     // Item 106: ticks charged to the unwind for its naked settlement window.
     arbUnwindPremiumTicks: 1,
+    /*
+     * Item 99. Seconds of window a package must still have to be worth opening.
+     *
+     * Set from the orphan path's own budget, not from its typical speed: if a
+     * leg orphans, `arbUnwindCreditGraceMs` (60s) is how long the unwind will
+     * keep waiting for the venue to credit the shares before giving up. A
+     * package entered with less time than that cannot complete its own recovery
+     * inside the window, so an orphan becomes an unmanaged bet that settles
+     * before anything can act on it — observed 2026-09-18 with 27s left.
+     *
+     * 0 disables the gate and restores the pre-99 behaviour exactly.
+     */
+    arbMinWindowSecondsLeft: 60,
     arbExploreRate: 0.08,
     arbOnlyUntilEdge: false,
     forceArbOnly: false,
@@ -392,6 +406,10 @@ export function validateConfig(cfg = {}) {
   }
   if (typeof next.minArbGap === 'number') {
     next.minArbGap = Math.max(0.005, next.minArbGap);
+  }
+  if (typeof next.arbMinWindowSecondsLeft === 'number') {
+    // A negative floor would read as "no gate" while looking like a setting.
+    next.arbMinWindowSecondsLeft = Math.max(0, next.arbMinWindowSecondsLeft);
   }
   return next;
 }

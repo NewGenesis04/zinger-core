@@ -19,6 +19,14 @@ import { fileURLToPath } from 'url';
 import { detectAndExecuteArbPackage, classifyKill } from '../../src/polymarket/arbEngine.js';
 import { saveAllPackages } from '../../src/polymarket/arbPersistence.js';
 
+/**
+ * Item 99: a package only opens with at least `arbMinWindowSecondsLeft` (60s)
+ * of window left, so the dispatch fixtures below carry a window that is still
+ * open. Nothing here is about entry timing — that rule is pinned in
+ * `invariants.windowTiming.test.ts`.
+ */
+const OPEN_WINDOW = (asset) => `${asset}-updown-5m-${Math.floor(Date.now() / 1000 / 300) * 300 + 300}`;
+
 describe('classifyKill', () => {
   const t0 = 1_000_000;
   const after = (o) => ({ bestAsk: 0.46, bestAskSize: 100, bookTs: t0 + 300, ...o });
@@ -45,7 +53,7 @@ describe('INVARIANT: a refused live leg carries its transit time and post-kill b
   beforeEach(() => saveAllPackages([]));
 
   const market = {
-    symbol: 'ETH', slug: 'eth-updown-5m-1789883400', conditionId: '0xkill', outcomes: ['Up', 'Down'],
+    symbol: 'ETH', slug: OPEN_WINDOW('eth'), conditionId: '0xkill', outcomes: ['Up', 'Down'],
     tokenIds: { up: 'tok-up', down: 'tok-down' }, acceptingOrders: true, tickSize: '0.01',
   };
   const run = ({ mode = 'live', peekBook }) => detectAndExecuteArbPackage({

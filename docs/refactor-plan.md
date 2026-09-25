@@ -5292,7 +5292,20 @@ treated as sufficient evidence for a route whose validation it could not exercis
 
 ---
 
-### 90. An arb unwind issued within ~2s of leg 1's match is refused, and the retry is 2 minutes away
+### 90. An arb unwind issued within ~2s of leg 1's match is refused, and the retry is 2 minutes away ✅ CLOSED 2026-09-25 — fixed by items 100 and 101
+
+**CLOSED 2026-09-25.** Both halves are already fixed, and better than this
+item proposed. The two-minute retry was item 100: one age predicate served both
+`PENDING_FILL` promotion (120s, a real interlock) and orphan retry on an
+already-ABORTED package (now 5s, nothing in flight). The refusal itself is item
+101: `isSettlementCreditRefusal` recognises the venue's `balance: 0` wording and
+does not spend the permanent-failure budget on it, retrying until the shares are
+credited, bounded on wall clock by `arbUnwindCreditGraceMs` (60s).
+
+This item's own proposal — "retry inline after ~2.5s" — would have failed on the
+2026-09-18 ETH leg, which was still refused at 2.85s (item 102). A fixed sleep
+is a guess about a distribution nobody has sampled; the balance-gated retry is
+not.
 
 **Found 2026-09-17** from the item 82 receipts (domain facts §9d).
 
@@ -5709,6 +5722,26 @@ reference to window end, time remaining, or `marketWindow()` — which
 rather than unwind) but it changes money-path behaviour and interacts with item
 74a's stop-loss, which currently owns the orphan.
 
+**Fixed 2026-09-25 (uncommitted), operator go-ahead.** `redeemRatherThanUnwind`
+(`positions/policy.ts`) is the one owner of "sell or redeem", beside
+`skipsWindowEndSale` — live only, and only on positive evidence that the window
+has ended (`positionWindowEndMs` returning null does not withdraw the sell).
+`unwindLeg` consults it before `placeMarketSell`, so both call paths are covered:
+the inline unwind at the end of dispatch and the reconcile sweep. A held leg
+latches `heldToRedemptionAt` so the sweep stops re-announcing an unwind it will
+not attempt, and the abort log says "held to redemption" instead of claiming an
+emergency unwind (the item 73(b) rule, one outcome later).
+
+Nothing new closes the position: `closeResolvedPositions` (item 103) already
+covers every live position past its window end, books the Gamma payout fee-free,
+and raises `resolution overdue` if the payout never lands. Paper is unchanged —
+it has no redemption, and its window-end close is its settlement model.
+
+Pinned by `tests/unit/invariants.windowTiming.test.ts`. Note
+`invariants.orphanUnwind.test.ts` had to move its fixtures into an open window:
+its slug was the 2026-09-18 one, whose window closed in 2026, so every unwind
+property there was being asserted against a leg this rule now holds.
+
 ---
 
 ### 99. Nothing stops a package opening seconds before its window closes
@@ -5738,6 +5771,32 @@ actual latency — abort plus settlement-credit plus one retry — not guessed.
 it is the orphan gate (5s) plus however long the venue takes to credit, retried
 until it does. The next live orphan measures it, and the gate should be set from
 that measurement rather than from the old figure.
+
+**Fixed 2026-09-25 (uncommitted), operator go-ahead.** `arbMinWindowSecondsLeft`
+(default **60s**), gated in `detectAndExecuteArbPackage` after the gap gates and
+before dispatch, emitting `window_closing` with its operands. Counted, not
+persisted (`decisionSink.ts`): it fires every scan tick for every market in the
+last minute of its window.
+
+The threshold is the machinery's own budget rather than its typical speed. The
+observed worst case to flat is ~5s (sub-second abort, 1.9-2.9s credit over three
+samples in §9d, one FOK sell), but `arbUnwindCreditGraceMs` is 60s — that is how
+long the unwind path will keep waiting for credit before giving up, so a package
+with less window than that cannot finish its own recovery inside the window. On
+5-minute windows it closes the last 20% to new packages. `0` restores the old
+behaviour exactly.
+
+Both modes, deliberately: this is a rule about which packages are worth opening,
+not about how they execute, and paper that ignores it stops being a model of the
+live book (D6). A window that cannot be established does **not** gate —
+`marketWindow` falls back to a wall-clock bucket for any slug it cannot parse
+(`windows.ts:80`), and refusing trades on that guess would silently disable the
+engine if the slug format ever changed.
+
+Pinned by `tests/unit/invariants.windowTiming.test.ts`. Six existing arb test
+files carried historical slugs whose windows have closed; their fixtures now sit
+in an open window, so the gate stays live in every test that dispatches a
+package rather than being switched off per file.
 
 ---
 

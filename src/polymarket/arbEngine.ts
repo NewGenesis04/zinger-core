@@ -10,6 +10,8 @@ import { getDepthForMarket } from './clob.js';
 import { getClobWsBook } from './clobWs.js';
 import { emitEvent } from './telemetry/events.js';
 import { isArbHalted } from './arbReconcile.js';
+import { marketWindow } from './windows.js';
+import { redeemRatherThanUnwind } from './positions/policy.js';
 import type { ArbPackage } from './arbPersistence.js';
 
 export type { ArbPackage };
@@ -186,6 +188,41 @@ export async function detectAndExecuteArbPackage({
   const minGap = Number(cfg.minArbGap ?? 0.015);
   if (gap < minGap) {
     arbDecision('skip', 'gap_below_operator_floor', { gap, minGap },
+      { breakEvenGap, requiredGap });
+    return null;
+  }
+
+  /*
+   * Time left in the window (item 99).
+   *
+   * A package that locks is indifferent to when it opened — both legs redeem to
+   * $1.00 whenever the window ends. A package that *orphans* is not: the path
+   * back to flat is abort -> wait for the venue to credit the shares -> unwind,
+   * and every stage of it costs wall-clock time the position may not have. The
+   * 2026-09-18 entry had 27 seconds, which is less than the credit wait alone
+   * has been observed to take on a bad day. What that produces is not a hedge
+   * that failed, it is an unmanaged directional bet at market odds: zero edge,
+   * full variance, settled before anything can act.
+   *
+   * The default is the machinery's own budget rather than its typical speed.
+   * `arbUnwindCreditGraceMs` is how long the unwind path will keep waiting for
+   * credit before it gives up (60s); a package that cannot afford that wait is
+   * one whose orphan path is guaranteed to be cut short.
+   *
+   * Both modes. This is a rule about which packages are worth opening, not
+   * about how they execute, so paper has to obey it or it stops being a model
+   * of the live book (D6).
+   *
+   * A window we cannot establish does not gate: `marketWindow` falls back to a
+   * wall-clock bucket for any slug it cannot parse (`windows.ts:80`), and that
+   * is a guess. Refusing trades on a guess would silently disable the engine if
+   * the slug format ever changed, which is the more expensive failure.
+   */
+  const minWindowLeftMs = Math.max(0, Number(cfg.arbMinWindowSecondsLeft ?? 60) * 1000);
+  const win = marketWindow(market);
+  if (minWindowLeftMs > 0 && win?.source !== 'wall' && Number(win?.remainingMs) < minWindowLeftMs) {
+    arbDecision('skip', 'window_closing',
+      { remainingMs: Number(win?.remainingMs) || 0, minRemainingMs: minWindowLeftMs, windowSource: win?.source ?? null },
       { breakEvenGap, requiredGap });
     return null;
   }
@@ -754,12 +791,16 @@ export async function detectAndExecuteArbPackage({
     ].filter(Boolean).join(' — ');
 
     let unwound = false;
-    if (upShares > 0 && downShares <= 0) {
-      await unwindLeg({ outcome: 'up', pkg, market, mode, cfg, botState, log, adjustPaperCash, saveTrade });
-      unwound = true;
-    } else if (downShares > 0 && upShares <= 0) {
-      await unwindLeg({ outcome: 'down', pkg, market, mode, cfg, botState, log, adjustPaperCash, saveTrade });
-      unwound = true;
+    let held = false;
+    const naked = upShares > 0 && downShares <= 0 ? 'up'
+      : downShares > 0 && upShares <= 0 ? 'down'
+        : null;
+    if (naked) {
+      const res = await unwindLeg({ outcome: naked, pkg, market, mode, cfg, botState, log, adjustPaperCash, saveTrade });
+      // Item 98. A post-close orphan is deliberately not sold, so the suffix
+      // must not claim it was — same rule as item 73(b) below, one outcome further on.
+      held = res?.heldToRedemption === true;
+      unwound = !held;
     }
 
     savePackage(pkg);
@@ -768,10 +809,12 @@ export async function detectAndExecuteArbPackage({
       // filled still claimed an emergency unwind had run — the loudest line in
       // the feed describing an event that did not happen. Neither leg filled is
       // the *safe* outcome; say that.
-      const suffix = unwound
-        ? '— emergency unwound filled leg'
-        : '— no leg filled, nothing to unwind';
-      log(`⚠️ ABORTED ARB PACKAGE ${market.symbol} (${pkg.abortReason}) ${suffix}`, 'sl', { packageId, slug: market.slug, unwound });
+      const suffix = held
+        ? '— filled leg held to redemption (window closed)'
+        : unwound
+          ? '— emergency unwound filled leg'
+          : '— no leg filled, nothing to unwind';
+      log(`⚠️ ABORTED ARB PACKAGE ${market.symbol} (${pkg.abortReason}) ${suffix}`, 'sl', { packageId, slug: market.slug, unwound, held });
     }
     return pkg;
   } catch (err) {
@@ -1061,6 +1104,31 @@ async function unwindLeg({ outcome, pkg, market, mode, cfg, botState, log, adjus
 
   const shares = Number(pos.shares || 0);
   const price = Number(pos.entryPrice || 0);
+  /*
+   * Item 98. After the window closes the sell is the wrong action in both
+   * branches of the only two outcomes left, so it is not attempted: a winning
+   * orphan is worth $1.00 at redemption and a losing one is worth nothing.
+   * `closeResolvedPositions` closes it at the real payout (item 103).
+   *
+   * Returns `closed: false` truthfully — the leg is still held. Callers that
+   * count sweeps already treat that as "not swept", which is correct: nothing
+   * was sold. The latch is on the position so the sweep can recognise a leg it
+   * has deliberately left alone rather than retrying it every tick.
+   */
+  if (redeemRatherThanUnwind(pos)) {
+    const first = !pos.heldToRedemptionAt;
+    pos.heldToRedemptionAt = pos.heldToRedemptionAt || Date.now();
+    pos.unwindBlocked = false;
+    if (log && first) {
+      log(
+        `🎟️ ARB ORPHAN HELD TO REDEMPTION ${pos.symbol} ${outcome.toUpperCase()} ${shares}sh — window closed, so a sell takes the bid and pays a fee that redemption does not`,
+        'system',
+        { packageId: pkg.packageId, slug: pos.slug || market?.slug, outcome, shares },
+      );
+    }
+    return { ok: true, closed: false, heldToRedemption: true };
+  }
+
   // The price the close is actually booked at. Stays null until a live receipt
   // says otherwise; paper has no receipt and models the refund at entry.
   let realisedExit = null;
@@ -1326,6 +1394,21 @@ export async function reconcilePendingPackages({
     }
     const orphan = [...outcomes][0];
     const ageH = ((now - Number(pkg.createdAt || 0)) / 3_600_000).toFixed(1);
+
+    // Item 98. A leg past its window end is waiting for redemption, not stuck.
+    // Checked before the log so the sweep does not announce an unwind it will
+    // not attempt, on every housekeeping tick until the payout lands.
+    const orphanPos = positions.find((p) => p.packageId === pkg.packageId && p.outcome === orphan && !p.closed);
+    if (orphanPos && redeemRatherThanUnwind(orphanPos, { now })) {
+      pkg.legs[orphan].filled = true;
+      if (!orphanPos.heldToRedemptionAt) {
+        orphanPos.heldToRedemptionAt = now;
+        if (log) log(`🎟️ ARB RECONCILE ${pkg.symbol} ${pkg.packageId} → naked ${orphan.toUpperCase()} leg held to redemption · window closed, payout collects it`, 'system', { packageId: pkg.packageId, slug: pkg.slug, outcome: orphan });
+      }
+      savePackage(pkg);
+      continue;
+    }
+
     if (log) log(`🔧 ARB RECONCILE ${pkg.symbol} ${pkg.packageId} → naked ${orphan.toUpperCase()} leg still open ${ageH}h after abort — unwinding`, 'sl', { packageId: pkg.packageId, slug: pkg.slug });
     try {
       const unwound = await unwindLeg({ outcome: orphan, pkg, market: { slug: pkg.slug }, mode, cfg, botState, log, adjustPaperCash, saveTrade });
