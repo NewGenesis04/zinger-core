@@ -75,6 +75,10 @@ export const COUNTED_CODES = new Set([
   // Item 99. Fires on every scan tick for every market in the last minute of
   // its window — standing state, not a decision about a particular book.
   'window_closing',
+  // Items 118 and 120. Both fire at scan rate for as long as the feed is behind
+  // or the book has not moved, which is the condition, not an event.
+  'book_stale',
+  'awaiting_book_update',
   'gap_below_operator_floor',
   'package_already_on_slug',
   'live_not_ready',

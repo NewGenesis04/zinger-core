@@ -37,7 +37,12 @@ const market = {
 };
 
 /** A gap wide enough to clear break-even, so only affordability can refuse it. */
-const depth = { up: { bestAsk: 0.33, bestAskSize: 5000 }, down: { bestAsk: 0.487, bestAskSize: 5000 } };
+/**
+ * Item 118 gates on book age, so a fixture stamped once at import would age out
+ * as the file runs. Stamped per call instead — in production every book carries
+ * the moment it was received.
+ */
+const depth = () => ({ up: { bestAsk: 0.33, bestAskSize: 5000, bookTs: Date.now() }, down: { bestAsk: 0.487, bestAskSize: 5000, bookTs: Date.now() } });
 
 const baseCfg = {
   clobArbEnabled: true,
@@ -57,7 +62,7 @@ const baseCfg = {
 function run({ mode, spendableBalance, paperBankroll, executeTrade, readiness = undefined }) {
   return detectAndExecuteArbPackage({
     market,
-    depth,
+    depth: depth(),
     prices: { up: 0.33, down: 0.487 },
     cfg: { ...baseCfg, paperBankroll },
     mode,

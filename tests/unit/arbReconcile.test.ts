@@ -296,7 +296,7 @@ describe('INVARIANT: a blind leg stops the engine', () => {
         outcomes: ['Up', 'Down'], tokenIds: { up: 'tok-up-h', down: 'tok-down-h' },
         acceptingOrders: true,
       },
-      depth: { up: { bestAsk: 0.04, bestAskSize: 400 }, down: { bestAsk: 0.94, bestAskSize: 400 } },
+      depth: { up: { bestAsk: 0.04, bestAskSize: 400, bookTs: Date.now() }, down: { bestAsk: 0.94, bestAskSize: 400, bookTs: Date.now() } },
       prices: { upAsk: 0.04, downAsk: 0.94 },
       cfg: {
         clobArbEnabled: true, minArbGap: 0.01, maxArbPackages: 4,

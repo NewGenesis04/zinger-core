@@ -37,7 +37,7 @@ vi.mock('../../src/polymarket/trade.js', async (orig) => ({
   },
 }));
 
-const { detectAndExecuteArbPackage, reconcilePendingPackages } = await import('../../src/polymarket/arbEngine.js');
+const { detectAndExecuteArbPackage, reconcilePendingPackages, __resetRefusedBooks } = await import('../../src/polymarket/arbEngine.js');
 const { saveAllPackages, savePackage, loadPackages } = await import('../../src/polymarket/arbPersistence.js');
 const { redeemRatherThanUnwind } = await import('../../src/polymarket/positions/policy.js');
 const { defaultPaperStrategy } = await import('../../src/polymarket/modeConfig.js');
@@ -95,6 +95,8 @@ async function detect({ slug, mode = 'paper', cfg = {}, fills = true }) {
 }
 
 beforeEach(() => {
+  // Item 120 keeps a refusal per slug in module state, like the package store.
+  __resetRefusedBooks();
   saveAllPackages([]);
   sell.calls = 0;
 });

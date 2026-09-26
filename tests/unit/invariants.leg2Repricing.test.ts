@@ -26,7 +26,7 @@
  * test asserting a latency would freeze a guess about it.
  */
 import { describe, it, expect, beforeEach } from 'vitest';
-import { detectAndExecuteArbPackage, chooseLeg2Exit } from '../../src/polymarket/arbEngine.js';
+import { detectAndExecuteArbPackage, chooseLeg2Exit, __resetRefusedBooks } from '../../src/polymarket/arbEngine.js';
 import { saveAllPackages, loadPackages } from '../../src/polymarket/arbPersistence.js';
 import { buyCeiling } from '../../src/polymarket/trade.js';
 import { arbBreakEvenGap } from '../../src/polymarket/fees.js';
@@ -121,7 +121,9 @@ const run = ({ cfg = {}, downAsk = DOWN_ASK, rereadDownAsk = null, rereadUpBid =
   }).then((pkg) => ({ pkg, seen }));
 };
 
-beforeEach(() => { saveAllPackages([]); });
+beforeEach(() => {
+  // Item 120 keeps a refusal per slug in module state, like the package store.
+  __resetRefusedBooks(); saveAllPackages([]); });
 
 // ─────────────────────────────────────────────────────────────────────────────
 describe('INVARIANT: a buy bound is lifted onto the grid, never below the ask', () => {
@@ -348,7 +350,10 @@ describe('INVARIANT: an expected buffer excess is not reported as a parity fault
 
     const pkg = await detectAndExecuteArbPackage({
       market,
-      depth: { up: { bestAsk: 0.70, bestAskSize: 5000 }, down: { bestAsk: cheapDown, bestAskSize: 5000 } },
+      depth: {
+        up: { bestAsk: 0.70, bestAskSize: 5000, bookTs: Date.now() },
+        down: { bestAsk: cheapDown, bestAskSize: 5000, bookTs: Date.now() },
+      },
       prices: { upAsk: 0.70, downAsk: cheapDown },
       cfg: { ...baseCfg, minArbGap: 0.01 },
       mode: 'live',

@@ -55,7 +55,7 @@ const baseCfg = {
  * @param bank            spendable balance (live)
  */
 function run({ upAsk, downAsk, size = 5000, arbMaxUsd = 50, bank = 10_000, executeTrade } = {}) {
-  const leg = (ask) => (size == null ? { bestAsk: ask } : { bestAsk: ask, bestAskSize: size });
+  const leg = (ask) => (size == null ? { bestAsk: ask, bookTs: Date.now() } : { bestAsk: ask, bestAskSize: size, bookTs: Date.now() });
   return detectAndExecuteArbPackage({
     market,
     depth: { up: leg(upAsk), down: leg(downAsk) },

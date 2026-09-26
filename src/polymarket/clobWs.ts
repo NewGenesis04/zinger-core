@@ -29,6 +29,30 @@ const STALE_MS = Number(process.env.CLOB_WS_STALE_MS) || 120_000;
 /** @type {Map<string, { bestBid:number|null, bestAsk:number|null, mid:number|null, lastTrade:number|null, ts:number, source:string }>} */
 const books = new Map();
 
+/**
+ * When the feed last went down (item 118).
+ *
+ * A snapshot taken before a disconnect is not a price, it is a memory. Nothing
+ * here cleared `books` on close, so after a drop — and the socket drops with
+ * code 1013 roughly 1.5 times a minute (item 117) — every cached book kept its
+ * pre-drop `ts` and read as fresh for the next `MAX_BOOK_AGE_MS`. A gate that
+ * asks "how old is this?" gets a truthful answer and the wrong one: the age is
+ * small, and the book is from a connection that no longer exists.
+ *
+ * Marked rather than deleted, per token, by comparing each snapshot's own `ts`
+ * against this. A book the new connection has already refreshed carries a newer
+ * stamp and stays usable; only the ones nothing has re-sent are withdrawn. The
+ * consumers already handle `stale` — `getDepthForMarket` falls through to a
+ * REST read of the venue (`clob.ts:188`), which is the correct answer to "we
+ * lost the feed", not a failure.
+ */
+let feedDownAt = 0;
+
+/** True when this snapshot predates the last disconnect, so it is not a live price. */
+function predatesOutage(snap) {
+  return feedDownAt > 0 && Number(snap?.ts) <= feedDownAt;
+}
+
 /*
  * Per-level resting size, one map per side per token. Item 70.
  *
@@ -344,6 +368,9 @@ function connect() {
   ws.on('message', handleMessage);
   ws.on('close', (code, reason) => {
     ws = null;
+    // Item 118. Every book older than this instant is now a memory of a feed
+    // that is gone, whatever its age says.
+    feedDownAt = Date.now();
     if (running) noteWs({ type: 'close', code, reason: reason ? String(reason) : '', lastMsgAt });
     if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
     if (!running) return;
@@ -396,6 +423,7 @@ export function setClobMarketTokens(tokenIds = []) {
 export function getClobWsMid(tokenId) {
   const snap = books.get(String(tokenId));
   if (!snap) return null;
+  if (predatesOutage(snap)) return null;
   if (Date.now() - snap.ts > MAX_BOOK_AGE_MS) return null;
   return Number.isFinite(snap.mid) ? snap.mid : null;
 }
@@ -403,9 +431,13 @@ export function getClobWsMid(tokenId) {
 export function getClobWsBook(tokenId) {
   const snap = books.get(String(tokenId));
   if (!snap) return null;
+  if (predatesOutage(snap)) return { ...snap, stale: true, predatesOutage: true };
   if (Date.now() - snap.ts > MAX_BOOK_AGE_MS) return { ...snap, stale: true };
   return { ...snap, stale: false };
 }
+
+/** Test seam: the outage mark is module state that survives between cases. */
+export function __setFeedDownAt(ts = 0) { feedDownAt = Number(ts) || 0; }
 
 /**
  * Has the feed gone silent while claiming to be connected?
@@ -426,7 +458,7 @@ export function getClobWsSnapshot() {
     out[id] = {
       ...snap,
       ageMs: Math.max(0, Date.now() - snap.ts),
-      stale: Date.now() - snap.ts > MAX_BOOK_AGE_MS,
+      stale: predatesOutage(snap) || Date.now() - snap.ts > MAX_BOOK_AGE_MS,
     };
   }
   return {

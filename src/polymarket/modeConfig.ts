@@ -47,7 +47,7 @@ export const STRATEGY_KEYS = [
   'preferShortTf', 'shortTfWeight',
   'clobArbEnabled', 'minArbGap', 'arbMinMarginPct', 'arbExploreRate', 'maxArbPackages',
   'arbLeg2BufferTicks', 'arbLeg2RereadBook', 'arbMaxHedgeLossPct', 'arbUnwindPremiumTicks',
-  'arbMinWindowSecondsLeft',
+  'arbMinWindowSecondsLeft', 'arbMaxBookAgeMs', 'arbMaxBookSkewMs', 'arbRefuseRefireOnSameBook',
   'maxDailyLossUsd',
   'arbOnlyUntilEdge', 'forceArbOnly', 'requireEdgeForLive',
   'edgeLookback', 'edgeMinTrades', 'edgeMinExpectancy',
@@ -193,6 +193,23 @@ export function defaultPaperStrategy() {
      * 0 disables the gate and restores the pre-99 behaviour exactly.
      */
     arbMinWindowSecondsLeft: 60,
+    /*
+     * Item 118. How old either book may be at the moment a package is gated,
+     * and how far apart the two snapshots may be taken.
+     *
+     * The socket's own staleness mark is 15s (`clobWs.ts`, MAX_BOOK_AGE_MS),
+     * which is right for a mark on a dashboard and far too loose for a price
+     * being signed: a gap between UP at t and DOWN at t-4s is the market having
+     * moved in between, not an opportunity. `0` on either disables that half.
+     */
+    arbMaxBookAgeMs: 1500,
+    arbMaxBookSkewMs: 500,
+    /*
+     * Item 120. After a refused leg, wait for new data on both books before
+     * sending the same signal again. False restores the pre-120 behaviour,
+     * which fired 25 live orders in 35 seconds against one unchanged book.
+     */
+    arbRefuseRefireOnSameBook: true,
     arbExploreRate: 0.08,
     arbOnlyUntilEdge: false,
     forceArbOnly: false,
@@ -406,6 +423,9 @@ export function validateConfig(cfg = {}) {
   }
   if (typeof next.minArbGap === 'number') {
     next.minArbGap = Math.max(0.005, next.minArbGap);
+  }
+  for (const key of ['arbMaxBookAgeMs', 'arbMaxBookSkewMs']) {
+    if (typeof next[key] === 'number') next[key] = Math.max(0, next[key]);
   }
   if (typeof next.arbMinWindowSecondsLeft === 'number') {
     // A negative floor would read as "no gate" while looking like a setting.

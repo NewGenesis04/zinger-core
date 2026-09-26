@@ -74,7 +74,10 @@ import { fileURLToPath } from 'url';
 function checkHandlers(src) {
   for (const [name, pattern] of [
     ['open', /ws\.on\('open'[\s\S]*?noteWs\(\{ type: 'open' \}\)/],
-    ['close', /ws\.on\('close', \(code, reason\) => \{[\s\S]{0,120}?noteWs\(\{ type: 'close'/],
+    // The window is generous because the handler also marks the book cache
+    // invalid on the way through (item 118); what is pinned is that a close
+    // still reports, not where the line sits.
+    ['close', /ws\.on\('close', \(code, reason\) => \{[\s\S]{0,600}?noteWs\(\{ type: 'close'/],
     ['error', /ws\.on\('error', \(err\) => \{\s*noteWs\(\{ type: 'error'/],
     ['stale', /isStreamStale\([\s\S]*?noteWs\(\{ type: 'stale'/],
   ]) {

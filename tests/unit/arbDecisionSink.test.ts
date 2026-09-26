@@ -162,7 +162,9 @@ describe('INVARIANT: a book refused only for capacity leaves a row (item 110)', 
     const { saveAllPackages } = await import('../../src/polymarket/arbPersistence.js');
     const openWindow = `btc-updown-5m-${Math.floor(Date.now() / 1000)}`;
     saveAllPackages([{ packageId: 'holder', mode: 'live', status: 'LOCKED', slug: openWindow, legs: {} }]);
-    const bookTs = Date.now() - 1_500;
+    // Old enough to prove the age is carried, young enough to clear item
+    // 118's freshness gate, which now runs before the capacity check.
+    const bookTs = Date.now() - 400;
     const pkg = await detectAndExecuteArbPackage({
       market: {
         symbol: 'ETH', slug: 'eth-cap-e2e', conditionId: '0xcap', outcomes: ['Up', 'Down'],
@@ -189,7 +191,7 @@ describe('INVARIANT: a book refused only for capacity leaves a row (item 110)', 
     expect(rows[0].slug).toBe('eth-cap-e2e');
     expect(rows[0].up_ask).toBeCloseTo(0.46, 6);
     const operands = JSON.parse(rows[0].payload).output.skipReason.operands;
-    expect(operands.bookAgeMs.up).toBeGreaterThanOrEqual(1_500);
+    expect(operands.bookAgeMs.up).toBeGreaterThanOrEqual(400);
     expect(operands).toMatchObject({ active: 1, max: 1 });
   });
 });
@@ -249,7 +251,7 @@ describe('INVARIANT: the sink reads the payload the engine actually emits', () =
     const { saveAllPackages } = await import('../../src/polymarket/arbPersistence.js');
     saveAllPackages([]);
 
-    const leg = (ask) => ({ bestAsk: ask, bestAskSize: 40 });
+    const leg = (ask) => ({ bestAsk: ask, bestAskSize: 40, bookTs: Date.now() });
     const pkg = await detectAndExecuteArbPackage({
       market: {
         symbol: 'BTC', slug: 'btc-sink-e2e', conditionId: '0xe2e',

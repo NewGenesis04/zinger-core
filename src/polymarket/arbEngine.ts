@@ -6,7 +6,7 @@ import {
   peekClobFeeParams,
 } from './fees.js';
 import { buyCeiling } from './trade.js';
-import { getDepthForMarket } from './clob.js';
+import { getDepthForMarket, getOrderBookDepth } from './clob.js';
 import { getClobWsBook } from './clobWs.js';
 import { emitEvent } from './telemetry/events.js';
 import { isArbHalted } from './arbReconcile.js';
@@ -27,6 +27,35 @@ export { getActivePackages, loadPackages, resetPackages };
  * it false on every btc/eth-updown market this bot trades — gating arb on it
  * disabled the strategy outright.
  */
+/**
+ * Books that produced a refusal, by slug (item 120).
+ *
+ * 2026-09-25 05:01:24-05:01:58: twenty-five live FOK orders in thirty-five
+ * seconds, one slug, all signed at the same price, all killed. Nothing bounded
+ * it — an abort frees the slug immediately, and the next 250ms scan pass
+ * rebuilds the identical order from the identical cached book, because the
+ * socket had not delivered anything in between.
+ *
+ * The bound is data, not time: a refused signal may be retried once the books
+ * that produced it have actually changed. A timer would be a guess about an
+ * update rate that is itself the variable here — that burst saw one update
+ * every 4-6 seconds on a market scanned four times a second.
+ */
+const refusedBooks = new Map<string, { upTs: number | null; downTs: number | null; at: number }>();
+
+const REFUSAL_MEMORY_MS = 10 * 60_000;
+
+/** Bounded: windows rotate every 5 minutes, so entries stop being relevant quickly. */
+function rememberRefusal(slug, upTs, downTs) {
+  if (!slug) return;
+  const now = Date.now();
+  for (const [key, rec] of refusedBooks) if (now - rec.at > REFUSAL_MEMORY_MS) refusedBooks.delete(key);
+  refusedBooks.set(String(slug), { upTs: upTs ?? null, downTs: downTs ?? null, at: now });
+}
+
+/** Test seam: module state that would otherwise leak between cases. */
+export function __resetRefusedBooks() { refusedBooks.clear(); }
+
 export function isComplementaryBinary(market): boolean {
   if (!market?.conditionId) return false;
   if (!Array.isArray(market.outcomes) || market.outcomes.length !== 2) return false;
@@ -54,6 +83,9 @@ export async function detectAndExecuteArbPackage({
   // Item 97. Injected so the leg-2 re-read is deterministic under test; in
   // production this is the same book reader the scan used.
   refetchDepth = getDepthForMarket,
+  // Item 119. The venue itself, for when the cache has not moved. Injected so
+  // the forced read is observable under test.
+  refetchBook = getOrderBookDepth,
   // Item 109. The book as the socket last saw it, read after a kill. Cache
   // only, never a network call. Injected for the same reason as above.
   peekBook = getClobWsBook,
@@ -190,6 +222,88 @@ export async function detectAndExecuteArbPackage({
     arbDecision('skip', 'gap_below_operator_floor', { gap, minGap },
       { breakEvenGap, requiredGap });
     return null;
+  }
+
+  /*
+   * Is this book a price, or a memory? (item 118)
+   *
+   * The gap is a difference between two numbers, and it is only an opportunity
+   * if both were true at the same moment. Measured 2026-09-25 over 33 live
+   * packages: 18 of 32 refusals came back `no_book_update` and 7 `unchanged` —
+   * the venue rejecting an order bounded at the book's own quoted ask, with the
+   * socket still showing that ask afterwards. One refusal in thirty-two was the
+   * price moving in transit.
+   *
+   * Two separate conditions, because they fail differently:
+   *
+   *   age   a snapshot both sides agree on, but from long enough ago that the
+   *         market has moved under it. The 05:01 burst ran on books that aged
+   *         to 6.2s between updates while the scan ran every 250ms.
+   *   skew  both snapshots recent, but taken at different moments. A gap
+   *         between UP at t and DOWN at t-4s is the market having moved in
+   *         between, and the further apart they are the wider the phantom — so
+   *         without this bound the gate selects for desynchronised books.
+   *
+   * Unknown age refuses. Every production path stamps `bookTs` — the socket
+   * from the snapshot it received (`clob.ts:203`), the REST fallback from the
+   * moment of the call (`clob.ts:210`) — so a book without one came from
+   * neither, and "I cannot tell how old this is" is not a basis for sending
+   * money.
+   *
+   * What this does NOT catch, and it is on the record: `pkg-eth-mugxs3bm` held
+   * both books under 600ms old and signed 4-7 ticks away from what the venue
+   * filled. Freshness is necessary and it is not sufficient; item 119 covers
+   * the committed path, and only a venue read covers the rest.
+   */
+  const upBookTs = Number(depth?.up?.bookTs) || null;
+  const downBookTs = Number(depth?.down?.bookTs) || null;
+  const maxBookAgeMs = Math.max(0, Number(cfg.arbMaxBookAgeMs ?? 1500));
+  const maxBookSkewMs = Math.max(0, Number(cfg.arbMaxBookSkewMs ?? 500));
+  if (maxBookAgeMs > 0) {
+    const at = Date.now();
+    const upAgeMs = upBookTs ? at - upBookTs : null;
+    const downAgeMs = downBookTs ? at - downBookTs : null;
+    const skewMs = upBookTs && downBookTs ? Math.abs(upBookTs - downBookTs) : null;
+    const tooOld = upAgeMs == null || downAgeMs == null
+      || upAgeMs > maxBookAgeMs || downAgeMs > maxBookAgeMs;
+    const tooSkewed = maxBookSkewMs > 0 && (skewMs == null || skewMs > maxBookSkewMs);
+    if (tooOld || tooSkewed) {
+      arbDecision('skip', 'book_stale',
+        {
+          upAgeMs, downAgeMs, skewMs, maxBookAgeMs, maxBookSkewMs,
+          reason: tooOld ? 'age' : 'skew',
+          upSource: depth?.up?.source ?? null, downSource: depth?.down?.source ?? null,
+        },
+        { breakEvenGap, requiredGap });
+      return null;
+    }
+  }
+
+  /*
+   * One refusal per book (item 120).
+   *
+   * A killed leg says this signal was not executable. Re-sending it against the
+   * same two snapshots asks the venue the same question and gets the same
+   * answer — twenty-five times in thirty-five seconds, on 2026-09-25. New data
+   * on *both* sides is what makes it a new signal: the phantom is one stale
+   * leg, so "the other side ticked" is not enough to clear it.
+   */
+  const lastRefusal = cfg.arbRefuseRefireOnSameBook === false ? null : refusedBooks.get(market.slug);
+  if (lastRefusal) {
+    // Either side still carrying its old stamp is enough to hold: the phantom
+    // is one stale leg against one live one, so "the live side ticked again"
+    // does not make the pair a new signal.
+    const upUnmoved = lastRefusal.upTs != null && lastRefusal.upTs === upBookTs;
+    const downUnmoved = lastRefusal.downTs != null && lastRefusal.downTs === downBookTs;
+    if (upUnmoved || downUnmoved) {
+      arbDecision('skip', 'awaiting_book_update',
+        {
+          unmoved: upUnmoved && downUnmoved ? 'both' : upUnmoved ? 'up' : 'down',
+          upBookTs, downBookTs, refusedAt: lastRefusal.at, waitedMs: Date.now() - lastRefusal.at,
+        },
+        { breakEvenGap, requiredGap });
+      return null;
+    }
   }
 
   /*
@@ -583,15 +697,41 @@ export async function detectAndExecuteArbPackage({
             ...market,
             tokenIds: { up: market.tokenIds?.up, down: market.tokenIds?.down },
           });
-          const a = Number(reread?.down?.bestAsk);
+          /*
+           * Item 119. `refetchDepth` is `getDepthForMarket`, which returns the
+           * WS cache whenever it is two-sided and under MAX_BOOK_AGE_MS
+           * (`clob.ts:188`). So when the socket has not ticked since the scan
+           * snapshot, the "re-read" returns the identical numbers and this path
+           * signs against the same book twice while reporting it refreshed.
+           *
+           * Measured: `pkg-eth-mugxs3bm`'s DOWN leg re-read at 513ms of age,
+           * signed 0.36, and filled at 0.32.
+           *
+           * Same `bookTs` means nothing was refreshed, so go to the venue. One
+           * token, one direct call (CLOB reads bypass the proxy, `clob.ts:1`),
+           * on the one path where leg 1 has already filled and the money is
+           * committed — the cost of being wrong here is a naked leg, not a
+           * missed trade. The UP bid below stays cache-priced: it chooses
+           * between two exits rather than signing one.
+           */
+          let downBook = reread?.down ?? null;
+          const cacheUnmoved = downBook
+            && depth?.down?.bookTs
+            && Number(downBook.bookTs) <= Number(depth.down.bookTs);
+          if (cacheUnmoved && market.tokenIds?.down) {
+            const venue = await refetchBook(market.tokenIds.down);
+            if (Number(venue?.bestAsk) > 0) downBook = { ...venue, bookTs: Date.now(), source: 'clob-rest-forced' };
+          }
+          const a = Number(downBook?.bestAsk);
           if (a > 0.01 && a < 0.99) {
             freshDownAsk = a;
             // Merge rather than replace: the UP side of `depth` is still the
             // book leg 1 was sized from, and `executeArbLeg` stamps leg
             // diagnostics (`bookAgeMs`, `bookSource`) off whichever entry it is
             // given. Dropping UP here would blank leg 1's provenance.
-            leg2Depth = { ...(depth || {}), down: reread.down };
-            bookRefreshed = true;
+            leg2Depth = { ...(depth || {}), down: downBook };
+            // Truthful: the book behind leg 2 is not the one the scan used.
+            bookRefreshed = !cacheUnmoved || downBook?.source === 'clob-rest-forced';
           }
           const b = Number(reread?.up?.bestBid);
           if (b > 0.01 && b < 0.99) upBid = b;
@@ -789,6 +929,10 @@ export async function detectAndExecuteArbPackage({
       why || null,
       age || null,
     ].filter(Boolean).join(' — ');
+
+    // Item 120. Leg 1 was refused, so these two snapshots did not describe a
+    // tradable book. Remember them, and do not ask again until both have moved.
+    if (upShares <= 0) rememberRefusal(market.slug, upBookTs, downBookTs);
 
     let unwound = false;
     let held = false;

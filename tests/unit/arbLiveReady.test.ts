@@ -27,9 +27,14 @@ const market = {
 };
 
 /** Clears break-even comfortably and is deep and funded, so only readiness can refuse. */
-const TRADABLE = { up: { bestAsk: 0.33, bestAskSize: 5000 }, down: { bestAsk: 0.487, bestAskSize: 5000 } };
+/**
+ * Item 118 gates on book age, so a fixture stamped once at import would age out
+ * as the file runs. Stamped per call instead — in production every book carries
+ * the moment it was received.
+ */
+const TRADABLE = () => ({ up: { bestAsk: 0.33, bestAskSize: 5000, bookTs: Date.now() }, down: { bestAsk: 0.487, bestAskSize: 5000, bookTs: Date.now() } });
 /** Sums above $1.00 — no gap at all. */
-const NO_GAP = { up: { bestAsk: 0.52, bestAskSize: 5000 }, down: { bestAsk: 0.51, bestAskSize: 5000 } };
+const NO_GAP = () => ({ up: { bestAsk: 0.52, bestAskSize: 5000, bookTs: Date.now() }, down: { bestAsk: 0.51, bestAskSize: 5000, bookTs: Date.now() } });
 
 const cfg = {
   clobArbEnabled: true, minArbGap: 0.01, maxArbPackages: 4,
@@ -37,7 +42,7 @@ const cfg = {
   instantCtfMerge: false, paperBankroll: 500,
 };
 
-function run({ mode = 'live', readiness, depth = TRADABLE, executeTrade }) {
+function run({ mode = 'live', readiness, depth = TRADABLE(), executeTrade }) {
   return detectAndExecuteArbPackage({
     market,
     depth,
@@ -102,7 +107,7 @@ describe('INVARIANT: live arb is gated on liveReady', () => {
 
 describe('INVARIANT: live_not_ready is counted only for tradable books, and not stored per row', () => {
   it('leaves a book with no gap under its own code', async () => {
-    await run({ depth: NO_GAP, readiness: { spendableBalance: 500, liveReady: false }, executeTrade: fills() });
+    await run({ depth: NO_GAP(), readiness: { spendableBalance: 500, liveReady: false }, executeTrade: fills() });
     const codes = skips().map((s) => s.code);
     expect(codes).not.toContain('live_not_ready');
     expect(codes.some((c) => c.startsWith('gap_below'))).toBe(true);

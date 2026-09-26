@@ -48,7 +48,7 @@ const baseCfg = {
 };
 
 function run({ upAsk = 0.04, downAsk = 0.94, size = 5000, arbMaxUsd = 50, bank = 10_000 } = {}) {
-  const leg = (ask) => ({ bestAsk: ask, bestAskSize: size });
+  const leg = (ask) => ({ bestAsk: ask, bestAskSize: size, bookTs: Date.now() });
   return detectAndExecuteArbPackage({
     market,
     depth: { up: leg(upAsk), down: leg(downAsk) },

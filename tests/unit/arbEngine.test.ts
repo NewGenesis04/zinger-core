@@ -1,5 +1,5 @@
 import { describe, expect, it, beforeEach } from 'vitest';
-import { detectAndExecuteArbPackage, getArbPackageMetrics } from '../../src/polymarket/arbEngine.js';
+import { detectAndExecuteArbPackage, getArbPackageMetrics, __resetRefusedBooks } from '../../src/polymarket/arbEngine.js';
 import { saveAllPackages, resetPackages } from '../../src/polymarket/arbPersistence.js';
 
 /**
@@ -12,6 +12,8 @@ const OPEN_WINDOW = (asset) => `${asset}-updown-5m-${Math.floor(Date.now() / 100
 
 describe('Atomic Arb Engine', () => {
   beforeEach(() => {
+  // Item 120 keeps a refusal per slug in module state, like the package store.
+  __resetRefusedBooks();
     saveAllPackages([]);
   });
 
@@ -26,8 +28,8 @@ describe('Atomic Arb Engine', () => {
     };
 
     const depth = {
-      up: { bestAsk: 0.34, bestAskSize: 5000 },
-      down: { bestAsk: 0.62, bestAskSize: 5000 },
+      up: { bestAsk: 0.34, bestAskSize: 5000, bookTs: Date.now() },
+      down: { bestAsk: 0.62, bestAskSize: 5000, bookTs: Date.now() },
     };
 
     const cfg = {
@@ -80,7 +82,7 @@ describe('Atomic Arb Engine', () => {
 
   it('rejects arbitrage execution when ask sum exceeds 1 - minArbGap', async () => {
     const market = { symbol: 'BTC', slug: 'btc-5m-test', conditionId: '0xbtc5m', outcomes: ['Up', 'Down'], tokenIds: { up: 'u', down: 'd' } };
-    const depth = { up: { bestAsk: 0.51, bestAskSize: 5000 }, down: { bestAsk: 0.50, bestAskSize: 5000 } }; // sum = 1.01 (no gap)
+    const depth = { up: { bestAsk: 0.51, bestAskSize: 5000, bookTs: Date.now() }, down: { bestAsk: 0.50, bestAskSize: 5000, bookTs: Date.now() } }; // sum = 1.01 (no gap)
 
     const cfg = { clobArbEnabled: true, minArbGap: 0.015, maxArbPackages: 4, paperBankroll: 100, arbLeg2BufferTicks: 0, arbLeg2RereadBook: false };
 
@@ -113,7 +115,7 @@ describe('Atomic Arb Engine', () => {
       tokenIds: { up: 'token-up-1', down: 'token-down-1' },
       negRisk: false,
     };
-    const depth = { up: { bestAsk: 0.34, bestAskSize: 5000 }, down: { bestAsk: 0.62, bestAskSize: 5000 } };
+    const depth = { up: { bestAsk: 0.34, bestAskSize: 5000, bookTs: Date.now() }, down: { bestAsk: 0.62, bestAskSize: 5000, bookTs: Date.now() } };
     const cfg = { clobArbEnabled: true, minArbGap: 0.015, maxArbPackages: 4, paperBankroll: 100, arbLeg2BufferTicks: 0, arbLeg2RereadBook: false, mode: 'paper' };
 
     const pkg = await detectAndExecuteArbPackage({
@@ -132,7 +134,7 @@ describe('Atomic Arb Engine', () => {
     ['both legs sharing one token', { conditionId: '0xabc', outcomes: ['Up', 'Down'], tokenIds: { up: 'u', down: 'u' } }],
   ])('rejects arb execution on a market with %s', async (_label, marketShape) => {
     const market = { symbol: 'ETH', slug: 'eth-not-a-binary', ...marketShape };
-    const depth = { up: { bestAsk: 0.34, bestAskSize: 5000 }, down: { bestAsk: 0.62, bestAskSize: 5000 } }; // big gap, would lock if allowed
+    const depth = { up: { bestAsk: 0.34, bestAskSize: 5000, bookTs: Date.now() }, down: { bestAsk: 0.62, bestAskSize: 5000, bookTs: Date.now() } }; // big gap, would lock if allowed
     const cfg = { clobArbEnabled: true, minArbGap: 0.015, maxArbPackages: 4, paperBankroll: 100, arbLeg2BufferTicks: 0, arbLeg2RereadBook: false, mode: 'paper' };
 
     const pkg = await detectAndExecuteArbPackage({
@@ -149,7 +151,7 @@ describe('Atomic Arb Engine', () => {
     const market2 = { symbol: 'ETH', slug: 'eth-2', conditionId: '0xeth2', outcomes: ['Up', 'Down'], tokenIds: { up: 'u2', down: 'd2' } };
 
     const cfg = { clobArbEnabled: true, minArbGap: 0.015, maxArbPackages: 1, paperBankroll: 100, mode: 'paper', arbLeg2BufferTicks: 0, arbLeg2RereadBook: false };
-    const depth = { up: { bestAsk: 0.34, bestAskSize: 5000 }, down: { bestAsk: 0.62, bestAskSize: 5000 } };
+    const depth = { up: { bestAsk: 0.34, bestAskSize: 5000, bookTs: Date.now() }, down: { bestAsk: 0.62, bestAskSize: 5000, bookTs: Date.now() } };
 
     // Package 1 fills successfully
     const pkg1 = await detectAndExecuteArbPackage({
@@ -190,7 +192,7 @@ describe('Atomic Arb Engine', () => {
 
   it('passes valid numeric entryPrice in order plans to trade execution', async () => {
     const market = { symbol: 'ETH', slug: 'eth-plan-test', conditionId: '0xethplan', outcomes: ['Up', 'Down'], tokenIds: { up: 'u', down: 'd' } };
-    const depth = { up: { bestAsk: 0.34, bestAskSize: 5000 }, down: { bestAsk: 0.62, bestAskSize: 5000 } };
+    const depth = { up: { bestAsk: 0.34, bestAskSize: 5000, bookTs: Date.now() }, down: { bestAsk: 0.62, bestAskSize: 5000, bookTs: Date.now() } };
     const cfg = { clobArbEnabled: true, minArbGap: 0.015, paperBankroll: 100, mode: 'paper', arbLeg2BufferTicks: 0, arbLeg2RereadBook: false };
 
     const capturedPlans: any[] = [];
@@ -259,7 +261,7 @@ describe('Arb entry invariants — fill-or-kill share parity', () => {
     tokenIds: { up: 'token-up-p', down: 'token-down-p' },
     acceptingOrders: true,
   };
-  const depth = { up: { bestAsk: 0.33, bestAskSize: 5000 }, down: { bestAsk: 0.487, bestAskSize: 5000 } };
+  const depth = { up: { bestAsk: 0.33, bestAskSize: 5000, bookTs: Date.now() }, down: { bestAsk: 0.487, bestAskSize: 5000, bookTs: Date.now() } };
   const cfg = {
     clobArbEnabled: true,
     minArbGap: 0.01,
@@ -289,6 +291,9 @@ describe('Arb entry invariants — fill-or-kill share parity', () => {
 
   beforeEach(() => {
     saveAllPackages([]);
+    // Item 120 remembers the books behind a refusal until they move; these
+    // cases reuse one fixture, so the memory has to be cleared like the store.
+    __resetRefusedBooks();
   });
 
   it('sizes the second leg from what the first leg actually matched, not from the plan', async () => {

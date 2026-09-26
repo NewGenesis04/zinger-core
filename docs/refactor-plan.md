@@ -6379,6 +6379,29 @@ scratch store.
 
 ---
 
+
+**Measured 2026-09-25 — the answer is the book, not the transit.** 33 live
+packages (2026-09-25 03:12-13:42), 1 filled, 32 killed. Kill causes from
+`classifyKill`, read off the socket book just after each refusal:
+
+| cause | n | share | what it means |
+|---|---|---|---|
+| `no_book_update` | 18 | 56% | socket delivered nothing between dispatch and refusal |
+| `unchanged` | 7 | 22% | book still shows enough size at or under the bound |
+| `unknown` | 6 | 19% | no socket book for that token at all |
+| `ask_moved_up` | 1 | 3% | the price moved in transit |
+| `size_thinned` | 0 | 0% | someone took it first |
+
+**One kill in 32 is the transit story this item was written around.** 25 of 32
+are a book that did not move, or did not update, while the venue refused an
+order bounded at its own quoted ask. Six had no socket book at the moment of the
+kill and were gated on something else. Transit is real — 300-1118ms measured,
+`transitMs` — but it is not what is killing the legs.
+
+Bluntly: the book the gate reads is not the book the venue matches against.
+Items 118, 119 and 120 are the three mechanisms behind that; this item is
+answered and should close with them.
+
 ### 110. A refusal that passed every gate leaves no row
 
 **Found 2026-09-21.** `package_capacity_full` is in `COUNTED_CODES`
@@ -6568,6 +6591,188 @@ known 0, and a filled leg with no closed trade `null`. Pinned by
 `tests/unit/invariants.abortCost.test.ts`.
 
 ---
+
+### 118. A WebSocket book is trusted for 15 seconds, and the arb gate never checks its age
+
+**Found 2026-09-25** from the 13:27 live package (-$0.68) and the 04:12/04:27
+aborts.
+
+`getClobWsBook` marks a cached book `stale` only after **15 seconds**
+(`clobWs.ts:12`, `MAX_BOOK_AGE_MS = 15_000`), and `getDepthForMarket` takes the
+WS branch for anything under that (`clob.ts:188`). The arb gate then reads
+`depth.up.bestAsk` and `depth.down.bestAsk` and never looks at `bookTs`: the
+field is recorded into `bookAgeMs` for diagnostics (`arbEngine.ts:262`,
+`arbEngine.ts:886`) and into the capacity-skip operands, and it gates nothing.
+
+So a gap is computed from two snapshots that may be up to 15 seconds old, and
+the two sides are aged independently — the side that is moving generates socket
+messages and stays fresh, while the side that has gone quiet, or whose updates
+were missed, does not. That is the shape of a phantom gap: a real ask on one
+leg, a stale ask on the other, and a "spread" that is the difference between now
+and then.
+
+**Why the missed updates are not hypothetical.** Item 117: the socket is closing
+with code 1013 (`slow consumer`) roughly 710 times a day, ~1.5/minute. A book
+whose updates were dropped is not marked stale — `snap.ts` is only written when a
+message arrives, so a book last updated just before a drop reads fresh for 15s
+after it. This is the cost of item 117 that was previously assessed as
+throughput-only; on this evidence it reaches the entry price.
+
+
+**Evidence 2026-09-25.** The one package that filled (`pkg-eth-mugxs3bm`,
+12:27:57) signed UP at **0.72** against a book **459ms** old and filled at
+**0.65** average (`fill.avgPrice`, `priceSource: venue_making`). Seven ticks of
+error at under half a second of age. Its DOWN leg signed **0.36** against a
+**513ms** book and filled at **0.32**.
+
+So the gate's error is not only *age*. A freshness bound of one second would
+have let this package through unchanged, and it is the only one that lost money
+(-$0.68). Age is necessary and not sufficient: the feed is behind the venue by
+more than its own timestamps admit, which is what a `slow consumer` disconnect
+(item 117) produces.
+
+The 05:01:24-05:01:58 burst is the pure age case, and a freshness gate does
+answer that one: `bookAgeMs` sawtooths 19 -> 916 -> 2264 -> 3702 -> 4974 -> 6227
+before resetting, so the socket was delivering roughly one update every 4-6s on
+a market the engine was scanning every 250ms.
+
+**A reconnect does not invalidate anything.** Neither the `close` handler
+(`clobWs.ts:345`) nor the `open` handler (`clobWs.ts:322`) touches the `books`
+map (`clobWs.ts:30`). `lastMsgAt` is reset on open so the *stream* is judged
+fresh, but every per-token snapshot keeps its pre-drop `ts`. With the socket
+dropping ~1.5x/minute (item 117), the bot spends part of every minute reading
+prices from before a disconnect and scoring them as fresh, until the resubscribe
+snapshot happens to arrive.
+
+**The two sides age independently.** Nothing compares `depth.up.bookTs` with
+`depth.down.bookTs`. A gap computed from one book at t and the other at t-4s is
+not a gap, it is the market having moved in between — and the wider the move,
+the wider the phantom, so the gate selects for exactly this.
+
+**Not fixed.** Candidate direction, cheapest first:
+
+1. A freshness gate at entry: refuse unless both books are younger than a small
+   bound (order 1-2s) and the socket is connected, with a counted skip code. No
+   added latency, and it is the gate item 109 asked for ("measure book age
+   before gating on width") now that the measurements exist. Add a *skew* bound
+   with it — refuse when the two books' `bookTs` differ by more than a few
+   hundred ms — since that is the phantom's actual shape. Note what this does
+   NOT catch: `pkg-eth-mugxs3bm` had both books under 600ms old and both were
+   wrong by 4-7 ticks.
+1b. Invalidate on reconnect: drop, or mark unusable, every cached book when the
+   socket closes. Costs nothing and removes the zombie-quote window entirely.
+2. A per-consumer age limit rather than one global 15s: a mark can tolerate 15s,
+   an entry price cannot.
+3. Re-reading BOTH books immediately before leg 1, not just DOWN before leg 2
+   (`arbEngine.ts:568`). Costs leg 1 a round trip, on the leg already dying ~95%
+   in transit, so this is the expensive option and probably the wrong one.
+
+Sizing note, for the record: leg 2's DOWN excess is **not** a parity breach. Leg
+2 is funded in dollars at the signed ceiling on purpose, so a better fill buys a
+small DOWN residual rather than signing fewer shares than leg 1 matched and
+leaving a naked UP leg (`arbEngine.ts:645-660`). The parity check expects it. A
+residual as large as 12% of the position does say the re-read ask was itself
+stale-high by several ticks, which is the same defect as above on the other side.
+
+
+**Fixed 2026-09-25 (uncommitted), operator go-ahead.** Three parts:
+
+- `arbMaxBookAgeMs` (**1500ms**) and `arbMaxBookSkewMs` (**500ms**), gated in
+  `detectAndExecuteArbPackage` before dispatch, emitting `book_stale` with both
+  ages, the skew, and which of the two bounds refused it. Unknown age refuses:
+  every production path stamps `bookTs`, so a book without one came from
+  neither. `0` disables either half.
+- A disconnect now invalidates. `clobWs.ts` records `feedDownAt` on close, and
+  `getClobWsBook` / `getClobWsMid` / the snapshot treat any book stamped at or
+  before it as stale (`predatesOutage`). Marked per snapshot rather than
+  clearing the map, so a book the new connection has already refreshed stays
+  usable. `getDepthForMarket` then falls through to a REST read, which is the
+  correct answer to "we lost the feed".
+- Counted, not persisted, in the sink: both codes fire at scan rate for as long
+  as the condition holds.
+
+Stands on the record: this would **not** have stopped the -$0.68 package, whose
+books were both under 600ms old. Item 119 covers the committed path; nothing
+short of a venue read covers entry.
+
+Pinned by `tests/unit/invariants.bookFreshness.test.ts`. Note the fixture cost:
+every arb test that dispatches a package now stamps `bookTs`, and two files that
+built their depth once at import had to stamp per call, since a frozen fixture
+ages out as the file runs.
+
+---
+
+### 119. The leg-2 "re-read" is a cache read, and can return the same stale book
+
+**Found 2026-09-25.** Item 97 re-prices leg 2 after leg 1 fills, via
+`refetchDepth` — which defaults to `getDepthForMarket` (`arbEngine.ts:56`). That
+function returns the **WS cache** whenever it is two-sided and under
+`MAX_BOOK_AGE_MS` (`clob.ts:188`), and only falls through to a REST call when it
+is not. So when the socket has not ticked since the scan snapshot, the re-read
+returns the identical numbers and `bookRefreshed` is set on a book that was
+never refreshed.
+
+Measured: `pkg-eth-mugxs3bm`'s DOWN leg re-read at 513ms of age, signed the
+ceiling at 0.36, and filled at 0.32 — the "fresh" quote was four ticks off the
+venue. The re-read did its job in the sense that it moved 0.23 -> 0.35, and it
+was still wrong, because it asked the same cache.
+
+**Not fixed.** Direction: when the re-read comes back with the same `bookTs` as
+the snapshot it is meant to replace, it has refreshed nothing — force a venue
+read (`getOrderBookDepth`, direct and unproxied per `clob.ts:1-12`) rather than
+signing against the cache twice. One token, one call, on the path where leg 1 is
+already filled and the money is already committed.
+
+
+**Fixed 2026-09-25 (uncommitted), operator go-ahead.** The re-read compares the
+returned `bookTs` against the snapshot it is replacing. Same stamp means nothing
+was refreshed, so it reads the venue directly (`getOrderBookDepth`, injected as
+`refetchBook` for test) and signs leg 2 off that. `bookRefreshed` is now only
+true when the book actually changed, so the log stops claiming a refresh that
+did not happen. A failed venue read falls back to the scan quote rather than
+leaving leg 1 naked — the documented pre-existing behaviour.
+
+The UP bid stays cache-priced on purpose: it chooses between two exits rather
+than signing one, and a second blocking read on the committed path costs more
+than it protects.
+
+---
+
+### 120. A refused package re-fires the same phantom every scan tick
+
+**Found 2026-09-25.** 05:01:24 to 05:01:58 UTC: **25 live FOK orders in 35
+seconds**, all ETH, all the same slug, all signed at the same 0.55, all killed.
+Every abort frees the slug immediately, so the next 250ms scan pass sees the same
+cached book, computes the same phantom gap, and sends the same order.
+
+Nothing bounds this. `maxConcurrentPerSlug` is raised to 2 for the duration of a
+dispatch and restored (`arbEngine.ts:536`), package capacity is released the
+moment the package aborts, and there is no per-slug cooldown after a refusal.
+Cost on this run was $0 — every order was killed — but the same loop with a book
+that happens to be executable opens a phantom package, which is exactly item
+118's loss.
+
+**Not fixed.** Direction: after a killed leg, refuse the same slug until the book
+that produced the signal has actually changed (`bookTs` advanced, or the ask
+moved), with a short floor — not a fixed timer, which would be a guess about a
+feed whose update rate is the variable here. Pairs naturally with item 118's
+freshness gate: both are "do not act twice on one snapshot".
+
+
+**Fixed 2026-09-25 (uncommitted), operator go-ahead.** `refusedBooks` keeps the
+two `bookTs` values behind each refused leg 1, per slug, and the gate emits
+`awaiting_book_update` while **either** side still carries its old stamp — the
+phantom is one stale leg against one live one, so the live side ticking again
+does not make the pair a new signal. Bounded: entries are pruned after 10
+minutes, and windows rotate every 5. `arbRefuseRefireOnSameBook: false` restores
+the old behaviour.
+
+Module state, so `__resetRefusedBooks()` belongs in any test that runs the
+detector more than once against one fixture — the same treatment the package
+store already needs.
+
+---
+
 
 ## Handoff — state as of 2026-08-20
 
