@@ -2,6 +2,15 @@
 export const POLY = {
   gammaApi: 'https://gamma-api.polymarket.com',
   clobApi: process.env.CLOB_API_URL?.trim() || 'https://clob.polymarket.com',
+  /**
+   * The Polygon JSON-RPC endpoint, owned here so there is exactly one place to
+   * repoint it. It was hardcoded in six modules, three of which ignored
+   * `POLYGON_RPC_URL` — including the live-readiness gate, which reads USDC and
+   * gas balances from chain and closes when they cannot be fetched. A free
+   * public endpoint going down therefore stopped live trading with no
+   * configuration available to avoid it (item 122).
+   */
+  polygonRpc: process.env.POLYGON_RPC_URL?.trim() || 'https://polygon-bor.publicnode.com',
   chainId: 137,
   usdc: '0x3c499c542cef5e3811e1192ce70d8cc03d5c3359',
   pUsd: '0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB',

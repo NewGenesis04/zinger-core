@@ -17,6 +17,7 @@ import {
 import { generateTokenFromPrompt } from './lib/ai.js';
 import { launchFlashToken } from './lib/chain.js';
 import { createPublicClient, http, formatEther } from 'viem';
+import { POLY } from './polymarket/config.js';
 import { polygon } from 'viem/chains';
 import fs from 'fs';
 import { refreshAllTokens, loadAutoSellConfig, saveAutoSellConfig } from './lib/monitor.js';
@@ -107,7 +108,7 @@ export async function createApp() {
 
   const publicClient = createPublicClient({
     chain: polygon,
-    transport: http('https://polygon-bor.publicnode.com', { timeout: 5000 }),
+    transport: http(POLY.polygonRpc, { timeout: 5000 }),
   });
 
   // Kick chart ticks + ML ladder even when bot is stopped

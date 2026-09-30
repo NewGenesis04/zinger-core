@@ -6,7 +6,7 @@ import { POLY } from './config.js';
 import { swapUsdcToPusd, depositPusdToDepositWallet, checkPusdBalance } from './swap.js';
 import { syncClobBalance } from './trade.js';
 
-const RPC = process.env.POLYGON_RPC_URL || 'https://polygon-bor.publicnode.com';
+const RPC = POLY.polygonRpc;
 const SCAN_INTERVAL = Number(process.env.DEPOSIT_SCAN_INTERVAL_MS || 30_000);
 
 const erc20Abi = parseAbi([
@@ -49,7 +49,19 @@ async function getUsdcTransferLogs(fromBlock, toBlock) {
 
 export async function scanForDeposits() {
   const client = createPublicClient({ chain: polygon, transport: http(RPC, { timeout: 10000 }) });
-  const currentBlock = Number(await client.getBlockNumber());
+
+  // Item 122. Inside the try, not above it. A public RPC answering with a
+  // Cloudflare error page rejects here, and this function is dispatched
+  // fire-and-forget on a timer, so the rejection had nowhere to go but the
+  // process-level handler — one `Unhandled:` line per tick for as long as the
+  // endpoint was down. Returning [] is the same answer a failed log fetch
+  // already gives: no deposits seen this pass, try again next tick.
+  let currentBlock;
+  try {
+    currentBlock = Number(await client.getBlockNumber());
+  } catch {
+    return [];
+  }
 
   if (_lastScannedBlock === 0) {
     _lastScannedBlock = currentBlock - 100;
@@ -116,8 +128,13 @@ export async function processDeposit(userAddress, usdcAmount, txHash) {
 
 export function startDepositScanner() {
   if (_scanTimer) return;
-  scanForDeposits();
-  _scanTimer = setInterval(scanForDeposits, SCAN_INTERVAL);
+  // `setInterval` discards the promise its callback returns, so a rejection
+  // that escapes `scanForDeposits` is unobservable here. Both dispatch sites
+  // swallow it explicitly rather than relying on the process-level handler
+  // in `index.ts` to keep the run alive (item 122).
+  const tick = () => { scanForDeposits().catch(() => {}); };
+  tick();
+  _scanTimer = setInterval(tick, SCAN_INTERVAL);
   return () => { clearInterval(_scanTimer); _scanTimer = null; };
 }
 

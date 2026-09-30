@@ -172,8 +172,34 @@ export async function getOrderBookDepth(tokenId, levels = 10) {
 
 export async function getDepthForMarket(market) {
   const depth = {};
-  for (const [outcome, tokenId] of Object.entries(market.tokenIds || {})) {
-    if (!tokenId) continue;
+  /*
+   * Both sides are read in ONE tick, not in sequence.
+   *
+   * This was an await-in-loop: UP's REST book was fetched, then DOWN's, so the
+   * two snapshots were hundreds of milliseconds apart by construction. For a
+   * complementary binary that is not a small inaccuracy. The two tokens share
+   * one order book (domain facts §11), so `UP.bid(p)` and `DOWN.ask(1−p)` are
+   * the same resting orders and a synchronised read always satisfies
+   * `ask_up + ask_down = 1 + spread`. Reading them apart breaks that identity
+   * and manufactures an apparent gap out of nothing but the delay — measured at
+   * 143/143 ladder levels matching in parallel versus 0/5 at ~0.4s of skew, and
+   * reproducible with `scripts/verify-complementary-books.mjs --sequential`.
+   *
+   * The arb gate fired on that phantom. The directional path reads the same
+   * function for order-book bias (`bot.ts:3073`), so it inherited the skew too.
+   *
+   * The WS cache is a synchronous map read, so it is already simultaneous; only
+   * the REST fallback needed the change. Two deliberate differences in what it
+   * returns: REST entries now share ONE `bookTs` (they were concurrent, so
+   * separate stamps would imply a skew that did not happen), and they carry
+   * `source: 'clob-rest'` — previously the REST branch set no `source` at all,
+   * so `leg.bookSource` recorded `null` and a REST book was indistinguishable
+   * from a missing one in the package records.
+   */
+  const entries = Object.entries(market.tokenIds || {}).filter(([, id]) => id);
+  const restNeeded = [];
+
+  for (const [outcome, tokenId] of entries) {
     try {
       const wsBook = getClobWsBook(tokenId);
       /*
@@ -204,11 +230,22 @@ export async function getDepthForMarket(market) {
         };
         continue;
       }
-      const d = await getOrderBookDepth(tokenId);
-      // The REST book was fetched just now, so its age starts here. Stamped so
-      // the two sources are comparable rather than one being silently undated.
-      if (d) depth[outcome] = { ...d, bookTs: Date.now() };
+      restNeeded.push([outcome, tokenId]);
     } catch {}
+  }
+
+  if (restNeeded.length) {
+    const books = await Promise.all(
+      restNeeded.map(([, tokenId]) => getOrderBookDepth(tokenId).catch(() => null)),
+    );
+    // One stamp for the whole batch: the calls were concurrent, so dating them
+    // individually would imply a skew that did not happen and would defeat the
+    // skew bound in `arbEngine.ts:261`.
+    const bookTs = Date.now();
+    restNeeded.forEach(([outcome], i) => {
+      const d = books[i];
+      if (d) depth[outcome] = { ...d, source: 'clob-rest', bookTs };
+    });
   }
   return depth;
 }

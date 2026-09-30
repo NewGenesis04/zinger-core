@@ -20,7 +20,7 @@ function getClient() {
   if (!_client) {
     _client = createPublicClient({
       chain: polygon,
-      transport: http('https://polygon-bor.publicnode.com', { timeout: 8000 }),
+      transport: http(POLY.polygonRpc, { timeout: 8000 }),
     });
   }
   return _client;
@@ -239,7 +239,7 @@ export async function checkReadiness(config = {}) {
    * the previous order (the dashboard renders the array as-is), and every leg
    * keeps its original failure branch. Only the waiting overlaps.
    *
-   * Cost: four concurrent calls to polygon-bor.publicnode.com instead of four
+   * Cost: four concurrent calls to the configured Polygon RPC instead of four
    * sequential ones, accepted by the operator.
    */
   const geoblockP = leased('geoblock', checkGeoblock,   // never rejects — proxyEnv.ts:180

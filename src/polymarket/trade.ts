@@ -22,7 +22,7 @@ function resolveWriteHost() {
 
 const HOST = process.env.CLOB_API_URL?.trim() || POLY.clobApi;
 const WRITE_HOST = resolveWriteHost();
-const RPC = 'https://polygon-bor.publicnode.com';
+const RPC = POLY.polygonRpc;
 
 let _signer = null;
 let _account = null;

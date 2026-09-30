@@ -13,7 +13,7 @@ import { processDeposit } from '../polymarket/deposits.js';
 
 const FILE = dataPath('pilot_accounts.json');
 const PLATFORM_FEE_RATE = 0.01;
-const RPC = process.env.POLYGON_RPC_URL || 'https://polygon-bor.publicnode.com';
+const RPC = POLY.polygonRpc;
 
 const erc20Abi = parseAbi(['function balanceOf(address owner) view returns (uint256)']);
 

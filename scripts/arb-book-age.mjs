@@ -2,6 +2,10 @@
 /**
  * Item 109: do wide arb gaps arrive on stale books?
  *
+ * Answered, and more strongly than the question assumed: ALL of them do. See
+ * domain facts §11 and the footer below. The tables still earn their keep as a
+ * measure of how stale, and of what the venue did with each dispatch.
+ *
  * Read-only. Lists every package in the store with its gap, the age of each
  * leg's book at dispatch (`bookAgeMs`, stamped by `executeArbLeg`), what the
  * venue said, and how the package ended. Then it tabulates outcome by gap and by
@@ -128,6 +132,11 @@ if (kills.length) {
   console.log('      mostly no_book_update → the socket is too slow to judge; widen the sample or read REST.');
 }
 
-console.log('\nRead: if wide gaps and old leg-1 books both concentrate in the aborted and');
-console.log('one-leg columns, the stale-quote mechanism in item 109 holds, and the fix is');
-console.log('to re-read the DOWN book before leg 1 as well as after. Small n settles nothing.');
+console.log('\nRead: every gap in the table above measures feed desynchronisation, not');
+console.log('opportunity. The two tokens of a binary share one order book, so');
+console.log('ask_up + ask_down is 1 + spread and cannot fall under $1.00 in a snapshot read');
+console.log('at a single moment (domain facts §11; check it with');
+console.log('scripts/verify-complementary-books.mjs). A wider gap means the stale side had');
+console.log('drifted further, so the entry gate selects for the worst reads rather than the');
+console.log('best trades. Re-reading DOWN before leg 1 does not help — a second sequential');
+console.log('read carries the same skew. Retired as item 118 candidate 3.');

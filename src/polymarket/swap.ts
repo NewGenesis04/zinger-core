@@ -5,7 +5,7 @@ import { privateKeyToAccount } from 'viem/accounts';
 import { getWallet } from '../lib/wallet.js';
 import { POLY } from './config.js';
 
-const RPC = process.env.POLYGON_RPC_URL || 'https://polygon-bor.publicnode.com';
+const RPC = POLY.polygonRpc;
 const ZRX_PROXY = '0xDef1C0ded9bec7F1a1670819833240f027b25EfF';
 
 const erc20Abi = parseAbi([
