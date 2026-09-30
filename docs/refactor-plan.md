@@ -6940,6 +6940,16 @@ live P&L attached and its "should be unreachable" note should be struck. The
 book-source question belongs to item 118 candidate 3, which should record that
 a venue read is not a clean control for this defect.
 
+**Status 2026-09-30.** Only step 2 (parallel reads) is applied. Arb has been
+abandoned by the operator, so steps 1, 3 and 4 (stop live arb, coherence gate,
+`asksSum` fault counter) are moot until arb is revisited; they are left
+unapplied rather than closed. What survives for the directional path is the
+parallel read: `bot.ts:2826`, `bot.ts:3074` and `bot.ts:4138` all call
+`getDepthForMarket`, so the order-book bias and exit marks no longer read the
+two sides at different moments. `scan/index.ts` destructured
+`getDepthForMarket` without using it and `bot.ts` never passed it; the unused
+name is removed.
+
 ---
 
 ### 122. The Polygon RPC host is hardcoded in six places and the env override reaches only three

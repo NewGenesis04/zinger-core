@@ -44,7 +44,6 @@ export async function executeScanCycle({
   fetchPriceToBeat,
   buildDataAssurance,
   getPricesForMarket,
-  getDepthForMarket,
   recordChartTick,
   detectAndExecuteArbPackage,
   buildDecision,
