@@ -29,6 +29,7 @@ const wsBooks = new Map();
 vi.mock('../../src/polymarket/clobWs.js', () => ({
   getClobWsBook: (id) => wsBooks.get(String(id)) ?? null,
   getClobWsMid: () => null,
+  getClobWsAggregate: () => null,
 }));
 
 const { getDepthForMarket } = await import('../../src/polymarket/clob.js');

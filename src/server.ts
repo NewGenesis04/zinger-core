@@ -994,6 +994,9 @@ export async function createApp() {
           useKellySizing: cfg.useKellySizing ?? null,
           useSignals: cfg.useSignals ?? null,
           useML: cfg.useML ?? null,
+          // Same expression the scan evaluates (`scan/inputs.ts`), so the status
+          // shows what is in force, not the raw key.
+          useAlphaFusion: cfg.useAlphaFusion !== false,
           enabledDurations: cfg.enabledDurations ?? null,
         },
         recent: closed.slice(0, 20).map((t) => ({

@@ -3076,12 +3076,12 @@ export async function scan() {
       // Feed the alpha fusion's ORDER_FLOW vote. Without this the modality has
       // no book to read and stays silent — collectSignals picks it up next pass.
       //
-      // Only the REST path (`normalizeLevels`) aggregates depth, so `imbalance`
-      // and `spreadPct` are absent whenever the live WS book is serving
-      // (`clob.ts:171-179` returns bestBid/bestAsk/mid/spread and nothing else).
-      // spreadPct is derivable from what the WS book does carry; imbalance is
-      // not, and is left null rather than defaulted to a neutral 0 — `source`
-      // records which book answered so a silent half-vote is diagnosable.
+      // Both branches of `getDepthForMarket` now carry `imbalance` and
+      // `spreadPct` (item 41; same arithmetic, `bookDepth.ts`). The null and the
+      // derived-spread fallback below only apply when the socket has no level
+      // data for the token; a null is left null rather than defaulted to a
+      // neutral 0 — `source` records which book answered so a silent half-vote
+      // is diagnosable.
       const sym = String(market.symbol).toLowerCase();
       if (depth && ['btc', 'eth'].includes(sym)) {
         const side = depth.up ?? depth.down ?? {};

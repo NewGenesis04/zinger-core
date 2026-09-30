@@ -788,6 +788,7 @@
       const brains = [];
       if (p.useSignals) brains.push('price signals');
       if (p.useML) brains.push('a machine-learning model');
+      if (p.useAlphaFusion) brains.push('multi-signal fusion');
       if (p.useKellySizing) brains.push('Kelly bet sizing');
       if (brains.length) L.push(`Decisions use ${b(brains.join(', '))}.`);
       const durs = Array.isArray(p.enabledDurations) ? p.enabledDurations : null;

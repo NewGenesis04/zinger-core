@@ -1,6 +1,7 @@
 // @ts-nocheck
 import { POLY } from './config.js';
-import { getClobWsMid, getClobWsBook } from './clobWs.js';
+import { getClobWsMid, getClobWsBook, getClobWsAggregate } from './clobWs.js';
+import { normalizeSide, summarizeBook } from './bookDepth.js';
 
 /**
  * CLOB **reads** go direct from the host (saves paid-proxy bandwidth).
@@ -25,73 +26,15 @@ export async function getPrice(tokenId) {
   return res.json();
 }
 
-/** Polymarket CLOB often returns bids ascending / asks descending — always normalize. */
-function normalizeLevels(book, levels = 10) {
-  const bidsRaw = (book?.bids || [])
-    .map((b) => ({ price: parseFloat(b.price), size: parseFloat(b.size) }))
-    .filter((b) => Number.isFinite(b.price) && Number.isFinite(b.size) && b.size > 0)
-    .sort((a, b) => b.price - a.price);
-  const asksRaw = (book?.asks || [])
-    .map((a) => ({ price: parseFloat(a.price), size: parseFloat(a.size) }))
-    .filter((a) => Number.isFinite(a.price) && Number.isFinite(a.size) && a.size > 0)
-    .sort((a, b) => a.price - b.price);
-
-  const bids = bidsRaw.slice(0, levels).map((b) => ({
-    ...b,
-    value: b.price * b.size,
-  }));
-  const asks = asksRaw.slice(0, levels).map((a) => ({
-    ...a,
-    value: a.price * a.size,
-  }));
-
-  let cumBid = 0;
-  let cumAsk = 0;
-  for (const b of bids) {
-    cumBid += b.size;
-    b.cum = cumBid;
-  }
-  for (const a of asks) {
-    cumAsk += a.size;
-    a.cum = cumAsk;
-  }
-
-  const bestBid = bids[0]?.price || 0;
-  const bestAsk = asks[0]?.price || 0;
-  // Top-of-book resting size. Item 73: the arb depth gate needs this from both
-  // the REST and WS branches of `getDepthForMarket`, and only the WS branch was
-  // ever missing `asks[]` — publishing the scalar here keeps the gate reading
-  // one field name whichever branch produced the book.
-  const bestBidSize = Number(bids[0]?.size) || 0;
-  const bestAskSize = Number(asks[0]?.size) || 0;
-  const spread = bestBid > 0 && bestAsk > 0 ? bestAsk - bestBid : null;
-  const mid = bestBid > 0 && bestAsk > 0
-    ? (bestBid + bestAsk) / 2
-    : (bestBid || bestAsk || null);
-  const spreadPct = mid > 0 && spread != null ? (spread / mid) * 100 : null;
-
-  const totalBidVol = bids.reduce((s, b) => s + b.value, 0);
-  const totalAskVol = asks.reduce((s, a) => s + a.value, 0);
-  const imbalance = totalBidVol + totalAskVol > 0
-    ? (totalBidVol - totalAskVol) / (totalBidVol + totalAskVol)
-    : 0;
-
-  return {
-    bids,
-    asks,
-    bestBid,
-    bestAsk,
-    bestBidSize,
-    bestAskSize,
-    spread: spread ?? 0,
-    spreadPct: spreadPct ?? 0,
-    mid: mid ?? 0,
-    totalBidVol,
-    totalAskVol,
-    imbalance,
-    bidCount: bids.length,
-    askCount: asks.length,
-  };
+/**
+ * REST payload → depth object. The ladder and aggregate arithmetic lives in
+ * `bookDepth.ts` and is shared with the WS branch (item 41). Exported for the
+ * test that pins the two branches to the same answer.
+ */
+export function normalizeLevels(book, levels = 10) {
+  const bids = normalizeSide(book?.bids, 'bid', levels);
+  const asks = normalizeSide(book?.asks, 'ask', levels);
+  return { bids, asks, ...summarizeBook(bids, asks) };
 }
 
 export async function getMidPrice(tokenId) {
@@ -227,6 +170,11 @@ export async function getDepthForMarket(market) {
           // the time we got there" is unfalsifiable, and it was the leading
           // untested theory for 20 consecutive FOK kills.
           bookTs: Number(wsBook.ts) || null,
+          // Item 41. Depth aggregate from the socket's own level maps, so the
+          // order-book vote is not blank whenever this branch serves. Spread
+          // after the top-of-book fields: `spreadPct`/`imbalance` are new keys
+          // here, and the aggregate carries no field that already exists above.
+          ...(getClobWsAggregate(tokenId) ?? {}),
         };
         continue;
       }

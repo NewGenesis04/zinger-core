@@ -34,7 +34,7 @@ export const STRATEGY_KEYS = [
   'assets', 'use15m', 'enabledDurations',
   'maxConcurrentPerSlug', 'maxOpenPositions',
   'minConfidence',
-  'useSignals', 'useML', 'useOrderBookBias', 'requireTightSpread',
+  'useSignals', 'useML', 'useOrderBookBias', 'useAlphaFusion', 'requireTightSpread',
   'tradeCurrentWindowOnly',
   'announceBeforeTrade', 'announceTimeoutSec',
   'autoApprovePaper', 'autoApproveLive',
@@ -96,6 +96,16 @@ export function defaultPaperStrategy() {
     useSignals: true,
     useML: true,
     useOrderBookBias: true,
+    /*
+     * Item 47. Kill switch for the alpha-fusion layer, which overwrites
+     * `direction` / `confidence` / `score` / `edge` on every signal
+     * (`alphaFusion.ts:163-177`). Read only by `scan/inputs.ts` as
+     * `!== false`. It must be a strategy key: a key that is not in
+     * `STRATEGY_KEYS` is stashed on the profile but dropped whenever
+     * `pickStrategy` rebuilds it, so a `false` written here used to re-arm
+     * itself. Seeded explicitly so the default is visible, not implied.
+     */
+    useAlphaFusion: true,
     requireTightSpread: true,
     tradeCurrentWindowOnly: true,
     announceBeforeTrade: true,

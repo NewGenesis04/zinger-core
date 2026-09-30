@@ -6,6 +6,7 @@
  * Endpoint: wss://ws-subscriptions-clob.polymarket.com/ws/market
  * Subscribe: { type: "market", assets_ids: [tokenId, ...] }
  */
+import { normalizeSide, summarizeBook } from './bookDepth.js';
 import WebSocket from 'ws';
 
 const WS_URL = 'wss://ws-subscriptions-clob.polymarket.com/ws/market';
@@ -434,6 +435,30 @@ export function getClobWsBook(tokenId) {
   if (predatesOutage(snap)) return { ...snap, stale: true, predatesOutage: true };
   if (Date.now() - snap.ts > MAX_BOOK_AGE_MS) return { ...snap, stale: true };
   return { ...snap, stale: false };
+}
+
+/**
+ * Depth aggregate for one token, computed from the level maps at READ time.
+ *
+ * The maintainer keeps every resting level (item 70) but publishes only the top
+ * of book, so the WS branch of `getDepthForMarket` had no `imbalance` and the
+ * directional scorer read the gap as 0 exactly when the socket was fresh (item
+ * 41). Summing here, per scan pass, leaves the message path — which the price
+ * snapshot and every stop-loss mark come from — untouched.
+ *
+ * Same arithmetic as the REST branch by construction: both call `bookDepth.ts`.
+ * Returns null when nothing is known about the token, so the caller falls back
+ * to "no aggregate" rather than a fabricated balanced book.
+ */
+export function getClobWsAggregate(tokenId) {
+  const m = levels.get(String(tokenId));
+  if (!m) return null;
+  const rows = (map) => [...map.entries()].map(([k, size]) => ({ price: keyPx(k), size }));
+  const bids = normalizeSide(rows(m.bids), 'bid');
+  const asks = normalizeSide(rows(m.asks), 'ask');
+  if (!bids.length && !asks.length) return null;
+  const { imbalance, spreadPct, totalBidVol, totalAskVol, bidCount, askCount } = summarizeBook(bids, asks);
+  return { imbalance, spreadPct, totalBidVol, totalAskVol, bidCount, askCount };
 }
 
 /** Test seam: the outage mark is module state that survives between cases. */

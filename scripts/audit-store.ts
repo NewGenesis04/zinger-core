@@ -432,5 +432,5 @@ if (asJson) {
   console.log(
     `${fails} failing · ${unknown} indeterminate · ${findings.length - fails - unknown} passing\n`,
   );
-  console.log('This is a snapshot of state, not a test result. Record it in docs/refactor-plan.md.\n');
+  console.log('This is a snapshot of state, not a test result. Record it in docs/refactor/open/ (plus a row in open-backlog.md).\n');
 }
