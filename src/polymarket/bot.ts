@@ -88,6 +88,7 @@ import { liveEquity } from './ledger/equity.js';
 import { decideExitShares, exitSharesFromSnapshot, GHOST_MIN_AGE_MS as DEFAULT_GHOST_MIN_AGE_MS } from './positions/inventory.js';
 import { evaluateEdgeGate, passesEdgeFilter } from './edge.js';
 import { buildDecision, resolveOrderSize, sideBalanceBonus } from './engines/directional.js';
+import { offerFusionBook } from './scan/fusionBook.js';
 import { recordTradeSample } from './heuristics/tradeCollector.js';
 import {
   overlayPlanWithHeuristics,
@@ -867,7 +868,6 @@ function emitDecisionEvent({
       bestAsk: telemetryNum(side?.bestAsk),
       spreadPct: telemetryNum(side?.spreadPct),
       imbalance: telemetryNum(side?.imbalance),
-      arbGap: telemetryNum(chosen?.book?.arbGap),
       remaining: telemetryNum(remaining),
       priceSource: prices?._source || null,
       isCurrent: market?.isCurrent ?? null,
@@ -3058,6 +3058,8 @@ export async function scan() {
       });
     }
 
+    // Per pass: which market's book stands for each symbol in the fusion.
+    const fusionPick = {};
     for (const market of tradableMarkets) {
       // One heartbeat per market: a pass crawling through a slow network is
       // still working and must not be abandoned; one that stops between markets
@@ -3075,29 +3077,13 @@ export async function scan() {
         : null;
       // Feed the alpha fusion's ORDER_FLOW vote. Without this the modality has
       // no book to read and stays silent — collectSignals picks it up next pass.
-      //
-      // Both branches of `getDepthForMarket` now carry `imbalance` and
-      // `spreadPct` (item 41; same arithmetic, `bookDepth.ts`). The null and the
-      // derived-spread fallback below only apply when the socket has no level
-      // data for the token; a null is left null rather than defaulted to a
-      // neutral 0 — `source` records which book answered so a silent half-vote
-      // is diagnosable.
-      const sym = String(market.symbol).toLowerCase();
-      if (depth && ['btc', 'eth'].includes(sym)) {
-        const side = depth.up ?? depth.down ?? {};
-        const mid = Number(side.mid) || 0;
-        const spread = Number(side.spread) || 0;
+      // The signal is per symbol but a pass scans several windows of it, so
+      // `offerFusionBook` owns which window's book stands for the symbol; the
+      // pick does not depend on the order markets are scanned in.
+      const fusionOffer = offerFusionBook(fusionPick, market, depth);
+      if (fusionOffer) {
         botState.booksForFusion = botState.booksForFusion || {};
-        botState.booksForFusion[sym] = {
-          bestBid: side.bestBid ?? null,
-          bestAsk: side.bestAsk ?? null,
-          imbalance: Number.isFinite(side.imbalance) ? side.imbalance : null,
-          spreadPct: Number.isFinite(side.spreadPct) && side.spreadPct > 0
-            ? side.spreadPct
-            : (mid > 0 && spread > 0 ? (spread / mid) * 100 : null),
-          source: side.source || 'clob-rest',
-          at: Date.now(),
-        };
+        botState.booksForFusion[fusionOffer.sym] = fusionOffer.book;
       }
       const remainingMs = market.endTime
         ? Math.max(0, market.endTime * 1000 - Date.now())

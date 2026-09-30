@@ -10,8 +10,8 @@ The old `docs/refactor-plan.md` (7,100+ lines) is split so context stays small.
 | What are the settled decisions / objectives? | `docs/refactor/charter.md` — Why + Objectives 1–4 + D1–D11. **Settled.** Do not re-derive or quietly diverge. |
 | What rules prevent repeats of `cccce43`? | `docs/refactor/conventions.md` — fixtures vs audits, `it.fails()`, derive money from primitives, prove behaviour-neutral moves, mutation-test invariants. |
 | What is verified Polymarket truth? | `docs/research/polymarket-domain-facts.md` (authority) + `docs/refactor/live-facts.md` (pointer + stale 2026-08-20 snapshot). Anything not in the research doc is unverified. |
-| What work is still open? | `docs/refactor/open-backlog.md` — map of 14 open items (sorted 2026-09-30: directional / infrastructure / arb-parked). Open only the per-item file you need in `docs/refactor/open/`. |
-| What did we already fix, and why? | `docs/refactor/archive/` — `fixed-items.md` (110 closed), `slices.md`, `handoff-2026-08-20.md` (stale). Grep here before re-deriving; never load whole. |
+| What work is still open? | `docs/refactor/open-backlog.md` — map of 12 open items (sorted 2026-09-30: directional / infrastructure / arb-parked). Open only the per-item file you need in `docs/refactor/open/`. |
+| What did we already fix, and why? | `docs/refactor/archive/` — `fixed-items.md` (112 closed), `slices.md`, `handoff-2026-08-20.md` (stale). Grep here before re-deriving; never load whole. |
 
 ## Context budget
 

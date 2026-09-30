@@ -355,23 +355,19 @@ export function buildDecision({
     addReason('live not ready — fund CLOB USDC', 'live_not_ready');
   }
 
-  // Order book / arb: YES+NO ask sum < 1 → free edge; imbalance biases direction
+  // Order book: imbalance and spread bias direction.
+  //
+  // Nothing here reads the sum of the two asks. The tokens of a binary share one
+  // order book, so a coherent snapshot always has `upAsk + downAsk >= 1 + spread`;
+  // a sum below 1.00 is a stale or mixed-source read, never an edge, and must not
+  // move a score, an eligibility gate, or a signal disagreement (domain facts §11).
   let bookMeta = null;
   if (cfg.useOrderBookBias !== false && depth) {
     const side = depth[outcome];
-    const upAsk = depth.up?.bestAsk || prices?.up;
-    const downAsk = depth.down?.bestAsk || prices?.down;
-    const arbGap = (upAsk > 0 && downAsk > 0) ? (1 - upAsk - downAsk) : null;
     const imbalance = side?.imbalance ?? 0;
     const spreadPct = side?.spreadPct ?? null;
-    bookMeta = { arbGap, imbalance, spreadPct, bestBid: side?.bestBid, bestAsk: side?.bestAsk };
+    bookMeta = { imbalance, spreadPct, bestBid: side?.bestBid, bestAsk: side?.bestAsk };
 
-    if (arbGap != null && arbGap > 0.01) {
-      score += arbGap * 160;
-      addReason(`arb gap +${(arbGap * 100).toFixed(1)}c`, 'arb_gap', {
-        value: arbGap, delta: arbGap * 160,
-      });
-    }
     // Absolute cents also matter — mid-% can look fine while book is untradeable
     const spreadCents = side?.bestBid > 0 && side?.bestAsk > 0
       ? (side.bestAsk - side.bestBid) * 100
@@ -431,16 +427,16 @@ export function buildDecision({
         operands: { tooVolatile: !!signal.tooVolatile, skipTrade: !!signal.skipTrade },
       });
     } else if (signal.direction === 'neutral') {
-      // Neutral: still allow book/arb-driven trades on either side
+      // Neutral: still allow book-driven trades on either side
       const edge = Math.max(0, 0.55 - price);
       score += edge * 35;
-      addReason('signal neutral — book/arb may lead', 'signal_neutral', {
+      addReason('signal neutral — book may lead', 'signal_neutral', {
         value: edge, delta: edge * 35,
       });
-      if (edge < 0.02 && !(bookMeta?.arbGap > 0.012)) {
+      if (edge < 0.02) {
         eligible = false;
         addReason('neutral + no edge', 'neutral_no_edge', {
-          value: edge, operands: { minEdge: 0.02, arbGap: bookMeta?.arbGap ?? null },
+          value: edge, operands: { minEdge: 0.02 },
         });
       }
     } else {
@@ -450,18 +446,12 @@ export function buildDecision({
       const skewSoft = cfg.sideBalanceEnabled !== false && Number(sideBalance?.upShare ?? 0.5) >= 0.68;
       if (!agrees) {
         // Soft mismatch ONLY — never hard-lock; explore lightly when skewed
-        const arbRescue = bookMeta?.arbGap != null && bookMeta.arbGap >= Number(cfg.minArbGap ?? 0.015);
         const explore = (cfg.arbExploreRate > 0 && Math.random() < Number(cfg.arbExploreRate));
         score -= 22;
         addReason(`signal says ${signal.direction.toUpperCase()} (counter)`, 'signal_counter', {
           delta: -22, operands: { signalDirection: signal.direction, expected: expectedDirection },
         });
-        if (arbRescue) {
-          score += bookMeta.arbGap * 200;
-          addReason('arb overrides mismatch', 'arb_overrides_mismatch', {
-            value: bookMeta.arbGap, delta: bookMeta.arbGap * 200,
-          });
-        } else if (explore || skewSoft) {
+        if (explore || skewSoft) {
           score += skewSoft ? 8 : 6;
           addReason(
             skewSoft ? 'soft skew explore' : 'explore opposite side',
@@ -469,10 +459,10 @@ export function buildDecision({
             { delta: skewSoft ? 8 : 6, operands: { upShare: sideBalance?.upShare ?? null } },
           );
         }
-        // Counter without arb/edge stays eligible only if price is a clear underdog
-        if (!arbRescue && !(price > 0 && price <= Number(cfg.underdogMaxPrice ?? 0.42))) {
+        // A counter-signal entry stays eligible only at a clear underdog price
+        if (!(price > 0 && price <= Number(cfg.underdogMaxPrice ?? 0.42))) {
           eligible = false;
-          addReason('counter needs arb or underdog price', 'counter_needs_arb_or_underdog', {
+          addReason('counter needs underdog price', 'counter_needs_underdog', {
             value: price, operands: { underdogMaxPrice: Number(cfg.underdogMaxPrice ?? 0.42) },
           });
         }

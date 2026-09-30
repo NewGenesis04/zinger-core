@@ -1,7 +1,7 @@
 # Open backlog — map (hot: load this, not the items)
 
 New structural findings append as new per-item files in `docs/refactor/open/` (with `file:line` evidence) plus one row here. When fixed, move the content to `archive/fixed-items.md`.
-14 open items, sorted 2026-09-30 by an audit of every `open/` file against `git log` and the code. Read the row you need, then open that file — do not load the whole set.
+12 open items, sorted 2026-09-30 by an audit of every `open/` file against `git log` and the code. Read the row you need, then open that file — do not load the whole set.
 
 Strategy focus: **directional** (operator abandoned arb, 2026-09-30). Arb items are parked, not closed.
 
@@ -9,9 +9,7 @@ Strategy focus: **directional** (operator abandoned arb, 2026-09-30). Arb items 
 
 | Item | Title | State | File |
 |---|---|---|---|
-| 42 | Alpha fusion replaces the numbers every directional gate reads | Watch note, not a defect. Item 41 has shipped (uncommitted): paper entry rate and confidence should now be compared before/after, and recorded here before live | `docs/refactor/open/042-alpha-fusion-replaces-the-numbers-every-directiona.md` |
-| 123 | The directional scorer treats a sub-$1.00 ask sum as an edge, and it is a stale read | Open, filed 2026-09-30. Three uses in `directional.ts:364-460`. First step is measuring reason-code frequency | `docs/refactor/open/123-the-directional-scorer-treats-a-sub-1-00-ask.md` |
-| 124 | booksForFusion keeps one book per symbol, and the last market scanned wins | Open, filed 2026-09-30. Matters more now item 41 makes imbalance non-zero | `docs/refactor/open/124-booksforfusion-keeps-one-book-per-symbol-and.md` |
+| 42 | Alpha fusion replaces the numbers every directional gate reads | Watch note, not a defect. Items 41, 123 and 124 have each changed what directional entries score on (real book imbalance, no arb terms, one deterministic fusion book). Compare paper entry rate and confidence before/after and record it here before live | `docs/refactor/open/042-alpha-fusion-replaces-the-numbers-every-directiona.md` |
 
 ## B. Live-money infrastructure and accounting
 

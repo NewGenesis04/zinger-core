@@ -1,6 +1,6 @@
 # Fixed / closed backlog items (archive — do not load by default)
 
-110 items, verbatim. History only; the story lives here and in git, not in context.
+112 items, verbatim. History only; the story lives here and in git, not in context.
 
 ---
 
@@ -5522,5 +5522,39 @@ toggles, which are the same shape of flag and already wired end to end.
 Roughly 15 lines across three files.
 
 ---
+
+---
+
+### 123. The directional scorer treats a sub-$1.00 ask sum as an edge, and it is a stale read
+
+**Closed 2026-09-30 (uncommitted).** `engines/directional.ts` no longer reads the sum of the two asks. `arbGap` was used in **four** places, not three: the `arb_gap` score bonus (`+gap × 160`), the neutral-signal escape from `neutral_no_edge` (`gap > 0.012`), the counter-signal `arb_overrides_mismatch` bonus (`+gap × 200`), and the counter-signal eligibility gate (`!arbRescue && !underdog`, which let a disagreeing entry through on a gap alone). All four are removed. `bookMeta` no longer carries `arbGap`, and `trade.decision` events no longer emit `inputs.arbGap`.
+
+Why: the two tokens of a binary share one order book (research §11, High confidence), so a coherent snapshot has `upAsk + downAsk >= 1 + spread`. A sum below 1.00 is a stale or mixed-source read, never an edge. Line 362-363 also fell back to the Gamma price when a side had no depth, so the gap could be computed from one real ask and one Gamma price, which is not a book comparison at all. No measurement was needed: the mechanism is settled, and the operator confirmed arb is abandoned.
+
+Behaviour change: a neutral signal with `edge < 0.02` is now always refused, and a counter-signal entry is eligible only at an underdog price (`underdogMaxPrice`). The reason code `counter_needs_arb_or_underdog` is renamed `counter_needs_underdog` (nothing else referenced it). `arb_gap` and `arb_overrides_mismatch` no longer appear.
+
+Verified: `tests/unit/directionalEngine.test.ts` (new block, 5 properties): score, eligibility and reason codes are identical across other-side asks giving sums from 0.65 to 1.20, for agreeing, disagreeing and neutral signals; no decision carries an arb code; the two refusal gates hold at every sum. Mutation-checked: the whole pre-change file fails 5 tests, and each of the three arb uses reintroduced on its own fails 2-3.
+
+Not touched: the arb engine (`arbEngine.ts`, parked), the `minArbGap` / `arbExploreRate` config keys (arb and exploration still read them), and the dashboard's `book.arbGap` display, which is a display value in `bot.ts` and not a decision input. The read-only measurement script drafted for this item was deleted as unnecessary. `directional.ts` is still `@ts-nocheck`, which is how a leftover `arbRescue` reference survived `tsc` during this change; the test suite caught it, not the compiler.
+
+---
+
+### 124. booksForFusion keeps one book per symbol, and the last market scanned wins
+
+**Closed 2026-09-30 (uncommitted).** `src/polymarket/scan/fusionBook.ts` now owns which window's book stands for a symbol in the fusion. The scan loop offers each market's depth to `offerFusionBook` with a per-pass map, and the pick no longer depends on scan order. Rule, best first: a live window over an upcoming one; a market accepting orders; the shortest window; then the slug as a tie-break. The book also records the `slug` and `windowSeconds` it came from, so a fused signal can be traced to a market.
+
+Why the shortest window: the fusion's other votes are 1m/5m technicals, so the order-flow vote should come from the book for the same horizon. That is a design choice the item left open; the alternative was the longest window or a per-market signal, which would need the signal itself to become per market.
+
+Verified: `tests/unit/invariants.fusionBook.test.ts` (10 tests) asserts the same pick over all 720 orderings of six markets across two symbols, and each rule on its own. Mutants that ignore liveness, ignore accepting-orders, prefer the longest window, drop the slug tie-break, or restore last-offered-wins each fail. One mutant survives: comparing with `> 0` instead of `>= 0`. It only differs when the *same* market is offered twice in one pass, which the scan never does, so it is an equivalent mutant in production flow.
+
+Not changed: the book is still the UP token's (`depth.up ?? depth.down`), which mirrors DOWN on a shared book (research §11), and entries in `booksForFusion` are still not aged out when a symbol has no depth for a pass.
+
+**Found 2026-09-30**, while reading `bot.ts` for item 41. Not fixed inline.
+
+`bot.ts:3090-3099` writes `botState.booksForFusion[sym]` inside the per-market loop, one slot per symbol (`btc` / `eth`), built from `depth.up ?? depth.down` of the market being processed. With several windows scanned per symbol (5m, 15m, 4h), whichever market the loop reaches last overwrites the others. `scan/inputs.ts:68-69` then hands that single book to `refreshFusionContext` for every signal of that symbol, so the ORDER_FLOW vote for a 5m entry can be computed from a 4h market's book.
+
+The book is also the UP side's (`depth.up` first); DOWN's imbalance mirrors it on a shared book (research §11), so that part is consistent.
+
+**Not fixed.** Direction: key the book by market, or select the market the signal is for. Which one is a design choice because the signal object is per symbol, not per market, so a fix needs to decide which window's book represents the symbol. Matters more now that item 41 makes the imbalance non-zero.
 
 ---

@@ -361,3 +361,63 @@ describe('directional engine — side balance', () => {
     expect(sideBalanceBonus('down', { ...CFG, sideBalanceEnabled: false }, skewed).bonus).toBe(0);
   });
 });
+
+describe('directional engine — the ask sum is not a signal (item 123)', () => {
+  // The tokens of a binary share one order book (domain facts §11), so a
+  // coherent snapshot has upAsk + downAsk >= 1 + spread. A sum below 1.00 is a
+  // stale or mixed-source read. The scorer must not treat it as an edge.
+  const withDownAsk = (downAsk, over = {}) => decide({
+    depth: { up: DEPTH.up, down: { ...DEPTH.down, bestAsk: downAsk, bestBid: Math.max(0.01, downAsk - 0.01) } },
+    prices: { up: 0.45, down: downAsk },
+    ...over,
+  });
+  const sums = [0.2, 0.35, 0.45, 0.5, 0.52, 0.6, 0.75];   // sum with the 0.45 up ask: 0.65 .. 1.20
+  const shape = (d) => ({ score: d.score, eligible: d.eligible, codes: (d.reasonCodes || []).map((r) => r.code) });
+
+  it('score, eligibility and reasons do not depend on the other side\'s ask', () => {
+    const base = shape(withDownAsk(0.52));
+    for (const downAsk of sums) {
+      expect(shape(withDownAsk(downAsk)), `downAsk=${downAsk}`).toEqual(base);
+    }
+  });
+
+  it('holds for a signal that disagrees, and for a neutral one', () => {
+    for (const signal of [
+      { direction: 'down', confidence: 0.62, score: -4, asset: 'BTC' },
+      { direction: 'neutral', confidence: 0.3, score: 0, asset: 'BTC' },
+    ]) {
+      for (const price of [0.3, 0.45, 0.54]) {
+        const base = shape(withDownAsk(0.52, { signal, price }));
+        for (const downAsk of sums) {
+          expect(shape(withDownAsk(downAsk, { signal, price })), `${signal.direction} price=${price} downAsk=${downAsk}`).toEqual(base);
+        }
+      }
+    }
+  });
+
+  it('no decision ever carries an arb reason code', () => {
+    for (const downAsk of sums) {
+      for (const direction of ['up', 'down', 'neutral']) {
+        const d = withDownAsk(downAsk, { signal: { direction, confidence: 0.62, score: 4, asset: 'BTC' } });
+        const arb = (d.reasonCodes || []).map((r) => r.code).filter((c) => /arb/.test(c));
+        expect(arb, `${direction} downAsk=${downAsk}`).toEqual([]);
+      }
+    }
+  });
+
+  it('a neutral signal with no edge is refused whatever the other ask says', () => {
+    for (const downAsk of sums) {
+      const d = withDownAsk(downAsk, { price: 0.54, signal: { direction: 'neutral', confidence: 0.3, score: 0, asset: 'BTC' } });
+      expect(d.eligible, `downAsk=${downAsk}`).toBe(false);
+      expect((d.reasonCodes || []).map((r) => r.code)).toContain('neutral_no_edge');
+    }
+  });
+
+  it('a counter-signal entry above the underdog price is refused whatever the other ask says', () => {
+    for (const downAsk of sums) {
+      const d = withDownAsk(downAsk, { price: 0.45, signal: { direction: 'down', confidence: 0.62, score: -4, asset: 'BTC' } });
+      expect(d.eligible, `downAsk=${downAsk}`).toBe(false);
+      expect((d.reasonCodes || []).map((r) => r.code)).toContain('counter_needs_underdog');
+    }
+  });
+});
