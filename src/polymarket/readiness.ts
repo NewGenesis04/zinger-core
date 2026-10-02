@@ -26,14 +26,16 @@ function getClient() {
   return _client;
 }
 
+/**
+ * The wallet's `owner()`, or null when the chain answered but nothing there
+ * names an owner. An RPC failure THROWS: it is not an answer about the wallet,
+ * and `leased` backs a rejection off briefly instead of caching it for the full
+ * owner TTL.
+ */
 async function readDepositWalletOwner(depositWallet) {
-  try {
-    const data = await getClient().call({ to: depositWallet, data: '0x8da5cb5b' });
-    if (!data?.data || data.data.length < 42) return null;
-    return `0x${data.data.slice(-40)}`;
-  } catch {
-    return null;
-  }
+  const data = await getClient().call({ to: depositWallet, data: '0x8da5cb5b' });
+  if (!data?.data || data.data.length < 42) return null;
+  return `0x${data.data.slice(-40)}`;
 }
 
 async function fetchDepositPositions(depositWallet) {
@@ -176,6 +178,11 @@ export function invalidateBalanceCache() {
   for (const key of ['clobBalance', 'depositPusd', 'positions']) _memo.delete(key);
 }
 
+/** Operator-forced re-read of who owns the deposit wallet. */
+export function invalidateOwnerCache() {
+  _memo.delete('depositOwner');
+}
+
 /** Test seam — drop every cached leg. */
 export function resetReadinessCache() {
   _memo.clear();
@@ -225,6 +232,8 @@ export async function checkReadiness(config = {}) {
   let polyBalance = 0;
   let depositOwner = null;
   let ownerMatches = false;
+  let ownerUnknown = false;
+  let ownerError = null;
   let clobError = null;
   let positions = [];
   let positionsOk = false;
@@ -248,8 +257,8 @@ export async function checkReadiness(config = {}) {
   // leased here — double-caching would only delay its recovery.
   const apiP = capture(ensureApiKey());
   const ownerP = depositWallet
-    ? leased('depositOwner', () => readDepositWalletOwner(depositWallet), () => TTL.depositOwner)
-    : null;   // never rejects — :34
+    ? capture(leased('depositOwner', () => readDepositWalletOwner(depositWallet), () => TTL.depositOwner))
+    : null;
   const pusdP = depositWallet
     ? capture(leased('depositPusd', () => getClient().readContract({
       address: POLY.pUsd,
@@ -294,14 +303,23 @@ export async function checkReadiness(config = {}) {
   }
 
   if (depositWallet) {
-    depositOwner = await ownerP;
+    const ownerRead = await ownerP;
+    // A failed read is "unknown", never a mismatch: it blocks live (ownership is
+    // unproven) but must not tell the operator their keys are wrong.
+    ownerUnknown = !ownerRead.ok;
+    depositOwner = ownerRead.ok ? ownerRead.value : null;
     ownerMatches = !!depositOwner && depositOwner.toLowerCase() === address.toLowerCase();
+    ownerError = ownerRead.ok ? null : (ownerRead.error?.message || 'unknown error');
     checks.push({
       id: 'deposit_owner',
       ok: ownerMatches,
-      detail: ownerMatches
-        ? `Deposit wallet owned by bot signer ${address.slice(0, 6)}…${address.slice(-4)}`
-        : `Deposit wallet owner ${depositOwner?.slice(0, 6)}…${depositOwner?.slice(-4)} ≠ bot ${address.slice(0, 6)}…${address.slice(-4)}`,
+      detail: ownerUnknown
+        ? `Deposit wallet owner could not be read: ${ownerError}`
+        : ownerMatches
+          ? `Deposit wallet owned by bot signer ${address.slice(0, 6)}…${address.slice(-4)}`
+          : depositOwner
+            ? `Deposit wallet owner ${depositOwner.slice(0, 6)}…${depositOwner.slice(-4)} ≠ bot ${address.slice(0, 6)}…${address.slice(-4)}`
+            : `Deposit wallet ${depositWallet.slice(0, 6)}…${depositWallet.slice(-4)} reports no owner()`,
     });
 
     const pusd = await pusdP;
@@ -459,6 +477,7 @@ export async function checkReadiness(config = {}) {
     depositWallet,
     depositOwner,
     ownerMatches,
+    ownerUnknown,
     clobError,
     geoblock,
     proxy: redactProxy(getClobProxyUrl()),
@@ -488,7 +507,10 @@ export async function checkReadiness(config = {}) {
       // With the proxy confirmed down, the auth, registry and region lines are
       // all consequences of it; listing them would point away from the cause.
       proxyDown && `CLOB proxy unreachable (${proxyHealth.detail || 'unknown'}) — live trading blocked; check the proxy quota and CLOB_PROXY_URL`,
-      depositWallet && !ownerMatches && `Deposit wallet owner ${depositOwner} is not bot signer ${address} — export that wallet’s private key into Zinger`,
+      depositWallet && ownerUnknown && `Deposit wallet owner could not be read (${ownerError}) — live blocked until the RPC answers; retries automatically`,
+      depositWallet && !ownerUnknown && !ownerMatches && (depositOwner
+        ? `Deposit wallet owner ${depositOwner} is not bot signer ${address} — export that wallet’s private key into Zinger`
+        : `Deposit wallet ${depositWallet} reports no owner() — check the address`),
       !proxyDown && clobError && `CLOB registry: ${clobError} (website balance may still work)`,
       !proxyDown && !apiReady && 'Wallet must sign CLOB API auth (automatic on first live trade)',
       !proxyDown && !regionAllowed && clobWorks && (geoblock.proxyError

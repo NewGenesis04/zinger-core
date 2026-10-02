@@ -57,7 +57,7 @@ import {
   reconcileArbLeg, haltArb, isArbHalted, arbHaltState, clearArbHalt,
   fetchWalletPositions, fetchWalletShares, findUnrecordedHoldings, markOrderInFlight, clearInFlight,
 } from './arbReconcile.js';
-import { checkReadiness, invalidateBalanceCache, applyBalanceDelta } from './readiness.js';
+import { checkReadiness, invalidateBalanceCache, invalidateOwnerCache, applyBalanceDelta } from './readiness.js';
 import { resolveDynamicLimits, setKellyTradeHistory, getKellyStats, buildDynamicPlan, checkTrailingStop, checkPartialProfit, resolveAdaptiveSl } from './kelly.js';
 import {
   dedupeTrades,
@@ -2696,7 +2696,10 @@ export async function getReadiness() {
  * like the button is broken. So freshness is explicit rather than implied.
  */
 export async function syncBalances({ force = false } = {}) {
-  if (force) invalidateBalanceCache();
+  if (force) {
+    invalidateBalanceCache();
+    invalidateOwnerCache();
+  }
   try {
     await syncClobBalance();
   } catch {}

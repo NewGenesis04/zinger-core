@@ -5558,3 +5558,19 @@ The book is also the UP side's (`depth.up` first); DOWN's imbalance mirrors it o
 **Not fixed.** Direction: key the book by market, or select the market the signal is for. Which one is a design choice because the signal object is per symbol, not per market, so a fix needs to decide which window's book represents the symbol. Matters more now that item 41 makes the imbalance non-zero.
 
 ---
+
+### Item 125 — a failed deposit-wallet owner read blocked live and blamed the key (closed 2026-10-02)
+
+`readDepositWalletOwner` returned `null` for an RPC failure, `leased` cached that `null` for the 60-minute owner TTL, and the readiness gate read `null` as "owner is not the bot signer — export that wallet's private key". One transient RPC error therefore blocked live for an hour with a message pointing at the wrong cause.
+
+Fix: an RPC failure now throws, so `leased` backs it off (1m → 15m) instead of caching it for the TTL. `checkReadiness` reports it as `ownerUnknown` with its own check detail and blocker text; live stays blocked (ownership is unproven) but nothing claims a mismatch. A wallet that answers with no `owner()` is reported as that. A forced `/sync` also clears the owner entry (`invalidateOwnerCache`). Dashboard shows `unknown` rather than `mismatch`.
+
+Verified: `tests/unit/invariants.ownerReadAndSocketFrames.test.ts`; mutants that treat a failure as a mismatch or make `invalidateOwnerCache` a no-op fail.
+
+### Item 126 — a `null` socket frame threw out of the CLOB message handler (closed 2026-10-02)
+
+`clobWs.ts` `handleMessage` read `data.event_type` after `JSON.parse`, which returns `null` for the frame `null`; the socket callback has no catch, so it surfaced as an uncaught exception. The array branch had the same hole for `null` elements. Now any non-object frame returns, and non-object array elements are skipped. The cause of the `null` frame upstream is not established.
+
+Verified by the same test file; removing the guards fails four tests.
+
+Open question: the `ERR_HTTP_HEADERS_SENT` at `server.ts:463` (the `/api/poly/sync` catch) seen alongside it has no established cause. Not filed as fixed; watch whether it recurs.

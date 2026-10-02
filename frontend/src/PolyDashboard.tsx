@@ -1204,6 +1204,7 @@ function PolyShell({
     mode === 'live'
     && !!readiness.apiReady
     && readiness.ownerMatches !== false
+    && !readiness.ownerUnknown
     && Number(readiness.spendableBalance ?? readiness.clobBalance ?? 0) >= 0.4
   )
   const liveOk = mode === 'paper' || inferredLiveReady
@@ -1945,7 +1946,7 @@ function PolyShell({
                     </div>
                     <div>
                       <div className="text-muted-foreground text-xs">Owner</div>
-                      <div>{readiness.ownerMatches === false ? 'mismatch' : 'ok'}</div>
+                      <div>{readiness.ownerUnknown ? 'unknown' : readiness.ownerMatches === false ? 'mismatch' : 'ok'}</div>
                     </div>
                     <div>
                       <div className="text-muted-foreground text-xs">Scans</div>

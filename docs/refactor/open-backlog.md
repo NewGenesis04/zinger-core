@@ -1,7 +1,7 @@
 # Open backlog — map (hot: load this, not the items)
 
 New structural findings append as new per-item files in `docs/refactor/open/` (with `file:line` evidence) plus one row here. When fixed, move the content to `archive/fixed-items.md`.
-13 open items, sorted 2026-09-30 by an audit of every `open/` file against `git log` and the code. Read the row you need, then open that file — do not load the whole set.
+12 open items, sorted 2026-09-30 by an audit of every `open/` file against `git log` and the code. Read the row you need, then open that file — do not load the whole set.
 
 Strategy focus: **directional** (operator abandoned arb, 2026-09-30). Arb items are parked, not closed.
 
@@ -15,7 +15,6 @@ Strategy focus: **directional** (operator abandoned arb, 2026-09-30). Arb items 
 
 | Item | Title | State | File |
 |---|---|---|---|
-| 125 | A failed deposit-wallet owner read blocks live for an hour, and the message blames the key | Open, filed 2026-09-30. `readiness.ts:29-37`, `:251`, `:298`, `:491`. Live readiness gate, so the fix is the operator's call | `docs/refactor/open/125-a-failed-deposit-owner-read-blocks-live-for-an-hour.md` |
 | 32 | The live order path has type checking disabled | Open. `trade.ts:1` still `// @ts-nocheck`; 69 `src` files carry it | `docs/refactor/open/032-the-live-order-path-has-type-checking-disabled.md` |
 | 122 | The Polygon RPC host is hardcoded in six places and the env override reaches only three | Residual only. Server side fixed in `591ec65`; `frontend/src/walletAuth.tsx:21` still hardcodes it (needs a `VITE_` variable) | `docs/refactor/open/122-the-polygon-rpc-host-is-hardcoded-in-six-places-an.md` |
 | 48 | The D8 decision-emitter tee plan, checked against the code | Implemented (Steps A–F). Stays here for one verification gap: nothing proves exactly one `position.exit` per exit and one `trade.execution` per trade. Blocked on D4 | `docs/refactor/open/048-the-d8-decision-emitter-tee-plan-checked-against-t.md` |

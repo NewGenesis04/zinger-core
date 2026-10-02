@@ -280,15 +280,18 @@ export function applyPriceChange(change, ts) {
   emit(assetId, snap);
 }
 
-function handleMessage(raw) {
+export function handleMessage(raw) {
   lastMsgAt = Date.now();
   msgCount += 1;
   let data;
   try { data = JSON.parse(raw.toString()); } catch { return; }
+  // `null` and bare scalars are valid JSON, and a socket callback has no catch.
+  if (data === null || typeof data !== 'object') return;
 
   // Initial snapshot can be an array of books
   if (Array.isArray(data)) {
     for (const item of data) {
+      if (item === null || typeof item !== 'object') continue;
       const assetId = item.asset_id || item.assetId || item.payload?.tokenId;
       upsertFromBook(assetId, item.bids || item.payload?.bids, item.asks || item.payload?.asks, item.timestamp || item.payload?.timestamp);
     }
