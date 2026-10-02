@@ -300,6 +300,9 @@ def quick_ml_signal(
     else:
         return {'direction': 0, 'confidence': 0, 'error': f'no model: {label}'}
 
+    direction_map = {0: -1, 1: 0, 2: 1}
+    direction = direction_map[int(np.argmax(probs))]
+
     return {
         'direction': direction,
         'confidence': round(confidence, 4),
