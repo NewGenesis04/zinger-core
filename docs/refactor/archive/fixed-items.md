@@ -5574,3 +5574,11 @@ Verified: `tests/unit/invariants.ownerReadAndSocketFrames.test.ts`; mutants that
 Verified by the same test file; removing the guards fails four tests.
 
 Open question: the `ERR_HTTP_HEADERS_SENT` at `server.ts:463` (the `/api/poly/sync` catch) seen alongside it has no established cause. Not filed as fixed; watch whether it recurs.
+
+### Item 127 — the readiness gate had one RPC endpoint and no fallback (closed 2026-10-02)
+
+The deposit-owner and pUSD reads went through a single public endpoint, so that host answering "upstream overloaded" blocked live. `config.ts` now owns `POLY.polygonRpcUrls` (`POLYGON_RPC_URL` first, then `POLYGON_RPC_FALLBACK_URLS`, then two keyless public defaults) and `readiness.ts` builds a viem `fallback` transport over all of them (5s timeout, no inner retries, so a dead endpoint costs one timeout).
+
+Verified: `tests/unit/invariants.rpcFallback.test.ts` (order, de-dup, one transport per endpoint; a one-endpoint mutant fails). A live check with a dead primary returned the deposit wallet's `owner()` from the fallback.
+
+Scope: only the readiness client. Other chain callers still use the single `POLY.polygonRpc` — see item 128.

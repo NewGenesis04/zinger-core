@@ -1,4 +1,24 @@
 // @ts-nocheck
+/**
+ * Public Polygon endpoints tried after the configured one. Each was checked to
+ * answer `eth_call` without a key; free shared endpoints shed load, so none is
+ * trusted alone.
+ */
+const DEFAULT_POLYGON_RPC_FALLBACKS = ['https://polygon.drpc.org', 'https://1rpc.io/matic'];
+
+/**
+ * Ordered, de-duplicated endpoint list: the primary first, then
+ * `POLYGON_RPC_FALLBACK_URLS` (comma separated), then the defaults.
+ */
+export function buildPolygonRpcUrls(primary, extra = '', defaults = DEFAULT_POLYGON_RPC_FALLBACKS) {
+  const out = [];
+  for (const raw of [primary, ...String(extra || '').split(','), ...defaults]) {
+    const url = String(raw || '').trim();
+    if (url && !out.includes(url)) out.push(url);
+  }
+  return out;
+}
+
 export const POLY = {
   gammaApi: 'https://gamma-api.polymarket.com',
   clobApi: process.env.CLOB_API_URL?.trim() || 'https://clob.polymarket.com',
@@ -11,6 +31,11 @@ export const POLY = {
    * configuration available to avoid it (item 122).
    */
   polygonRpc: process.env.POLYGON_RPC_URL?.trim() || 'https://polygon-bor.publicnode.com',
+  /** Every endpoint to try, in order; `polygonRpc` is always first. */
+  polygonRpcUrls: buildPolygonRpcUrls(
+    process.env.POLYGON_RPC_URL?.trim() || 'https://polygon-bor.publicnode.com',
+    process.env.POLYGON_RPC_FALLBACK_URLS,
+  ),
   chainId: 137,
   usdc: '0x3c499c542cef5e3811e1192ce70d8cc03d5c3359',
   pUsd: '0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB',

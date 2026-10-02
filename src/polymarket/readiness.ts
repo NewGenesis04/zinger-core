@@ -1,5 +1,5 @@
 // @ts-nocheck
-import { createPublicClient, http, formatUnits } from 'viem';
+import { createPublicClient, http, fallback, formatUnits } from 'viem';
 import { polygon } from 'viem/chains';
 import { getWallet } from '../lib/wallet.js';
 import { POLY, POLY_MIN_ORDER_USD } from './config.js';
@@ -20,7 +20,13 @@ function getClient() {
   if (!_client) {
     _client = createPublicClient({
       chain: polygon,
-      transport: http(POLY.polygonRpc, { timeout: 8000 }),
+      // One transport per endpoint, tried in order: a shared public RPC shedding
+      // load must not block the gate while another endpoint answers. No inner
+      // retries, so a dead endpoint costs one timeout, not several.
+      transport: fallback(
+        POLY.polygonRpcUrls.map((url) => http(url, { timeout: 5000, retryCount: 0 })),
+        { retryCount: 0 },
+      ),
     });
   }
   return _client;
