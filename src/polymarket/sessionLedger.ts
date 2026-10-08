@@ -138,6 +138,7 @@ export function reconcileSession({
   unrealizedPnl,
   openCost,
   openMark,
+  openEntryFees = 0,
   initialBankroll,
   tradesPnlSum,
   sessionCashDelta = null,
@@ -149,12 +150,16 @@ export function reconcileSession({
   if (!session) return null;
 
   const bankroll = Number(initialBankroll ?? session.baseline.cash ?? 0);
+  // An open position's entry fee has already left cash but is not yet in any
+  // closed trade's P/L, so both expectations carry it (item 129).
   const booksEquity = bankroll
     + Number(realizedPnl || 0)
-    + Number(unrealizedPnl || 0);
+    + Number(unrealizedPnl || 0)
+    - Number(openEntryFees || 0);
   const cashExpect = bankroll
     + Number(realizedPnl || 0)
-    - Number(openCost || 0);
+    - Number(openCost || 0)
+    - Number(openEntryFees || 0);
   const driftEquity = Math.round((Number(equity || 0) - booksEquity) * 100) / 100;
   const driftCash = Math.round((Number(cash || 0) - cashExpect) * 100) / 100;
   const sessionTradePnl = Math.round(

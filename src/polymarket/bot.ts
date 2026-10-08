@@ -10,6 +10,8 @@ import {
   isFeeFreeExit,
 } from './fees.js';
 import { buildDataAssurance } from './dataAssurance.js';
+import { planDepthEntry, paperSellFill, planPartialExit, depthSnapshot, DEFAULT_PARTICIPATION } from './depthRealism.js';
+import { bookPaperLeg, paperEntryFields, entryFeeOutstanding, resolveSlFillPrice } from './paperLeg.js';
 import { getPricesForMarket, getDepthForMarket } from './clob.js';
 import {
   startClobMarketStream,
@@ -62,6 +64,7 @@ import { resolveDynamicLimits, setKellyTradeHistory, getKellyStats, buildDynamic
 import {
   dedupeTrades,
   computeTradeStats,
+  tradeFeesPaid,
   runAudit,
   loadBaseline,
   saveBaseline,
@@ -435,6 +438,40 @@ function adjustPaperCash(delta, reason = '') {
   return paperCash.adjust(delta, reason);
 }
 
+/** Taker-fee pack for a paper sell. Settle/redeem exits are fee-free (`isFeeFreeExit`). */
+function paperExitPackSync(cfg, shares, price, exitReason) {
+  const premium = Math.round(shares * price * 100) / 100;
+  if (cfg.simulateClobFees === false) return { premium, fee: 0, net: premium };
+  return closeProceedsWithFee(shares, price, cfg.feeCategory || 'crypto', exitReason);
+}
+
+async function paperExitPack(cfg, pos, shares, price, exitReason) {
+  const premium = Math.round(shares * price * 100) / 100;
+  if (cfg.simulateClobFees === false) return { premium, fee: 0, net: premium };
+  return (cfg.useClobMarketFees !== false && pos.tokenId)
+    ? closeProceedsWithFeeForToken(shares, price, pos.tokenId, exitReason, cfg.feeCategory || 'crypto')
+    : closeProceedsWithFee(shares, price, cfg.feeCategory || 'crypto', exitReason);
+}
+
+/**
+ * The only place a paper exit leg moves cash (items 129, 130). Credits the net
+ * proceeds and stamps the leg's P/L, fees and allocated cost on the position so
+ * the saved trade record carries them. Partial, final, stop, settle, drawdown
+ * and repair exits all come through here.
+ */
+function bookPaperExit(pos, sellShares, pack, label) {
+  const leg = bookPaperLeg({
+    pos,
+    heldShares: positionShares(pos),
+    sellShares,
+    proceeds: pack.net,
+    exitFee: pack.fee,
+  });
+  Object.assign(pos, leg.record, leg.state, { pnl: leg.pnl });
+  adjustPaperCash(pack.net, label);
+  return leg;
+}
+
 /**
  * Apply a live fill to the in-memory balance immediately — backlog item 61.
  *
@@ -514,12 +551,12 @@ function repairPaperOverdraft(reason = 'overdraft repair') {
     if (!(price > 0)) break;
     markPosition(pos, price);
     const shares = positionShares(pos);
-    const proceeds = Math.round(shares * price * 100) / 100;
+    const pack = paperExitPackSync(botState.config, shares, price, 'repair');
+    const proceeds = pack.net;
     pos.exitPrice = price;
     pos.closed = true;
     pos.exitReason = 'repair';
-    // Ledger will be rebuilt by reconcile — still credit for live log clarity
-    adjustPaperCash(proceeds, `REPAIR ${pos.symbol} ${pos.outcome?.toUpperCase()}`);
+    bookPaperExit(pos, shares, pack, `REPAIR ${pos.symbol} ${pos.outcome?.toUpperCase()}`);
     saveTrade({ ...pos, timestamp: Date.now() });
     log(`🧰 PAPER REPAIR close ${pos.symbol} ${pos.outcome?.toUpperCase()} @ $${price.toFixed(3)} · freed $${proceeds.toFixed(2)}`, 'system');
   }
@@ -550,11 +587,11 @@ function repairPaperOverdraft(reason = 'overdraft repair') {
     if (!(price > 0)) break;
     markPosition(pos, price);
     const shares = positionShares(pos);
-    const proceeds = Math.round(shares * price * 100) / 100;
+    const pack = paperExitPackSync(botState.config, shares, price, 'repair');
     pos.exitPrice = price;
     pos.closed = true;
     pos.exitReason = 'repair';
-    adjustPaperCash(proceeds, `REPAIR TRIM ${pos.symbol}`);
+    bookPaperExit(pos, shares, pack, `REPAIR TRIM ${pos.symbol}`);
     saveTrade({ ...pos, timestamp: Date.now() });
   }
 
@@ -1015,7 +1052,7 @@ function prunePendingTrades() {
   });
 }
 
-function buildTradePlan({ cfg, market, outcome, price, remaining, signal, sizeUsd, kelly, analysis }) {
+function buildTradePlan({ cfg, market, outcome, price, remaining, signal, sizeUsd, kelly, analysis, depthPlan = null, entryDepth = null }) {
   let plan = buildDynamicPlan({ cfg, price, analysis, signal });
   plan = overlayPlanWithHeuristics(plan, {
     duration: market?.duration,
@@ -1029,6 +1066,8 @@ function buildTradePlan({ cfg, market, outcome, price, remaining, signal, sizeUs
   if (cfg.mode === 'paper') {
     // Paper: never inflate above budget (minShares=5 was blowing the ledger)
     shares = Math.max(0.01, Math.round((sizeUsd / entry) * 1000) / 1000);
+    // Item 131: capped to what the book can absorb, and lifted to the exchange minimum.
+    if (depthPlan?.ok) shares = depthPlan.shares;
   } else {
     shares = Math.max(minSh, Math.ceil((sizeUsd / entry) * 100) / 100);
   }
@@ -1067,6 +1106,7 @@ function buildTradePlan({ cfg, market, outcome, price, remaining, signal, sizeUs
     tpPrice: Math.round(tpPrice * 1000) / 1000,
     slPrice: Math.round(slPrice * 1000) / 1000,
     shares,
+    entryDepth,
     costEst,
     tpPnl,
     slPnl,
@@ -1237,6 +1277,7 @@ async function executePendingTrade(pending) {
     negRisk: pending.negRisk,
     tickSize: pending.tickSize,
     minShares: pending.minShares,
+    entryDepth: plan.entryDepth ?? null,
     announceId: pending.id,
   };
 
@@ -1541,6 +1582,7 @@ async function executePendingTrade(pending) {
     pos.costBasis = premium;
     recordEntryFill(pos, { shares: pos.shares, costUsd: premium, priceSource: 'paper_model', feeUsd: entryFee });
     const debit = Math.round((premium + entryFee) * 100) / 100;
+    Object.assign(pos, paperEntryFields(premium, debit));
     adjustPaperCash(-debit, `BUY ${pending.symbol} ${pending.outcome?.toUpperCase()} @ ${entryPx.toFixed(3)}`);
     log(`✅ PAPER BUY ${pending.symbol} ${pending.outcome.toUpperCase()} @ $${entryPx.toFixed(3)} · $${premium.toFixed(2)} + fee $${entryFee.toFixed(4)} · TP +${plan.targetTp}% · SL -${plan.slPct}%`, 'buy', {
       market: pending.symbol, slug: pending.slug, outcome: pending.outcome,
@@ -1926,21 +1968,7 @@ function exitMarkPrice(outcome, prices, depth) {
   return mid || 0;
 }
 
-/**
- * Cap paper SL fills at stop + small slip so gaps can't book -56% on a 10% stop.
- * Live keeps the real bid (exchange fill) but still triggers off bid.
- */
-function resolveSlFillPrice(pos, markBid, effectiveSl, cfg) {
-  const entry = Number(pos.entryPrice || 0);
-  const mark = Number(markBid || 0);
-  if (!(entry > 0)) return mark;
-  const slip = Math.max(0, Number(cfg.slMaxSlippagePct ?? 2));
-  const floor = entry * (1 - (Number(effectiveSl) + slip) / 100);
-  if (pos.mode === 'paper') {
-    return Math.round(Math.max(0.01, Math.max(mark, floor)) * 1000) / 1000;
-  }
-  return Math.round(Math.max(0.01, mark || floor) * 1000) / 1000;
-}
+// `resolveSlFillPrice` lives in `paperLeg.ts`: paper stops fill at the real bid (item 130).
 
 function summarizeBook(depth) {
   if (!depth) return null;
@@ -2013,6 +2041,8 @@ function buildPortfolio(readiness, mode) {
       return sum + Number(p.size || 0);
     }, 0);
     const paperRealizedPnl = paperStats.totalPnl || 0;
+    const paperOpenEntryFees = paperPositions.reduce((sum, p) => sum + entryFeeOutstanding(p), 0);
+    const paperFeesPaid = paperTrades.reduce((sum, t) => sum + tradeFeesPaid(t), 0);
     // Spendable cash is the live ledger (buys debit, closes credit exit value)
     const cash = Math.round(paperBankroll * 100) / 100;
     const equity = Math.round((cash + paperOpenValue) * 100) / 100;
@@ -2030,6 +2060,8 @@ function buildPortfolio(readiness, mode) {
       netPnl,
       sessionPnl: netPnl,
       realizedPnl: Math.round(paperRealizedPnl * 100) / 100,
+      openEntryFees: Math.round(paperOpenEntryFees * 100) / 100,
+      feesPaid: Math.round(paperFeesPaid * 100) / 100,
       realizedPnlBot: 0,
       realizedPnlPaper: Math.round(paperRealizedPnl * 100) / 100,
       equity,
@@ -2838,8 +2870,14 @@ async function scanOpenExitsFast() {
         : resolveAdaptiveSl(pos, { signal: liveSignal, cfg });
       const hit = pos.gainPct <= -effectiveSl || (pos.slPrice > 0 && mark <= Number(pos.slPrice));
       if (!hit) continue;
-      const fillPrice = resolveSlFillPrice(pos, mark, effectiveSl, cfg);
+      let fillPrice = resolveSlFillPrice(pos, mark, effectiveSl, cfg);
       let sellShares = positionShares(pos);
+      let exitBook = depthSnapshot(depth?.[pos.outcome]);
+      if (pos.mode === 'paper' && cfg.depthRealism !== false) {
+        const walked = paperSellFill({ side: depth?.[pos.outcome], sellShares, fallbackPrice: fillPrice });
+        fillPrice = walked.price;
+        exitBook = { ...(exitBook || {}), ...walked.record };
+      }
       if (pos.mode === 'live' && pos.tokenId && sellShares > 0) {
         const held = await resolveExitShares(pos, sellShares, readinessPositions);
         if (held.action === 'ghost') {
@@ -2881,7 +2919,7 @@ async function scanOpenExitsFast() {
       pos.closed = true;
       pos.exitReason = 'sl';
       if (pos.mode === 'paper') {
-        adjustPaperCash(Math.round(sellShares * fillPrice * 100) / 100, `SL ${pos.symbol} ${pos.outcome?.toUpperCase()}`);
+        bookPaperExit(pos, sellShares, await paperExitPack(cfg, pos, sellShares, fillPrice, 'sl'), `SL ${pos.symbol} ${pos.outcome?.toUpperCase()}`);
       }
       saveTrade({
         ...pos,
@@ -2891,6 +2929,7 @@ async function scanOpenExitsFast() {
         effectiveSlPct: effectiveSl,
         markBid: mark,
         fillCapped: fillPrice > mark + 0.0005,
+        exitBook,
         fastExit: true,
       });
       bookWindowExit('sl', pos.pnl);
@@ -3127,8 +3166,14 @@ export async function scan() {
           const liveSignal = botState.signals?.[String(market.symbol || '').toLowerCase()] || null;
           const effectiveSl = resolveAdaptiveSl(openPos, { signal: liveSignal, cfg });
           if (openPos.gainPct > -effectiveSl && !(openPos.slPrice > 0 && mark <= Number(openPos.slPrice))) continue;
-          const fillPrice = resolveSlFillPrice(openPos, mark, effectiveSl, cfg);
+          let fillPrice = resolveSlFillPrice(openPos, mark, effectiveSl, cfg);
           let sellShares = positionShares(openPos);
+          let exitBook = depthSnapshot(depth?.[openPos.outcome]);
+          if (openPos.mode === 'paper' && cfg.depthRealism !== false) {
+            const walked = paperSellFill({ side: depth?.[openPos.outcome], sellShares, fallbackPrice: fillPrice });
+            fillPrice = walked.price;
+            exitBook = { ...(exitBook || {}), ...walked.record };
+          }
           if (openPos.mode === 'live' && openPos.tokenId && sellShares > 0) {
             const held = await resolveExitShares(openPos, sellShares, readiness?.positions || []);
             if (held.action === 'ghost') {
@@ -3180,7 +3225,7 @@ export async function scan() {
           openPos.closed = true;
           openPos.exitReason = 'sl';
           if (openPos.mode === 'paper') {
-            adjustPaperCash(Math.round(sellShares * fillPrice * 100) / 100, `SL ${openPos.symbol} ${openPos.outcome?.toUpperCase()}`);
+            bookPaperExit(openPos, sellShares, await paperExitPack(cfg, openPos, sellShares, fillPrice, 'sl'), `SL ${openPos.symbol} ${openPos.outcome?.toUpperCase()}`);
           }
           saveTrade({
             ...openPos,
@@ -3190,6 +3235,7 @@ export async function scan() {
             effectiveSlPct: effectiveSl,
             markBid: mark,
             fillCapped: fillPrice > mark + 0.0005,
+            exitBook,
             earlyExit: true,
           });
           bookWindowExit('sl', openPos.pnl);
@@ -3399,11 +3445,31 @@ export async function scan() {
         botState.lastSizing = kelly ? { ...kelly, sizeUsd, bankroll: readiness?.spendableBalance } : { sizeUsd, reason: 'fixed' };
 
         const analysis = signal?.direction ? signal : null;
+        // Item 131: a paper entry may take only what the resting ask can absorb.
+        const entrySide = depth?.[buyOutcome];
+        const depthPlan = (cfg.mode === 'paper' && cfg.depthRealism !== false)
+          ? planDepthEntry({
+            requestedShares: Math.max(0.01, Math.round((sizeUsd / buyPrice) * 1000) / 1000),
+            entryPrice: buyPrice,
+            side: entrySide,
+            minShares: market.minShares || 5,
+            participation: cfg.depthParticipation ?? DEFAULT_PARTICIPATION,
+            maxCostUsd: Math.min(
+              Number(cfg.maxPositionCap ?? cfg.maxPositionSize ?? 14),
+              Number(cfg.paperBankroll ?? 0) * 0.95,
+            ),
+          })
+          : null;
+        const entryDepth = { ...(depthSnapshot(entrySide) || {}), ...(depthPlan?.record || {}) };
         const plan = buildTradePlan({
-          cfg, market, outcome: buyOutcome, price: buyPrice, remaining, signal, sizeUsd, kelly, analysis,
+          cfg, market, outcome: buyOutcome, price: buyPrice, remaining, signal, sizeUsd, kelly, analysis, depthPlan, entryDepth,
         });
 
-        if (cfg.mode === 'paper' && plan.costEst > Number(cfg.paperBankroll ?? 0) + 0.001) {
+        if (depthPlan && !depthPlan.ok) {
+          skipReason = { code: depthPlan.reason, operands: depthPlan.record };
+          action = 'hold';
+          botState._buyLocks.delete(market.slug);
+        } else if (cfg.mode === 'paper' && plan.costEst > Number(cfg.paperBankroll ?? 0) + 0.001) {
           skipReason = {
             code: 'insufficient_paper_cash',
             operands: { costEst: plan.costEst, paperBankroll: Number(cfg.paperBankroll ?? 0) },
@@ -3497,7 +3563,7 @@ export async function scan() {
               op.closed = true;
               op.exitReason = 'dd';
               if (op.mode === 'paper') {
-                adjustPaperCash(Number(op.shares) * fillPrice, `DD ${op.symbol} ${op.outcome?.toUpperCase()}`);
+                bookPaperExit(op, positionShares(op), await paperExitPack(botState.config, op, positionShares(op), fillPrice, 'dd'), `DD ${op.symbol} ${op.outcome?.toUpperCase()}`);
               }
               saveTrade({ ...op, timestamp: Date.now(), exitReason: 'dd' });
             }
@@ -3537,6 +3603,27 @@ export async function scan() {
             extraMeta = { ...extraMeta, markBid: price, fillCapped: fillPrice > price + 0.0005 };
           }
           let sellShares = exitReason === 'partial' ? positionShares(pos) * (pos.partialPct || 0.5) : positionShares(pos);
+          if (exitReason === 'partial' && cfg.enforceMinShareExits !== false) {
+            // Neither the sale nor the remainder may fall under the exchange minimum.
+            const partialPlan = planPartialExit({ held: positionShares(pos), partialPct: pos.partialPct || 0.5, minShares: pos.minShares || 5 });
+            if (partialPlan.skip) {
+              pos.partialSkipped = true;
+              log(`⏭️ PARTIAL SKIPPED ${pos.symbol} ${pos.outcome?.toUpperCase()} · ${positionShares(pos).toFixed(2)}sh is under two exchange minimums`, 'system', {
+                slug: pos.slug, shares: positionShares(pos), minShares: pos.minShares || 5,
+              });
+              return false;
+            }
+            sellShares = partialPlan.sell;
+          }
+          // Item 131: a paper sell is priced against the resting bids, not the best price.
+          const exitBookSnap = depthSnapshot(depth?.[pos.outcome]);
+          if (pos.mode === 'paper' && cfg.depthRealism !== false && !isFeeFreeExit(exitReason)) {
+            const walked = paperSellFill({ side: depth?.[pos.outcome], sellShares, fallbackPrice: fillPrice });
+            fillPrice = walked.price;
+            extraMeta = { ...extraMeta, exitBook: { ...(exitBookSnap || {}), ...walked.record } };
+          } else if (exitBookSnap) {
+            extraMeta = { ...extraMeta, exitBook: exitBookSnap };
+          }
           if (pos.mode === 'live' && pos.tokenId && sellShares > 0) {
             const held = await resolveExitShares(pos, sellShares, readiness?.positions || []);
             if (held.action === 'ghost') {
@@ -3593,25 +3680,21 @@ export async function scan() {
             }
             pos.partialSold = true;
             pos.firstPartialTime = Date.now();
-            const feeOn = botState.config.simulateClobFees !== false;
-            const useClob = botState.config.useClobMarketFees !== false;
-            const feeCat = botState.config.feeCategory || 'crypto';
-            const proceedsPack = !feeOn
-              ? { premium: Math.round(sellShares * fillPrice * 100) / 100, fee: 0, net: Math.round(sellShares * fillPrice * 100) / 100 }
-              : (useClob && pos.tokenId)
-                ? await closeProceedsWithFeeForToken(sellShares, fillPrice, pos.tokenId, 'partial', feeCat)
-                : closeProceedsWithFee(sellShares, fillPrice, feeCat, 'partial');
+            const proceedsPack = await paperExitPack(botState.config, pos, sellShares, fillPrice, 'partial');
             const proceeds = proceedsPack.net;
-            const partialPnl = Math.round(((fillPrice - pos.entryPrice) * sellShares - proceedsPack.fee - (Number(pos.entryFee || 0) * (sellShares / Math.max(positionShares(pos) + sellShares, 1e-9)))) * 100) / 100;
-            pos.shares = positionShares(pos) * (1 - (pos.partialPct || 0.5));
+            let partialPnl;
+            if (pos.mode === 'paper') {
+              // Booked before the share count is reduced: the allocation is sold / held.
+              partialPnl = bookPaperExit(pos, sellShares, proceedsPack, `PARTIAL ${pos.symbol} ${pos.outcome?.toUpperCase()}`).pnl;
+            } else {
+              partialPnl = Math.round(((fillPrice - pos.entryPrice) * sellShares - proceedsPack.fee - (Number(pos.entryFee || 0) * (sellShares / Math.max(positionShares(pos) + sellShares, 1e-9)))) * 100) / 100;
+              pos.feesPaid = Math.round((Number(pos.feesPaid || 0) + proceedsPack.fee) * 1e5) / 1e5;
+            }
+            pos.shares = Math.max(0, positionShares(pos) - sellShares);
             pos.costBasis = Math.round(pos.shares * pos.entryPrice * 100) / 100;
             pos.markValue = Math.round(pos.shares * fillPrice * 100) / 100;
             pos.partialExitPrice = fillPrice;
             pos.partialPnl = partialPnl;
-            pos.feesPaid = Math.round((Number(pos.feesPaid || 0) + proceedsPack.fee) * 1e5) / 1e5;
-            if (pos.mode === 'paper') {
-              adjustPaperCash(proceeds, `PARTIAL ${pos.symbol} ${pos.outcome?.toUpperCase()}`);
-            }
             saveTrade({
               ...pos,
               id: `partial-${pos.id}-${Date.now().toString(36)}`,
@@ -3694,19 +3777,8 @@ export async function scan() {
           pos.exitReason = exitReason;
           pos.pendingRedeem = false;
           if (pos.mode === 'paper') {
-            const feeOn = cfg.simulateClobFees !== false;
-            const useClob = cfg.useClobMarketFees !== false;
-            const feeCat = cfg.feeCategory || 'crypto';
-            const pack = !feeOn
-              ? { premium: Math.round(sellShares * fillPrice * 100) / 100, fee: 0, net: Math.round(sellShares * fillPrice * 100) / 100 }
-              : (useClob && pos.tokenId)
-                ? await closeProceedsWithFeeForToken(sellShares, fillPrice, pos.tokenId, exitReason, feeCat)
-                : closeProceedsWithFee(sellShares, fillPrice, feeCat, exitReason);
-            const entryFeeAlloc = Number(pos.entryFee || 0);
-            pos.exitFee = pack.fee;
-            pos.feesPaid = Math.round((entryFeeAlloc + pack.fee) * 1e5) / 1e5;
-            pos.pnl = Math.round(((fillPrice - pos.entryPrice) * sellShares - entryFeeAlloc - pack.fee) * 100) / 100;
-            adjustPaperCash(pack.net, `${exitReason.toUpperCase()}${isFeeFreeExit(exitReason) ? ' (redeem)' : ''} ${pos.symbol} ${pos.outcome?.toUpperCase()}`);
+            const pack = await paperExitPack(cfg, pos, sellShares, fillPrice, exitReason);
+            bookPaperExit(pos, sellShares, pack, `${exitReason.toUpperCase()}${isFeeFreeExit(exitReason) ? ' (redeem)' : ''} ${pos.symbol} ${pos.outcome?.toUpperCase()}`);
             recordTradeSample({
               asset: pos.symbol,
               slug: pos.slug,
@@ -4405,6 +4477,7 @@ export function startBackgroundFeeds() {
         unrealizedPnl: portfolio.unrealizedPnl,
         openCost: portfolio.openCostBasis,
         openMark: portfolio.openMarkValue,
+        openEntryFees: portfolio.openEntryFees,
         // Always use THIS session's cash baseline — never stale poly_baseline / paperInitial
         initialBankroll: Number(botState.session?.baselineCash ?? portfolio.cash),
         tradesPnlSum: modeTrades.reduce((s, t) => s + Number(t.pnl || 0), 0),
@@ -4623,6 +4696,7 @@ function completeSession(reason = 'stopped') {
     unrealizedPnl: portfolio.unrealizedPnl,
     openCost: portfolio.openCostBasis,
     openMark: portfolio.openMarkValue,
+    openEntryFees: portfolio.openEntryFees,
     initialBankroll: Number(botState.session.baselineCash ?? portfolio.cash),
     tradesPnlSum: currentPnl,
     sessionCashDelta,
@@ -4995,19 +5069,9 @@ async function executeSell(pos, reason = 'manual') {
     // the in-scan TP/SL path booked net — two conventions in one ledger.
     // `closeProceedsWithFee` returns fee 0 for settle/redeem, which is correct:
     // redeeming a resolved token is not a taker CLOB sell.
-    const feeOn = botState.config.simulateClobFees !== false;
     const shares = positionShares(pos);
-    const pack = closeProceedsWithFee(shares, price, botState.config.feeCategory || 'crypto', reason);
-    const exitFee = feeOn ? pack.fee : 0;
-    const proceeds = Math.round((pack.premium - exitFee) * 100) / 100;
-
-    pos.exitFee = exitFee;
-    pos.feesPaid = Math.round((Number(pos.entryFee || 0) + exitFee) * 1e5) / 1e5;
-    pos.pnl = Math.round(
-      ((price - pos.entryPrice) * shares - Number(pos.entryFee || 0) - exitFee) * 100,
-    ) / 100;
-
-    adjustPaperCash(proceeds, `${reason.toUpperCase()} ${pos.symbol} ${pos.outcome?.toUpperCase()}`);
+    const pack = await paperExitPack(botState.config, pos, shares, price, reason);
+    bookPaperExit(pos, shares, pack, `${reason.toUpperCase()} ${pos.symbol} ${pos.outcome?.toUpperCase()}`);
   }
   saveTrade({ ...pos, timestamp: Date.now(), orderId: pos.orderId });
   saveState();

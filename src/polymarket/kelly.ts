@@ -339,7 +339,7 @@ export function checkTrailingStop(pos, currentPrice) {
 }
 
 export function checkPartialProfit(pos, currentPrice) {
-  if (pos.partialSold) return null;
+  if (pos.partialSold || pos.partialSkipped) return null;
   // Skip partials when adaptive loss defense is active
   if (pos.adaptiveSlArmed) return null;
   const gainPct = ((currentPrice - pos.entryPrice) / pos.entryPrice) * 100;

@@ -43,6 +43,12 @@ export function tradeRealizedPnl(trade) {
  * before it existed.
  */
 export function tradeFeesPaid(trade) {
+  // A per-leg record (item 129) carries its own entry-fee share; `feesPaid` on
+  // such a record is the position's lifetime total and would double count.
+  const entryShare = Number(trade?.entryFeeShare);
+  if (trade?.entryFeeShare != null && Number.isFinite(entryShare)) {
+    return entryShare + Number(trade?.exitFee || 0);
+  }
   const total = Number(trade?.feesPaid);
   if (Number.isFinite(total)) return total;
   return Number(trade?.entryFee || 0) + Number(trade?.exitFee || 0);
@@ -58,6 +64,14 @@ export function tradeFeesPaid(trade) {
  * ledger is correct for historical trades too, with no migration.
  */
 export function tradeNetPnl(trade) {
+  // Per-leg record (item 129): P/L is the cash that moved — proceeds credited
+  // minus the cost and entry fee that leg was allocated — in whole cents, so
+  // it equals the cash ledger's change exactly.
+  const { legProceeds, legCost, entryFeeShare } = trade || {};
+  if (legProceeds != null && legCost != null && entryFeeShare != null
+    && [legProceeds, legCost, entryFeeShare].every((v) => Number.isFinite(Number(v)))) {
+    return Math.round((Number(legProceeds) - Number(legCost) - Number(entryFeeShare)) * 100) / 100;
+  }
   return Math.round((tradeRealizedPnl(trade) - tradeFeesPaid(trade)) * 100) / 100;
 }
 
@@ -83,7 +97,10 @@ export function tradeEngine(trade) {
 
 export function normalizeTrade(trade) {
   const cost = tradeCostBasis(trade);
-  const pnl = tradeRealizedPnl(trade);
+  // Paper P/L is net of fees everywhere (item 129): the cash ledger is net, and
+  // a headline built from gross P/L can never reconcile to it. Live keeps its
+  // existing definition.
+  const pnl = trade.mode === 'paper' ? tradeNetPnl(trade) : tradeRealizedPnl(trade);
   // Live is only verified when CLOB returned a real orderId (phantom fills had none).
   const verified = trade.mode === 'paper' ? false : !!trade.orderId;
   return { ...trade, costBasis: cost, pnl, verified, engine: tradeEngine(trade) };

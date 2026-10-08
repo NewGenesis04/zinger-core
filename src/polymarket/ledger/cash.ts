@@ -42,6 +42,7 @@
 
 import { dedupeTrades, tradeNetPnl } from '../audit.js';
 import { getDefaultPaperBankroll } from '../modeConfig.js';
+import { costOutstanding, entryFeeOutstanding } from '../paperLeg.js';
 
 /** Money precision — cents. The protocol's 5dp applies to fees, not balances. */
 export function roundCash(value) {
@@ -68,7 +69,7 @@ export function booksCash({ trades = [], positions = [], initialDeposit = 100, m
   const openCost = positions
     .filter((p) => !p.closed && (!mode || p.mode === mode))
     .reduce(
-      (sum, p) => sum + Number(p.costBasis || p.size || 0) + Number(p.entryFee || 0),
+      (sum, p) => sum + costOutstanding(p) + entryFeeOutstanding(p),
       0,
     );
 

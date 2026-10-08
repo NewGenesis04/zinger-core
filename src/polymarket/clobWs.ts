@@ -461,7 +461,10 @@ export function getClobWsAggregate(tokenId) {
   const asks = normalizeSide(rows(m.asks), 'ask');
   if (!bids.length && !asks.length) return null;
   const { imbalance, spreadPct, totalBidVol, totalAskVol, bidCount, askCount } = summarizeBook(bids, asks);
-  return { imbalance, spreadPct, totalBidVol, totalAskVol, bidCount, askCount };
+  // The ladders are published too, so a paper exit can be walked against the
+  // resting bids on the WS branch as on the REST one (item 131). Before this the
+  // WS shape carried top-of-book size only.
+  return { imbalance, spreadPct, totalBidVol, totalAskVol, bidCount, askCount, bids, asks };
 }
 
 /** Test seam: the outage mark is module state that survives between cases. */

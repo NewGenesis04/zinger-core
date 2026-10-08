@@ -54,6 +54,7 @@ export const STRATEGY_KEYS = [
   'holdToSettleUnderdogs', 'underdogMaxPrice', 'holdToSettleDisasterSlPct',
   'holdToSettleFavorites', 'favoriteMinPrice', 'favoriteMaxPrice',
   'slMaxSlippagePct',
+  'depthRealism', 'depthParticipation', 'enforceMinShareExits',
   'allowScaleIn',
   'maxOpenDrawdownPct',
   'simulateClobFees',
@@ -120,6 +121,11 @@ export function defaultPaperStrategy() {
     adaptiveSl: false,
     minAdaptiveSlPct: 10,
     slMaxSlippagePct: 2,
+    // Item 131. Paper fills are sized and priced against the resting book.
+    // `depthParticipation` is a modelling assumption, not a Polymarket fact.
+    depthRealism: true,
+    depthParticipation: 0.4,
+    enforceMinShareExits: true,
     // Live CLOB schedule via /clob-markets fd.r/e (fallback category crypto).
     simulateClobFees: true,
     useClobMarketFees: true,
