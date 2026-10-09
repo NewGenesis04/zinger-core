@@ -40,7 +40,8 @@ import { getRemainingSeconds, getRemainingMs, getCycleEndMs, formatRemainingMs, 
 import { getSignalForBoth } from './signal.js';
 import { getMLSignalForBoth, getMLTraceForBoth } from './predict.js';
 import { addMLPrediction, addPriceTrace, getConfidenceBias, getConfidenceBufferStats, getPriceTrace } from './confidence.js';
-import { addSpotTick } from './spotPriceHistory.js';
+import { addSpotTick, getSpotHistory } from './spotPriceHistory.js';
+import { shadowObserve, resolvePending as resolveShadowPending } from './signalShadow.js';
 import { getModelStates, getModelHealth, onModelChange } from './modelRegistry.js';
 import {
   detectAndExecuteArbPackage,
@@ -3131,6 +3132,23 @@ export async function scan() {
         ? Math.max(0, market.endTime * 1000 - Date.now())
         : getRemainingMs();
       const remaining = Math.ceil(remainingMs / 1000);
+      // Item 132. Observer only: reads what this pass already holds, writes its
+      // own table, and sits before every `continue` below so a market with an
+      // open position is sampled like any other.
+      {
+        const shadowAsset = String(market.symbol || '').toLowerCase();
+        shadowObserve({
+          cfg,
+          nowMs: Date.now(),
+          mode: cfg.mode,
+          market,
+          depth,
+          signal: botState.signals?.[shadowAsset],
+          mlPoints: getPriceTrace(shadowAsset)?.prices,
+          spot: getSpotHistory(shadowAsset, 1)[0]?.price ?? null,
+        });
+        void resolveShadowPending();
+      }
       const buildLiveSellDebug = (position, requestedShares, reason = '') => {
         const readinessPositions = readiness?.positions || [];
         const matchingReadinessPosition = findReadinessPositionForBotPosition(position, readinessPositions);

@@ -5,6 +5,8 @@ import { describeBackend } from './src/polymarket/persistence.js';
 import { getWallet } from './src/lib/wallet.js';
 import { getClobProxyUrl, redactProxy } from './src/polymarket/proxyEnv.js';
 import { startArbDecisionSink } from './src/polymarket/telemetry/decisionSink.js';
+import { startSignalShadow } from './src/polymarket/signalShadow.js';
+import { onSpotTick } from './src/polymarket/spotPriceHistory.js';
 import os from 'os';
 
 // Perf tuning
@@ -25,6 +27,9 @@ process.on('unhandledRejection', (err) => {
 // `zinger.db`. Idempotent, and a no-op on the JSON fallback backend.
 const arbSinkOn = startArbDecisionSink();
 
+// Backlog item 132. Same placement and reason as the arb sink above.
+const signalShadowOn = startSignalShadow(onSpotTick);
+
 const app = await createApp();
 
 const server = app.listen(PORT, '0.0.0.0', () => {
@@ -38,7 +43,8 @@ const server = app.listen(PORT, '0.0.0.0', () => {
     `     Store: ${store.backend.toUpperCase()} · ${store.reason}` +
       (store.docCount != null ? ` · ${store.docCount} docs` : '') +
       `\n     Data dir: ${store.dataDir}` +
-      `\n     Arb sink: ${arbSinkOn ? 'ON (arb_decisions)' : 'OFF — decisions are in-memory only'}`,
+      `\n     Arb sink: ${arbSinkOn ? 'ON (arb_decisions)' : 'OFF — decisions are in-memory only'}` +
+      `\n     Signal shadow: ${signalShadowOn ? 'ON (signal_shadow)' : 'OFF'}`,
   );
   try {
     const w = getWallet();

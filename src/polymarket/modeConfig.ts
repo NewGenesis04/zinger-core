@@ -55,6 +55,7 @@ export const STRATEGY_KEYS = [
   'holdToSettleFavorites', 'favoriteMinPrice', 'favoriteMaxPrice',
   'slMaxSlippagePct',
   'depthRealism', 'depthParticipation', 'enforceMinShareExits',
+  'signalShadow',
   'allowScaleIn',
   'maxOpenDrawdownPct',
   'simulateClobFees',
@@ -126,6 +127,8 @@ export function defaultPaperStrategy() {
     depthRealism: true,
     depthParticipation: 0.4,
     enforceMinShareExits: true,
+    // Item 132. Read-only signal/book log; off switch only, never changes a trade.
+    signalShadow: true,
     // Live CLOB schedule via /clob-markets fd.r/e (fallback category crypto).
     simulateClobFees: true,
     useClobMarketFees: true,
