@@ -24,11 +24,14 @@ export interface ExecLimits {
   maxOrderShares: number; maxNetSharesPerToken: number; maxMarketUsd: number; maxPortfolioUsd: number;
   maxOpenOrders: number; maxOrdersPerMinute: number; maxLossUsd: number; restToleranceTicks: number;
   maxConsecutiveRejects: number; maxHeartbeatMisses: number; ackTimeoutMs: number; maxPositionDriftShares: number;
+  /** Venue balances settle after a match; skip drift checks on a token this long after its last fill. */
+  driftGraceMs: number;
 }
 export const CANARY_LIMITS: ExecLimits = {
   maxOrderShares: 50, maxNetSharesPerToken: 100, maxMarketUsd: 25, maxPortfolioUsd: 100,
   maxOpenOrders: 20, maxOrdersPerMinute: 60, maxLossUsd: 10, restToleranceTicks: 1,
   maxConsecutiveRejects: 5, maxHeartbeatMisses: 2, ackTimeoutMs: 15_000, maxPositionDriftShares: 0.01,
+  driftGraceMs: 120_000,
 };
 
 export type OrderState = 'submitting' | 'open' | 'cancel_pending' | 'unknown' | 'filled' | 'cancelled' | 'rejected';
@@ -52,6 +55,7 @@ export class MmLiveExecutor {
   private heartbeatMisses = 0;
   private seq = 0;
   private meta = new Map<string, { conditionId: string; event: string }>();
+  private lastFillAt = new Map<string, number>();
 
   constructor(
     private venue: MmVenue,
@@ -209,6 +213,7 @@ export class MmLiveExecutor {
     const delta = next - o.filled;
     if (Math.abs(delta) < 1e-9) return;
     o.filled = next;
+    this.lastFillAt.set(o.tokenId, this.clock());
     const sign = o.side === 'BUY' ? 1 : -1;
     this.position.set(o.tokenId, (this.position.get(o.tokenId) ?? 0) + sign * delta);
     this.cash -= sign * delta * o.price;
@@ -263,6 +268,7 @@ export class MmLiveExecutor {
       if (held) {
         const tokens = new Set([...this.position.keys(), ...[...held.keys()].filter((t) => this.meta.has(t))]);
         for (const t of tokens) {
+          if (this.clock() - (this.lastFillAt.get(t) ?? -Infinity) < this.limits.driftGraceMs) continue;
           const drift = (held.get(t) ?? 0) - (this.position.get(t) ?? 0);
           if (Math.abs(drift) > this.limits.maxPositionDriftShares) { this.log('drift', { token: t, venue: held.get(t) ?? 0, ledger: this.position.get(t) ?? 0 }); await this.halt(`position_drift:${t}`); break; }
         }

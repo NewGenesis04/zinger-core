@@ -44,6 +44,30 @@ There is no portfolio-level edge yet. There is a reward-capture edge, but advers
 
 Real capital stays conditional on a positive multi-day out-of-sample portfolio result. The risks are set out in the 2026-10-22 report.
 
+## Live execution (built, locked)
+
+`src/research/mm/live/` holds the order path the paper engine never had. It runs end to end in dry-run today. Live mode stays locked until the evidence gate passes.
+
+| Piece | File | What it does |
+|---|---|---|
+| Executor | `executor.ts` | Post-only quotes, one order per token and side, cancel-before-replace, worst-case exposure caps, fill accounting (deduplicated; late, reversed and reconciled fills counted once), reconciliation (lost acks, closed orders, orphans, balance drift after a settlement grace window), heartbeat, latched kill switch, journal restore |
+| Dry-run venue | `venue.ts` | In-memory exchange. Resting orders fill only when the public book trades through them |
+| CLOB adapter | `clobVenue.ts` | `@polymarket/clob-client-v2`: GTC post-only orders, batch cancel, cancel-all, open orders, order status, server heartbeat (the exchange cancels our orders if heartbeats stop), conditional token balances. SDK error objects count as failures, never as acks |
+| User channel | `userChannel.ts` | Our trade events from the user WebSocket. MATCHED/MINED/CONFIRMED count once; FAILED reverses. Missed messages are recovered by reconciliation |
+| Arming gate | `gate.ts` | All checks must pass: `ZINGER_MM_LIVE=1`; `ZINGER_MM_LIVE_ACK` set to the hash of the exact limits; limits within the canary ceiling ($100 portfolio, $25/market, 50 shares/order, $10 loss); no kill file; no proxy; region allowed from the real egress; collateral covers the cap; ≥3 positive out-of-sample days with a positive portfolio result |
+| Runner | `scripts/mm-live.ts` | `preflight` (read-only; `--auth` adds balance, open orders and holdings) and `run` (dry-run by default) |
+
+```bash
+npx tsx scripts/mm-live.ts preflight --markets=<conditionId,...>
+npx tsx scripts/mm-live.ts run --markets=<conditionId,...> --minutes=10
+```
+
+Live mode also needs a dedicated wallet with no open orders and no holdings in the quoted tokens. Any order the executor did not place is treated as an orphan: it is cancelled and the executor halts. To stop, press Ctrl-C, send SIGTERM or create `tmp/mm-live.KILL`. Every stop cancels all orders and then checks that none rest.
+
+First dry run (2026-10-23, 5 House-seat markets, 3 minutes, 1 tick behind the touch): 3 quotes placed and held with no churn, and a clean shutdown. The other two markets were held back because their 50-share reward minimum costs more than the $25 per-market cap.
+
+Known limits: one outcome is quoted per market (YES bid, plus a YES ask when shares are held). Maker rebates and rewards are not booked. The dry-run fill rule is conservative and shows nothing about live queue priority.
+
 ## Reproduce
 
 ```bash
