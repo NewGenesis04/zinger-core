@@ -145,11 +145,16 @@ export interface ShadowInput {
   spot: number | null;
 }
 
-const side = (d: any) => ({
-  bid: num(d?.bestBid), ask: num(d?.bestAsk),
-  bidSize: num(d?.bestBidSize), askSize: num(d?.bestAskSize),
-  bookTs: num(d?.bookTs),
-});
+/** A quote is a positive price. Zero means "nothing resting", which is stored as no quote, never as a price. */
+const quote = (px: unknown, size: unknown) => {
+  const p = num(px);
+  return p != null && p > 0 ? { px: p, size: num(size) } : { px: null, size: null };
+};
+const side = (d: any) => {
+  const bid = quote(d?.bestBid, d?.bestBidSize);
+  const ask = quote(d?.bestAsk, d?.bestAskSize);
+  return { bid: bid.px, ask: ask.px, bidSize: bid.size, askSize: ask.size, bookTs: num(d?.bookTs) };
+};
 
 /**
  * Build one row from values already in hand. Pure: the same inputs give the same

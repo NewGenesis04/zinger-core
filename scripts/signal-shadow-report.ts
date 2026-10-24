@@ -20,6 +20,13 @@
  *   H2  buying the side the model prefers, at the ask, held to settlement, is
  *       profitable after the taker fee, when the model leads the ask by a gap.
  *   H3  the ML trace's weighted vote predicts the window result.
+ *   H4  (model-free) a token bought at its ask, held to settlement, is calibrated:
+ *       its win rate matches ask + fee, by ask bucket and window length.
+ *       H4 was written down on 2026-10-13, AFTER a first look at the first 1,446
+ *       windows, where a favourite-versus-longshot pattern appeared on 15m. Those
+ *       windows are exploratory. Only windows that START at or after
+ *       H4_CONFIRM_START_MS count as confirmation, and the report prints that
+ *       section separately.
  *
  * Edge is measured per window, not per row: rows inside a window are
  * correlated, so each window contributes one number to a bucket and the
@@ -37,6 +44,14 @@ const since = sinceArg ? Date.parse(sinceArg) : 0;
 const FRACTIONS = [[0.2, 0.4], [0.4, 0.6], [0.6, 0.8], [0.8, 0.95]];
 const GAPS = [[0.05, 0.1], [0.1, 0.2], [0.2, 1.01]];
 const MIN_FRACTION_FOR_EDGE = 0.4;
+// An ask only counts if someone could actually have bought from it: a real price, at least the
+// exchange minimum resting, and a book that was current when the row was written.
+const MIN_ASK = 0.02;
+const MIN_ASK_SIZE = 5;
+const MAX_BOOK_AGE_MS = 2000;
+// 2026-10-13T01:15:00Z. Windows starting before this were seen when H4 was formed.
+const H4_CONFIRM_START_MS = 1791854100000;
+const H4_BUCKETS = [[0.02, 0.1], [0.1, 0.3], [0.3, 0.5], [0.5, 0.7], [0.7, 0.85], [0.85, 0.95], [0.95, 0.99]];
 
 const db = new DatabaseSync(dbPath, { readOnly: true });
 const all = db.prepare(
@@ -64,6 +79,36 @@ function summarize(vals) {
   if (vals.length < 2) return { n: vals.length, mean: NaN, se: NaN };
   return { n: vals.length, mean: mean(vals), se: sd(vals) / Math.sqrt(vals.length) };
 }
+
+
+/**
+ * Mean with a standard error that treats every window as one cluster. Rows of one window are
+ * correlated, so the error comes from the window totals, not from the row count.
+ *
+ * Entries are NOT averaged per window first: that gives a window with one qualifying row the same
+ * weight as one with twenty, and inflated an apparent edge to +7.5c when pooled rows and a
+ * realistic first-sight entry both said about zero. Two estimators are always printed:
+ *   pooled      every qualifying row, equal weight
+ *   first-sight the first qualifying row of each window (and token), the entry a bot could take
+ */
+function clusterMean(items) {
+  const n = items.length;
+  if (n < 3) return { n, windows: 0, mean: NaN, se: NaN };
+  const m = items.reduce((s, x) => s + x.v, 0) / n;
+  const by = new Map();
+  for (const x of items) by.set(x.slug, (by.get(x.slug) || 0) + (x.v - m));
+  const ss = [...by.values()].reduce((s, t) => s + t * t, 0);
+  return { n, windows: by.size, mean: m, se: Math.sqrt(ss) / n };
+}
+function firstSight(entries) {
+  const first = new Map();
+  for (const e of entries) {
+    const k = `${e.slug}|${e.tok || ''}`;
+    if (!first.has(k) || e.ts < first.get(k).ts) first.set(k, e);
+  }
+  return [...first.values()];
+}
+const fmtNet = (t) => (t.n < 3 || Number.isNaN(t.mean) ? '      -       ' : `${t.mean >= 0 ? '+' : ''}${t.mean.toFixed(3)} (±${t.se.toFixed(3)})`);
 
 function coverage(rows) {
   const windows = new Set(rows.map((r) => r.slug));
@@ -101,19 +146,27 @@ function h1(rows) {
 function h2(rows, label) {
   for (const col of ['p_up_spot', 'p_up_oracle']) {
     console.log(`\nH2  buy the model's side at the ask, hold to settlement, net of taker fee — ${col}${label}`);
+    console.log('       (pooled = every qualifying row; first-sight = first qualifying row per window)');
     for (const d of [300, 900]) {
       for (const [lo, hi] of GAPS) {
-        const q = rows.filter((r) => r.dur_s === d && r[col] != null && frac(r) >= MIN_FRACTION_FOR_EDGE && r.up_ask != null && r.down_ask != null);
-        const value = (r) => {
+        const entries = [];
+        for (const r of rows) {
+          if (r.dur_s !== d || r[col] == null || frac(r) < MIN_FRACTION_FOR_EDGE) continue;
+          if (r.up_ask == null || r.down_ask == null) continue;
           const side = r[col] >= 0.5 ? 'up' : 'down';
           const ask = side === 'up' ? r.up_ask : r.down_ask;
+          const askSize = side === 'up' ? r.up_ask_size : r.down_ask_size;
+          if (!(ask >= MIN_ASK) || !(askSize >= MIN_ASK_SIZE) || !(ask < 1)) continue;
+          if (r.book_ts == null || r.ts - r.book_ts > MAX_BOOK_AGE_MS) continue;
           const model = side === 'up' ? r[col] : 1 - r[col];
           const gap = model - ask;
-          if (!(gap >= lo && gap < hi) || !(ask > 0 && ask < 1)) return null;
-          return (win(side, r) ? 1 : 0) - ask - feePerShare(ask);
-        };
-        const s = summarize(perWindow(q, value));
-        if (s.n >= 10) console.log(`  ${d / 60}m  model-over-ask ${(lo * 100) | 0}-${hi > 1 ? '+' : (hi * 100) | 0}pts  windows=${s.n}  net/share=${s.mean >= 0 ? '+' : ''}${s.mean.toFixed(4)} (±${s.se.toFixed(4)})`);
+          if (!(gap >= lo && gap < hi)) continue;
+          entries.push({ slug: r.slug, ts: r.ts, v: (win(side, r) ? 1 : 0) - ask - feePerShare(ask) });
+        }
+        const pooled = clusterMean(entries);
+        if (pooled.windows < 10) continue;
+        const fs = clusterMean(firstSight(entries));
+        console.log(`  ${d / 60}m  model-over-ask ${(lo * 100) | 0}-${hi > 1 ? '+' : (hi * 100) | 0}pts  windows=${String(pooled.windows).padStart(4)}  pooled ${fmtNet(pooled)}  first-sight ${fmtNet(fs)}`);
       }
     }
   }
@@ -137,6 +190,38 @@ function h3(rows) {
   }
 }
 
+function h4(rows, label) {
+  console.log(`\nH4  model-free: buy a token at its ask, hold to settlement, net of taker fee — late in window (>=${MIN_FRACTION_FOR_EDGE * 100}%)${label}`);
+  console.log('       (pooled = every qualifying row; first-sight = first qualifying row per window and token)');
+  const cutTs = rows.length ? rows[Math.floor(rows.length / 2)].ts : 0;
+  for (const d of [300, 900]) {
+    console.log(`  --- ${d / 60}m windows`);
+    for (const [lo, hi] of H4_BUCKETS) {
+      const entries = [];
+      let wins = 0; let askSum = 0;
+      for (const r of rows) {
+        if (r.dur_s !== d || frac(r) < MIN_FRACTION_FOR_EDGE) continue;
+        if (r.book_ts == null || r.ts - r.book_ts > MAX_BOOK_AGE_MS) continue;
+        for (const tok of ['up', 'down']) {
+          const ask = r[`${tok}_ask`]; const size = r[`${tok}_ask_size`];
+          if (!(ask >= MIN_ASK) || !(size >= MIN_ASK_SIZE) || !(ask >= lo && ask < hi) || !(ask < 1)) continue;
+          const w = win(tok, r);
+          entries.push({ slug: r.slug, tok, ts: r.ts, v: (w ? 1 : 0) - ask - feePerShare(ask) });
+          wins += w ? 1 : 0; askSum += ask;
+        }
+      }
+      const pooled = clusterMean(entries);
+      if (pooled.windows < 15) continue;
+      const first = firstSight(entries);
+      const fs = clusterMean(first);
+      const a = clusterMean(first.filter((e) => e.ts < cutTs));
+      const b = clusterMean(first.filter((e) => e.ts >= cutTs));
+      const avgAsk = askSum / entries.length;
+      console.log(`  ask ${lo.toFixed(2)}-${hi.toFixed(2)}  windows=${String(pooled.windows).padStart(4)}  wins ${pct(wins / entries.length)} at avg ask ${avgAsk.toFixed(3)} (break-even ${pct(avgAsk + feePerShare(avgAsk))})  pooled ${fmtNet(pooled)}  first-sight ${fmtNet(fs)}  halves ${a.n < 3 ? '-' : (a.mean >= 0 ? '+' : '') + a.mean.toFixed(3)} | ${b.n < 3 ? '-' : (b.mean >= 0 ? '+' : '') + b.mean.toFixed(3)}`);
+    }
+  }
+}
+
 if (!all.length) {
   console.log('No resolved shadow rows yet. The bot must run, and windows must end and be resolved first.');
   process.exit(0);
@@ -148,4 +233,9 @@ h2(all, ' [all data]');
 const cut = all[Math.floor(all.length / 2)].ts;
 h2(all.filter((r) => r.ts < cut), ' [first half]');
 h2(all.filter((r) => r.ts >= cut), ' [second half]');
-console.log('\nA bucket counts only if it is positive in BOTH halves and its net/share exceeds twice its ± error.');
+h4(all, ' [all data: includes the exploratory windows]');
+const confirm = all.filter((r) => r.end_ms - r.dur_s * 1000 >= H4_CONFIRM_START_MS);
+console.log(`\nH4 confirmation set: windows starting at or after ${new Date(H4_CONFIRM_START_MS).toISOString()} — ${new Set(confirm.map((r) => r.slug)).size} windows`);
+h4(confirm, ' [CONFIRMATION ONLY]');
+console.log(`\nAsks counted only if price >= ${MIN_ASK}, resting size >= ${MIN_ASK_SIZE} shares and book age <= ${MAX_BOOK_AGE_MS} ms.`);
+console.log('A bucket counts only if BOTH pooled and first-sight net/share are positive, exceed twice their ± error, and hold in both halves.');

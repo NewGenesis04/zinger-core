@@ -1,7 +1,7 @@
 # Open backlog — map (hot: load this, not the items)
 
 New structural findings append as new per-item files in `docs/refactor/open/` (with `file:line` evidence) plus one row here. When fixed, move the content to `archive/fixed-items.md`.
-17 open items, sorted 2026-09-30 by an audit of every `open/` file against `git log` and the code. Read the row you need, then open that file — do not load the whole set.
+18 open items, sorted 2026-09-30 by an audit of every `open/` file against `git log` and the code. Read the row you need, then open that file — do not load the whole set.
 
 Strategy focus: **directional** (operator abandoned arb, 2026-09-30). Arb items are parked, not closed.
 
@@ -17,6 +17,7 @@ Strategy focus: **directional** (operator abandoned arb, 2026-09-30). Arb items 
 |---|---|---|---|
 | 131 | Paper fills ignored the order book: entry size, exit price, take-profit at the ask, 5-share minimum | Implemented in the working tree (uncommitted), filed 2026-10-08; live from the next session. Residual: sell-minimum unverified (needs a live canary); 0.4 participation and 5-tick exhaust are assumptions | `docs/refactor/open/131-paper-fills-ignored-the-book-entry-size-exit-price-and-minimums.md` |
 | 132 | No record of what the signals said on windows the bot did not trade, so no signal could be tested | Implemented in the working tree (uncommitted), filed 2026-10-09; collects while the bot runs. Residuals: Binance spot as a proxy for the Chainlink resolution price; restart warm-up of about 20 minutes | `docs/refactor/open/132-no-record-of-what-the-signals-said-on-windows-the-bot-did-not-trade.md` |
+| 133 | Research and backtest suite on the VPS over the public Polymarket fill history (279 GB, to 2026-10-04): maker economics, calibration, flow signals | **Plan with decisions made 2026-10-19 (data, isolation, first hypothesis, time box)**, filed 2026-10-10. Nothing built or pulled; fills only, no order-book snapshots | `docs/refactor/open/133-research-suite-for-the-public-polymarket-fill-history-on-the-vps.md` |
 | 130 | Paper stop-losses fill at the stop price, not the bid | Fixed in the working tree (uncommitted), filed 2026-10-08; live from the next session. `bot.ts:1933-1945`, `3535-3537`. Re-pricing the latest 500 trades' stops at the recorded bid removes ~$1,591 against +$1,352 gross | `docs/refactor/open/130-paper-stop-losses-fill-at-the-stop-price-not-the-bid.md` |
 | 129 | Paper PnL is kept in two ledgers with different conventions, and paper stops never pay an exit fee | Fixed in the working tree (uncommitted), filed 2026-10-08; live from the next session. Residuals: `cashAudit.ok` still independent of the reconcile; live partial PnL unchanged. `audit.ts:28-37` vs `:60`, `sessionLedger.ts:155-157`, `bot.ts:~2884`/`~3183` (no exit fee on stops, ~$3,058), `bot.ts:3605-3611`/`3707` (partial fee overwrite). $5,763 drift on the live paper session | `docs/refactor/open/129-paper-pnl-lives-in-two-ledgers-and-stops-pay-no-exit-fee.md` |
 | 128 | Other chain callers still use a single RPC endpoint | Open, filed 2026-10-02. `server.ts:111`, `trade.ts:25`, `swap.ts:8`, `deposits.ts:9`, `api/pilotLedger.ts:16` | `docs/refactor/open/128-other-chain-callers-still-use-a-single-rpc-endpoint.md` |

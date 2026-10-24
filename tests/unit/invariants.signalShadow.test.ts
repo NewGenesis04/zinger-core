@@ -216,6 +216,16 @@ describe('INVARIANT: a row is only written inside the window\'s sampling band', 
     expect(row.end_ms).toBe((START + 300) * 1000);
   });
 
+  it('stores an empty side of the book as no quote, not as a price of zero', () => {
+    warm();
+    const empty = { bestBid: 0, bestAsk: 0, bestBidSize: 0, bestAskSize: 0, bookTs: at(150) - 50, source: 'clob-rest' };
+    const row = buildShadowRow(mk(at(150), { depth: { up: empty, down: side(0.49, 0.5, at(150) - 50) } }) as any)!;
+    expect(row.up_ask).toBeNull();
+    expect(row.up_ask_size).toBeNull();
+    expect(row.up_bid).toBeNull();
+    expect(row.down_ask).toBe(0.5);
+  });
+
   it('records the model as unknown, not as 50%, until volatility has enough history', () => {
     const row = buildShadowRow(mk(at(150)) as any)!;
     expect(row.sigma_1m).toBeNull();
