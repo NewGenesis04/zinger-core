@@ -46,7 +46,7 @@ for cid, m in tr.items():
     rank = trg[1]["netUsdPerDay"] / trg[1]["capitalUsd"]
     if rank > 0: mk.append((rank, cid, teg))
 mk.sort(key=lambda x: -x[0])
-for C in (100, 250, 500, 1000, 2500, 5000, 10000, 20000):
+for C in (100, 200, 250, 500, 1000, 2500, 5000, 10000, 20000):
     alloc = {}; used = 0.0
     for r, cid, teg in mk:
         if used + teg[1]["capitalUsd"] <= C: alloc[cid] = 1; used += teg[1]["capitalUsd"]

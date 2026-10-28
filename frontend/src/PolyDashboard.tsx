@@ -10,6 +10,7 @@ import {
   History,
   LineChart,
   ListOrdered,
+  Gauge,
   Play,
   RefreshCw,
   RotateCcw,
@@ -102,6 +103,7 @@ import SystemFlow from '@/components/SystemFlow'
 import MlBay from '@/components/MlBay'
 import AccountPage from '@/pages/AccountPage'
 import ProcessPage from '@/pages/ProcessPage'
+import MmLivePanel from '@/components/MmLivePanel'
 
 function addr(a) {
   return a ? `${a.slice(0, 6)}…${a.slice(-4)}` : '—'
@@ -1315,7 +1317,7 @@ function PolyShell({
         <SidebarContent>
           {['ops', 'book', 'ops2'].map((groupKey) => {
             const groups = {
-              ops: { label: 'Ops', ids: ['overview', 'markets', 'process', 'traces'] },
+              ops: { label: 'Ops', ids: ['overview', 'mm-live', 'markets', 'process', 'traces'] },
               book: { label: 'Book', ids: ['positions', 'account', 'history'] },
               ops2: { label: 'Control', ids: ['log', 'behavior'] },
             }
@@ -1564,6 +1566,7 @@ function PolyShell({
         </header>
 
         <div className="poly-mobile-pad scroll-anchor flex flex-1 flex-col gap-1.5 p-1.5 sm:gap-2 sm:p-2">
+          {tab === 'mm-live' && <MmLivePanel />}
           {!liveOk && displayMode === 'live' && (
             <Alert variant="destructive">
               <AlertTitle>Live blocked</AlertTitle>
@@ -2641,6 +2644,13 @@ function PolyDashboardApp() {
         icon: Activity,
       },
       {
+        id: 'mm-live',
+        label: 'MM Live',
+        shortLabel: 'MM',
+        description: 'Market-making runs: quotes, fills, stops, kill',
+        icon: Gauge,
+      },
+      {
         id: 'markets',
         label: 'Markets',
         shortLabel: 'Markets',
@@ -2708,6 +2718,8 @@ function PolyDashboardApp() {
       const map = {
         mission: 'overview',
         overview: 'overview',
+        mm: 'mm-live',
+        'mm-live': 'mm-live',
         markets: 'markets',
         process: 'process',
         traces: 'traces',
@@ -2728,6 +2740,7 @@ function PolyDashboardApp() {
   useEffect(() => {
     const hashMap = {
       overview: 'mission',
+      'mm-live': 'mm-live',
       markets: 'markets',
       process: 'process',
       traces: 'traces',
@@ -2743,6 +2756,7 @@ function PolyDashboardApp() {
     }
     const titles = {
       overview: 'Mission',
+      'mm-live': 'MM Live',
       markets: 'Markets',
       process: 'Process',
       traces: 'Traces',

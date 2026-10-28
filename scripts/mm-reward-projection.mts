@@ -18,11 +18,17 @@ const outDir = path.resolve(`tmp/commercial-evidence/mm-reward-projection/${runI
 fs.mkdirSync(outDir, { recursive: true });
 const samplesFile = path.join(outDir, 'samples.jsonl'), fillsFile = path.join(outDir, 'fills.jsonl'), snapFile = path.join(outDir, 'snapshots.jsonl');
 
-const getJson = async (url: string) => {
+// Hard deadline on the whole request, body included. On 26-27 Oct a stalled body left a promise
+// that never settled, and Node exited mid-day once nothing else kept the loop alive.
+const withDeadline = <T>(p: Promise<T>, ms: number, what: string) => new Promise<T>((resolve, reject) => {
+  const t = setTimeout(() => reject(Error(`deadline ${ms}ms: ${what}`)), ms);
+  p.then((v) => { clearTimeout(t); resolve(v); }, (e) => { clearTimeout(t); reject(e); });
+});
+const getJson = (url: string) => withDeadline((async () => {
   const r = await fetch(url, { signal: AbortSignal.timeout(15000) });
   if (!r.ok) throw Error(`${r.status} ${url}`);
   return r.json() as Promise<any>;
-};
+})(), 20_000, url.split('?')[0]);
 const log = (file: string, rec: any) => fs.appendFileSync(file, JSON.stringify(rec) + '\n');
 
 async function selectMarkets() {
@@ -88,8 +94,12 @@ let bookCache = new Map<string, any>();
 async function fetchBooks(tokens: string[]) {
   const out = new Map<string, any>();
   for (let i = 0; i < tokens.length; i += 50) {
-    const r = await fetch(`${CLOB}/books`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(tokens.slice(i, i + 50).map((token_id) => ({ token_id }))), signal: AbortSignal.timeout(20000) }).catch(() => null);
-    if (r?.ok) for (const b of await r.json() as any[]) out.set(String(b.asset_id), b);
+    // Body read included: an ECONNRESET while reading the body crashed day 3 on 27 Oct.
+    const rows = await withDeadline((async () => {
+      const r = await fetch(`${CLOB}/books`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(tokens.slice(i, i + 50).map((token_id) => ({ token_id }))), signal: AbortSignal.timeout(20000) });
+      return r.ok ? await r.json() as any[] : [];
+    })(), 25_000, 'books').catch((e) => { log(samplesFile, { at: Date.now(), warning: 'books_failed', error: String(e?.message ?? e) }); return [] as any[]; });
+    for (const b of rows) out.set(String(b.asset_id), b);
   }
   return out;
 }
@@ -154,6 +164,9 @@ const markets = await selectMarkets();
 console.log(JSON.stringify({ runId, outDir, markets: markets.length, minutes: MINUTES, markoutMs: MARKOUT_MS }));
 fs.writeFileSync(path.join(outDir, 'markets.json'), JSON.stringify(markets, null, 2));
 
+// Keep the event loop alive between awaits, and log (not die on) anything unexpected.
+const keepAlive = setInterval(() => {}, 30_000);
+process.on('unhandledRejection', (e) => log(samplesFile, { at: Date.now(), warning: 'unhandled_rejection', error: String((e as any)?.message ?? e) }));
 for (let i = 0; i < MINUTES; i++) {
   const at = Date.now();
   bookCache = await fetchBooks(markets.flatMap((m: any) => m.tokens));
@@ -163,6 +176,7 @@ for (let i = 0; i < MINUTES; i++) {
   const wait = SAMPLE_MS - (Date.now() - at);
   if (i < MINUTES - 1 && wait > 0) await new Promise((r) => setTimeout(r, wait));
 }
+clearInterval(keepAlive);
 
 // Markouts: mid at (fill + MARKOUT_MS), from the nearest later sample of the same market.
 const marked = fills.map((f) => {

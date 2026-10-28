@@ -108,6 +108,46 @@ describe('MM live executor', () => {
   });
 });
 
+describe('review fixes: executor', () => {
+  it('a failed trade reverses a quantity already taken from reconciliation', async () => {
+    const { venue, ex } = setup();
+    await ex.step([q()], marks);
+    const id = ex.liveOrders()[0].venueOrderId!;
+    await ex.onFill({ tradeId: 'x', venueOrderId: id, tokenId: 'T', side: 'BUY', price: 0.4, shares: 4, status: 'matched', at: 0 });
+    venue.openOrders = async () => [{ id, tokenId: 'T', side: 'BUY', price: 0.4, originalShares: 10, matchedShares: 4, status: 'open' }];
+    await ex.reconcile();
+    await ex.onFill({ tradeId: 'x', venueOrderId: id, tokenId: 'T', side: 'BUY', price: 0.4, shares: 4, status: 'failed', at: 0 });
+    expect(ex.position.get('T')).toBeCloseTo(0);
+    expect(ex.cash).toBeCloseTo(0);
+  });
+  it('a halt during a submit stops later submits and cancels what rested', async () => {
+    let k: string | null = null;
+    const { venue, ex } = setup(() => k);
+    const place = venue.place.bind(venue);
+    venue.place = async (r) => { const res = await place(r); k = 'SIGTERM'; return res; };
+    await ex.step([q(), q({ tokenId: 'U' })], new Map([['T', 0.4], ['U', 0.4]]));
+    expect(venue.sent).toHaveLength(1);
+    expect(ex.halted).toBe('kill:SIGTERM');
+    expect(await venue.openOrders()).toHaveLength(0);
+  });
+  it('enforces the event cap across markets', async () => {
+    const { ex } = setup();
+    // $25 per market, $50 per event: two markets of one event fill the event allowance.
+    await ex.step([q({ shares: 50, price: 0.45, conditionId: 'C1' }), q({ tokenId: 'U', shares: 50, price: 0.45, conditionId: 'C2' })], new Map([['T', 0.45], ['U', 0.45]]));
+    expect(ex.liveOrders()).toHaveLength(2);
+    expect(ex.preTradeCheck(q({ tokenId: 'V', shares: 50, price: 0.45, conditionId: 'C3' }))).toBe('event_usd_limit');
+    expect(ex.preTradeCheck(q({ tokenId: 'V', shares: 50, price: 0.45, conditionId: 'C3', event: 'Other' }))).toBeNull();
+  });
+  it('counts earlier sessions against the loss limit', async () => {
+    const { ex } = setup();
+    ex.priorPnlUsd = -9.5;
+    await ex.step([q({ shares: 10 })], marks);
+    ex.cash = -1; // a one-dollar loss now crosses the $10 limit with the earlier -$9.50
+    await ex.step([], marks);
+    expect(ex.halted).toMatch(/^loss_limit/);
+  });
+});
+
 describe('MM live gate', () => {
   const base = { mode: 'live' as const, limits: CANARY_LIMITS, killFile: '/nonexistent/kill', collateralUsd: 500,
     geoblock: { checked: true, blocked: false, viaProxy: false, country: 'XX' }, evidence: { positiveOutOfSampleDays: 3, portfolioNetUsdPerDay: 1 } };
@@ -116,6 +156,9 @@ describe('MM live gate', () => {
     const env = { ZINGER_MM_LIVE: '1', ZINGER_MM_LIVE_ACK: limitsHash(CANARY_LIMITS) };
     expect(evaluateGate({ ...base, env }).armed).toBe(true);
     expect(evaluateGate({ ...base, env: { ...env, HTTPS_PROXY: 'x' } }).armed).toBe(false);
+    expect(evaluateGate({ ...base, env: { ...env, CLOB_PROXY_API_URL: 'https://relay.example' } }).armed).toBe(false);
+    expect(evaluateGate({ ...base, env: { ...env, CLOB_API_URL: 'http://clob.example' } }).armed).toBe(false);
+    expect(evaluateGate({ ...base, env: { ...env, CLOB_API_URL: 'https://clob.polymarket.com/' } }).armed).toBe(true);
     expect(evaluateGate({ ...base, env, evidence: null }).armed).toBe(false);
     expect(evaluateGate({ ...base, env, limits: { ...CANARY_LIMITS, maxPortfolioUsd: 1000 } }).armed).toBe(false);
   });

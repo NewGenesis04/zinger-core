@@ -36,6 +36,7 @@ import {
   evictedCount as telemetryEvictedCount,
   buildSyncFrame,
 } from './polymarket/telemetry/events.js';
+import * as mmWatch from './research/mm/live/watch.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
@@ -178,6 +179,34 @@ export async function createApp() {
   });
 
   // --- API Routes ---
+
+  // --- MM execution watch (read model over tmp/mm-live; the only writes are the kill file) ---
+  const mmOperator = (req, res) => {
+    if (req.auth?.role !== 'operator') { res.status(403).json({ ok: false, error: 'Operator access required' }); return false; }
+    return true;
+  };
+  app.get('/api/mm/runs', (req, res) => {
+    if (!mmOperator(req, res)) return;
+    res.set('Cache-Control', 'no-store');
+    res.json({ ok: true, at: Date.now(), runs: mmWatch.listMmRuns(), killFile: mmWatch.killFileState() });
+  });
+  app.get('/api/mm/runs/:id', (req, res) => {
+    if (!mmOperator(req, res)) return;
+    res.set('Cache-Control', 'no-store');
+    const run = mmWatch.readMmRun(req.params.id);
+    if (!run) return res.status(404).json({ ok: false, error: 'Unknown MM run' });
+    res.json({ ok: true, at: Date.now(), run, killFile: mmWatch.killFileState() });
+  });
+  app.post('/api/mm/runs/:id/kill', (req, res) => {
+    if (!mmOperator(req, res)) return;
+    const r = mmWatch.requestKill(req.params.id);
+    res.status(r.ok ? 200 : 409).json(r);
+  });
+  app.post('/api/mm/kill-file/clear', (req, res) => {
+    if (!mmOperator(req, res)) return;
+    const r = mmWatch.clearKill();
+    res.status(r.ok ? 200 : 409).json(r);
+  });
 
   app.get('/api/status', async (req, res) => {
     try {
