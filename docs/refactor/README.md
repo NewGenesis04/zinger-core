@@ -7,6 +7,7 @@ The old `docs/refactor-plan.md` (7,100+ lines) is split so context stays small.
 
 | Question | Open |
 |---|---|
+| New operator: how do I deploy, monitor, find credentials? | `docs/refactor/onboarding.md` |
 | What are the settled decisions / objectives? | `docs/refactor/charter.md` — Why + Objectives 1–4 + D1–D11. **Settled.** Do not re-derive or quietly diverge. |
 | What rules prevent repeats of `cccce43`? | `docs/refactor/conventions.md` — fixtures vs audits, `it.fails()`, derive money from primitives, prove behaviour-neutral moves, mutation-test invariants. |
 | What is verified Polymarket truth? | `docs/research/polymarket-domain-facts.md` (authority) + `docs/refactor/live-facts.md` (pointer + stale 2026-08-20 snapshot). Anything not in the research doc is unverified. |
